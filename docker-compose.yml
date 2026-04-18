@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: agos-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agos
+      POSTGRES_PASSWORD: agos
+      POSTGRES_DB: agosdb
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - agos_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agos -d agosdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Adminer: interfaccia web leggera per esplorare il DB in dev
+  # Raggiungibile su http://localhost:8888
+  adminer:
+    image: adminer:latest
+    container_name: agos-adminer
+    restart: unless-stopped
+    ports:
+      - "8888:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  agos_pgdata:
+    driver: local

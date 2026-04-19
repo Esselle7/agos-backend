@@ -1,4 +1,7 @@
-Prompt/
+
 docs/
 .claude/
 **application.properties
+target/
+.mvn/
+Prompt/

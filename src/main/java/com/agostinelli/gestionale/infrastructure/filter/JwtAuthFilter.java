@@ -52,7 +52,12 @@ public class JwtAuthFilter implements ContainerRequestFilter {
     }
 
     private boolean isPublicPath(String path) {
-        return path.startsWith("/auth/") || path.startsWith("/q/");
+        // /auth/google/* = flusso OAuth2 pubblico
+        // /auth/refresh  = rinnovo token tramite refresh token (nessun JWT)
+        // /auth/logout e /auth/me richiedono JWT
+        return path.startsWith("/auth/google/")
+            || path.equals("/auth/refresh")
+            || path.startsWith("/q/");
     }
 
     private SecurityContext buildSecurityContext(JsonWebToken jwt) {

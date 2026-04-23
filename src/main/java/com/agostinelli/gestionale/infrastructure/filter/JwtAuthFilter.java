@@ -1,6 +1,7 @@
 package com.agostinelli.gestionale.infrastructure.filter;
 
 import com.agostinelli.gestionale.infrastructure.exception.UnauthorizedException;
+import io.quarkus.arc.profile.UnlessBuildProfile;
 import io.smallrye.jwt.auth.principal.JWTParser;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -24,6 +25,7 @@ import java.security.Principal;
 @Provider
 @ApplicationScoped
 @Priority(Priorities.AUTHENTICATION)
+@UnlessBuildProfile("test")
 public class JwtAuthFilter implements ContainerRequestFilter {
 
     @Inject

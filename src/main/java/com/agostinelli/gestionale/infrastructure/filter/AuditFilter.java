@@ -38,8 +38,8 @@ public class AuditFilter implements ContainerRequestFilter, ContainerResponseFil
     @Override
     public void filter(ContainerRequestContext requestContext,
                        ContainerResponseContext responseContext) throws IOException {
-        long startTime = (Long) requestContext.getProperty(START_TIME_KEY);
-        long duration = System.currentTimeMillis() - startTime;
+        Object startTimeObj = requestContext.getProperty(START_TIME_KEY);
+        long duration = startTimeObj != null ? System.currentTimeMillis() - (Long) startTimeObj : -1;
 
         log.info("[{}] [{}] [{}] [{}] [{}ms]",
                 requestContext.getMethod(),

@@ -26,9 +26,10 @@ public class GlobalExceptionMapper implements ExceptionMapper<Throwable> {
         if (exception instanceof ApiException apiEx) {
             return handleApiException(apiEx);
         }
-        if (exception instanceof jakarta.ws.rs.NotFoundException) {
-            return buildResponse(Response.Status.NOT_FOUND,
-                    ErrorResponse.of("NOT_FOUND", "Risorsa non trovata"));
+        if (exception instanceof jakarta.ws.rs.WebApplicationException wae) {
+            Response.Status status = Response.Status.fromStatusCode(wae.getResponse().getStatus());
+            if (status == null) status = Response.Status.INTERNAL_SERVER_ERROR;
+            return buildResponse(status, ErrorResponse.of(status.name(), wae.getMessage()));
         }
         return handleUnexpected(exception);
     }

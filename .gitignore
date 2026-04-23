@@ -8,4 +8,5 @@ target/
 src/main/resources/privateKey.pem
 src/main/resources/publicKey.pem
 generate-keys.sh
+.venv/
 Prompt/

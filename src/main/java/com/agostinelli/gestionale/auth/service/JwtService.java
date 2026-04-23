@@ -89,6 +89,7 @@ public class JwtService {
                 .subject(user.id.toString())
                 .claim("email", user.email)
                 .claim("role", user.ruolo.name())
+                .groups(Set.of(user.ruolo.name()))
                 .issuedAt(Instant.now())
                 .expiresAt(Instant.now().plusSeconds(ACCESS_TTL_S))
                 .jws()

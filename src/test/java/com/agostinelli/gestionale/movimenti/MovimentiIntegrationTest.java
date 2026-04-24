@@ -335,6 +335,409 @@ class MovimentiIntegrationTest {
                 .body("matched", notNullValue());
     }
 
+    // ── Importi edge case ──────────────────────────────────────────────────────
+
+    @Test
+    @Order(51)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testImportoZeroRifiutato() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":0.00,"dataMovimento":"2026-12-01",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,"descrizione":"Importo zero"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(52)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testImportoNegativoRifiutato() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":-50.00,"dataMovimento":"2026-12-01",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,"descrizione":"Importo negativo"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(53)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testImportoMassimoAccettato() {
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildCreateRequest("ENTRATA", "9999999.99", "Importo massimo", null))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(201)
+                .body("importo", greaterThan(9000000.0f));
+    }
+
+    @Test
+    @Order(54)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testCommissioneDecimaleNonArrotondata() {
+        // 100.00 - 97.37 = 2.63 — verifica che BigDecimal non arrotondi
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildCreateRequestConCommissione("ENTRATA", "97.37", "100.00"))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(201)
+                .body("importo", equalTo(97.37f))
+                .body("importoCommissione", equalTo(2.63f));
+    }
+
+    // ── Date edge case ─────────────────────────────────────────────────────────
+
+    @Test
+    @Order(61)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testDataPassatoRemotoAccettata() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":1.00,"dataMovimento":"2000-01-01",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,"descrizione":"Data passato remoto"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(201)
+                .body("dataMovimento", equalTo("2000-01-01"));
+    }
+
+    @Test
+    @Order(62)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testDataFuturaAccettata() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":1.00,"dataMovimento":"2099-12-31",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,"descrizione":"Data futura"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(201)
+                .body("dataMovimento", equalTo("2099-12-31"));
+    }
+
+    // ── Stato machine ──────────────────────────────────────────────────────────
+
+    @Test
+    @Order(71)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testAnnullaMovimentoGiaAnnullatoConflict() {
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body(buildCreateRequest("USCITA", "30.00", "Doppio annullo test", null))
+            .when().post("/api/movimenti")
+            .then().statusCode(201).extract().path("id");
+
+        given().when().delete("/api/movimenti/" + id).then().statusCode(204);
+        // Seconda annullazione sullo stesso movimento → CONFLICT
+        given().when().delete("/api/movimenti/" + id).then().statusCode(409);
+    }
+
+    @Test
+    @Order(72)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testUpdateMovimentoGiaAnnullatoConflict() {
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body(buildCreateRequest("ENTRATA", "40.00", "Update su annullato", null))
+            .when().post("/api/movimenti")
+            .then().statusCode(201).extract().path("id");
+
+        given().when().delete("/api/movimenti/" + id).then().statusCode(204);
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("{\"descrizione\":\"Tentativo update su annullato\"}")
+            .when().put("/api/movimenti/" + id)
+            .then()
+                .statusCode(409);
+    }
+
+    @Test
+    @Order(73)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testRiconciliaMovimentoAnnullatoConflict() {
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body(buildCreateRequest("ENTRATA", "45.00", "Riconcilia su annullato", null))
+            .when().post("/api/movimenti")
+            .then().statusCode(201).extract().path("id");
+
+        given().when().delete("/api/movimenti/" + id).then().statusCode(204);
+
+        given()
+            .contentType(ContentType.JSON)
+            .when().post("/api/movimenti/riconciliazione/" + id + "/riconcilia")
+            .then()
+                .statusCode(409);
+    }
+
+    @Test
+    @Order(74)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testRiconciliaMovimentoNonTrovato() {
+        given()
+            .contentType(ContentType.JSON)
+            .when().post("/api/movimenti/riconciliazione/00000000-0000-0000-0000-999999999999/riconcilia")
+            .then()
+                .statusCode(404);
+    }
+
+    // ── Bulk edge case ─────────────────────────────────────────────────────────
+
+    @Test
+    @Order(81)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testBulkImportOltreLimite500() {
+        StringBuilder sb = new StringBuilder("{\"movimenti\":[");
+        for (int i = 0; i < 501; i++) {
+            if (i > 0) sb.append(",");
+            sb.append(buildCreateRequest("ENTRATA", "1.00", "Limite " + i, null));
+        }
+        sb.append("]}");
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(sb.toString())
+            .when().post("/api/movimenti/bulk")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(82)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testBulkImportMistoValidiEInvalidi() {
+        String valido1 = buildCreateRequest("ENTRATA", "10.00", "Bulk valido A", null);
+        String invalido = """
+                {"tipo":"ENTRATA","importo":0.00,"dataMovimento":"2026-12-01",
+                 "contoBancarioId":1,"metodoPagamentoId":%d,
+                 "businessUnitId":1,"contoCoge":%d,"descrizione":"Importo zero"}
+                """.formatted(validMetodoPagamento, validContoCoge);
+        String valido2 = buildCreateRequest("USCITA", "20.00", "Bulk valido B", null);
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("{\"movimenti\":[" + valido1 + "," + invalido + "," + valido2 + "]}")
+            .when().post("/api/movimenti/bulk")
+            .then()
+                .statusCode(200)
+                .body("importati", equalTo(2))
+                .body("errori",    equalTo(1))
+                .body("duplicati", equalTo(0));
+    }
+
+    // ── Filtri avanzati ────────────────────────────────────────────────────────
+
+    @Test
+    @Order(91)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testFiltraPerDateRange() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":5.00,"dataMovimento":"2026-11-15",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,"descrizione":"Filtro date range"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then().statusCode(201);
+
+        given()
+            .queryParam("from", "2026-11-15")
+            .queryParam("to", "2026-11-15")
+            .when().get("/api/movimenti")
+            .then()
+                .statusCode(200)
+                .body("content", hasSize(greaterThan(0)))
+                .body("content.dataMovimento", everyItem(equalTo("2026-11-15")));
+    }
+
+    @Test
+    @Order(92)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testFiltraPerBuId() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":1.00,"dataMovimento":"2026-10-01",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":2,"contoCoge":%d,"descrizione":"Filtro buId 2"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then().statusCode(201);
+
+        given()
+            .queryParam("buId", 2)
+            .when().get("/api/movimenti")
+            .then()
+                .statusCode(200)
+                .body("content", hasSize(greaterThan(0)))
+                .body("content.businessUnitId", everyItem(equalTo(2)));
+    }
+
+    @Test
+    @Order(93)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testFiltraPerStatoAnnullato() {
+        // Order 15 ha già creato e annullato un movimento — almeno uno ANNULLATO esiste
+        given()
+            .queryParam("stato", "ANNULLATO")
+            .when().get("/api/movimenti")
+            .then()
+                .statusCode(200)
+                .body("content.stato", everyItem(equalTo("ANNULLATO")));
+    }
+
+    // ── Riconciliazione avanzata ───────────────────────────────────────────────
+
+    @Test
+    @Order(101)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testRiconciliaManualeConNote() {
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":88.00,"dataMovimento":"2026-09-01",
+                     "contoBancarioId":2,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "fonte":"IMPORT_BANCA","descrizione":"Movimento da riconciliare"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then().statusCode(201).extract().path("id");
+
+        given()
+            .contentType(ContentType.JSON)
+            .queryParam("note", "Riconciliato manualmente in test")
+            .when().post("/api/movimenti/riconciliazione/" + id + "/riconcilia")
+            .then()
+                .statusCode(204);
+
+        given()
+            .when().get("/api/movimenti/" + id)
+            .then()
+                .statusCode(200)
+                .body("stato", equalTo("RICONCILIATO"));
+    }
+
+    @Test
+    @Order(102)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testMatchAutomaticoConCoppiaBillyBanca() {
+        // Importo univoco (13579.24) per non interferire con dati seed
+        String importoUnico = "13579.24";
+        String data = "2026-08-10";
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "contoBancarioId":2,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "fonte":"IMPORT_BILLY","riferimentoEsterno":"BILLY-MATCH-102",
+                     "descrizione":"Billy per match automatico"}
+                    """.formatted(importoUnico, data, validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then().statusCode(201);
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "contoBancarioId":2,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "fonte":"IMPORT_BANCA","riferimentoEsterno":"BANCA-MATCH-102",
+                     "descrizione":"Banca per match automatico"}
+                    """.formatted(importoUnico, data, validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then().statusCode(201);
+
+        given()
+            .contentType(ContentType.JSON)
+            .when().post("/api/movimenti/riconciliazione/match-automatico")
+            .then()
+                .statusCode(200)
+                .body("matched", greaterThanOrEqualTo(1));
+    }
+
+    @Test
+    @Order(103)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testMatchAutomaticoAmbiguitaDueBancaUnBilly() {
+        // Importo univoco (24680.13): 1 BILLY + 2 BANCA → entrambe le coppie riconciliate.
+        // NOTA: questa è una limitazione nota del match automatico — un pagamento Billy
+        // viene associato a più estratti conto bancari se l'importo coincide.
+        String importoAmbiguo = "24680.13";
+        String data = "2026-07-20";
+
+        String billyId = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "contoBancarioId":2,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "fonte":"IMPORT_BILLY","riferimentoEsterno":"BILLY-AMB-103",
+                     "descrizione":"Billy ambiguo"}
+                    """.formatted(importoAmbiguo, data, validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then().statusCode(201).extract().path("id");
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "contoBancarioId":2,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "fonte":"IMPORT_BANCA","riferimentoEsterno":"BANCA-AMB1-103",
+                     "descrizione":"Banca ambigua 1"}
+                    """.formatted(importoAmbiguo, data, validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then().statusCode(201);
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "contoBancarioId":2,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "fonte":"IMPORT_BANCA","riferimentoEsterno":"BANCA-AMB2-103",
+                     "descrizione":"Banca ambigua 2"}
+                    """.formatted(importoAmbiguo, data, validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then().statusCode(201);
+
+        given()
+            .contentType(ContentType.JSON)
+            .when().post("/api/movimenti/riconciliazione/match-automatico")
+            .then()
+                .statusCode(200)
+                .body("matched", greaterThanOrEqualTo(2));
+
+        // Il Billy viene marcato RICONCILIATO su entrambe le coppie (comportamento attuale)
+        given()
+            .when().get("/api/movimenti/" + billyId)
+            .then()
+                .statusCode(200)
+                .body("stato", equalTo("RICONCILIATO"));
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private String buildCreateRequest(String tipo, String importo, String descrizione, String tipoEvento) {

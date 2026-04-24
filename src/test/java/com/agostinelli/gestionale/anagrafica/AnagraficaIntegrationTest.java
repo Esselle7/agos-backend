@@ -128,6 +128,82 @@ class AnagraficaIntegrationTest {
     }
 
     @Test
+    @Order(14)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testCreaCategoriaConNomeVuoto() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"nome":"","tipo":"ENTRATA","buId":1,"ordinamento":0}
+                    """)
+            .when().post("/api/categorie")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(15)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testCreaCategoriaParentBuIdDiverso() {
+        int parentId = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"nome":"Parent BU1 per cross-BU test","tipo":"ENTRATA","buId":1,"ordinamento":0}
+                    """)
+            .when().post("/api/categorie")
+            .then().statusCode(201).extract().path("id");
+
+        // Sottocategoria in BU2 con parent in BU1 → deve fallire (stessa validazione del tipo)
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"nome":"Figlio BU2","tipo":"ENTRATA","parentId":%d,"buId":2,"ordinamento":0}
+                    """.formatted(parentId))
+            .when().post("/api/categorie")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(16)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testCreaCategoriaParentIdInesistente() {
+        // parentId inesistente → 400 (INVALID_PARENT da CategorieService)
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"nome":"Orfana","tipo":"ENTRATA","parentId":999999,"buId":1,"ordinamento":0}
+                    """)
+            .when().post("/api/categorie")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(17)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testUpdateCategoria() {
+        int id = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"nome":"Categoria aggiornamento test","tipo":"USCITA","buId":1,"ordinamento":0}
+                    """)
+            .when().post("/api/categorie")
+            .then().statusCode(201).extract().path("id");
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"nome":"Categoria aggiornata","tipo":"USCITA","buId":1,"ordinamento":5}
+                    """)
+            .when().put("/api/categorie/" + id)
+            .then()
+                .statusCode(200)
+                .body("nome",        equalTo("Categoria aggiornata"))
+                .body("ordinamento", equalTo(5));
+    }
+
+    @Test
     @Order(13)
     @TestSecurity(user = "test-dipendente", roles = {"DIPENDENTE"})
     void testCreaCategoriaComeDipendenteForbidden() {
@@ -280,6 +356,148 @@ class AnagraficaIntegrationTest {
             .when().post("/api/fornitori")
             .then()
                 .statusCode(400);
+    }
+
+    @Test
+    @Order(40)
+    @TestSecurity(user = "test-dipendente", roles = {"DIPENDENTE"})
+    void testDipendentePuoCercareFornitore() {
+        given()
+            .when().get("/api/fornitori")
+            .then()
+                .statusCode(200)
+                .body("content", notNullValue());
+    }
+
+    @Test
+    @Order(41)
+    @TestSecurity(user = "test-dipendente", roles = {"DIPENDENTE"})
+    void testDipendenteNonPuoCreareFornitore() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"ragioneSociale":"Fornitore Dipendente Test"}
+                    """)
+            .when().post("/api/fornitori")
+            .then()
+                .statusCode(403);
+    }
+
+    @Test
+    @Order(42)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testUpdateFornitore() {
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"ragioneSociale":"Fornitore Da Aggiornare Srl"}
+                    """)
+            .when().post("/api/fornitori")
+            .then().statusCode(201).extract().path("id");
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"ragioneSociale":"Fornitore Aggiornato Srl","alias":"FornAgg","note":"Aggiornato in test"}
+                    """)
+            .when().put("/api/fornitori/" + id)
+            .then()
+                .statusCode(200)
+                .body("ragioneSociale", equalTo("Fornitore Aggiornato Srl"))
+                .body("alias",          equalTo("FornAgg"));
+    }
+
+    @Test
+    @Order(43)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testFornitoreConPivaDuplicataFallisce() {
+        // Usa una P.IVA di 11 cifre non presente nel seed
+        String piva = "99887766551";
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"ragioneSociale":"Fornitore PIVA Prima","piva":"%s"}
+                    """.formatted(piva))
+            .when().post("/api/fornitori")
+            .then().statusCode(201);
+
+        // Seconda creazione con stessa P.IVA → DB UNIQUE constraint violation
+        // Il servizio non gestisce esplicitamente il duplicato (nessun 409 custom),
+        // quindi ci si aspetta un errore server-side (4xx o 5xx)
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"ragioneSociale":"Fornitore PIVA Doppia","piva":"%s"}
+                    """.formatted(piva))
+            .when().post("/api/fornitori")
+            .then()
+                .statusCode(greaterThanOrEqualTo(400));
+    }
+
+    @Test
+    @Order(44)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testAliasPatternVuotoRifiutato() {
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"ragioneSociale":"Fornitore Alias Vuoto Test"}
+                    """)
+            .when().post("/api/fornitori")
+            .then().statusCode(201).extract().path("id");
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"pattern":"","matchType":"CONTAINS"}
+                    """)
+            .when().post("/api/fornitori/" + id + "/alias")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(45)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testCancellaAliasFornitoreErratoNotFound() {
+        // Crea due fornitori separati
+        String id1 = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"ragioneSociale":"Fornitore Cross Alias Uno"}
+                    """)
+            .when().post("/api/fornitori")
+            .then().statusCode(201).extract().path("id");
+
+        String id2 = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"ragioneSociale":"Fornitore Cross Alias Due"}
+                    """)
+            .when().post("/api/fornitori")
+            .then().statusCode(201).extract().path("id");
+
+        // Crea alias per il primo fornitore
+        int aliasId = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"pattern":"CROSS_ALIAS_TEST","matchType":"CONTAINS"}
+                    """)
+            .when().post("/api/fornitori/" + id1 + "/alias")
+            .then().statusCode(201).extract().path("id");
+
+        // Tenta di cancellare l'alias del fornitore 1 usando il path del fornitore 2 → 404
+        given()
+            .when().delete("/api/fornitori/" + id2 + "/alias/" + aliasId)
+            .then()
+                .statusCode(404);
+
+        // L'alias deve ancora esistere sul fornitore 1
+        given()
+            .when().get("/api/fornitori/" + id1)
+            .then()
+                .body("aliasList", hasSize(1));
     }
 
     // ── CONTI BANCARI ──────────────────────────────────────────────────────────

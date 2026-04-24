@@ -221,4 +221,212 @@ class CassaIntegrationTest {
             .then()
                 .statusCode(403);
     }
+
+    // ── DIPENDENTE edge case ───────────────────────────────────────────────────
+
+    @Test
+    @Order(25)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"DIPENDENTE"})
+    void testDipendentePuoCreareMovimentoCassa() {
+        // CassaResource ha @RolesAllowed({"ADMIN","DIPENDENTE"}) a livello classe
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":25.00,
+                     "dataMovimento":"2026-07-01","descrizione":"Dipendente crea cassa"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then()
+                .statusCode(201)
+                .body("tipo", equalTo("ENTRATA"));
+    }
+
+    // ── Giroconto accoppiato ───────────────────────────────────────────────────
+
+    @Test
+    @Order(31)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testPrelievo_creaMovimentoBancario_USCITA() {
+        // PRELIEVO_DA_BANCA deve generare automaticamente un'USCITA sul conto bancario
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"PRELIEVO_DA_BANCA","importo":444.44,
+                     "contoBancaId":1,"dataMovimento":"2026-09-15",
+                     "descrizione":"Prelievo per verifica giroconto"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then()
+                .statusCode(201)
+                .body("tipo", equalTo("PRELIEVO_DA_BANCA"));
+
+        // Il giroconto bancario deve comparire come USCITA in /api/movimenti
+        given()
+            .queryParam("tipo", "USCITA")
+            .queryParam("from", "2026-09-15")
+            .queryParam("to", "2026-09-15")
+            .when().get("/api/movimenti")
+            .then()
+                .statusCode(200)
+                .body("content", hasSize(greaterThan(0)));
+    }
+
+    @Test
+    @Order(32)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testVersamento_creaMovimentoBancario_ENTRATA() {
+        // VERSAMENTO_IN_BANCA deve generare automaticamente un'ENTRATA sul conto bancario
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"VERSAMENTO_IN_BANCA","importo":555.55,
+                     "contoBancaId":1,"dataMovimento":"2026-09-16",
+                     "descrizione":"Versamento per verifica giroconto"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then()
+                .statusCode(201)
+                .body("tipo", equalTo("VERSAMENTO_IN_BANCA"));
+
+        given()
+            .queryParam("tipo", "ENTRATA")
+            .queryParam("from", "2026-09-16")
+            .queryParam("to", "2026-09-16")
+            .when().get("/api/movimenti")
+            .then()
+                .statusCode(200)
+                .body("content", hasSize(greaterThan(0)));
+    }
+
+    // ── Invariante saldo ───────────────────────────────────────────────────────
+
+    @Test
+    @Order(41)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testSaldoNonCambiaDopoAnnullamento() {
+        Float saldoPre = given()
+            .when().get("/api/cassa/saldo")
+            .then().statusCode(200)
+            .extract().path("saldo");
+
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"USCITA","importo":99.99,
+                     "dataMovimento":"2026-08-01","descrizione":"Uscita da annullare"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then().statusCode(201).extract().path("id");
+
+        Float saldoDopoUscita = given()
+            .when().get("/api/cassa/saldo")
+            .then().statusCode(200).extract().path("saldo");
+
+        org.junit.jupiter.api.Assertions.assertEquals(
+            saldoPre - 99.99f, saldoDopoUscita, 0.02f,
+            "Saldo deve diminuire di 99.99 dopo USCITA");
+
+        given().when().delete("/api/cassa/movimenti/" + id).then().statusCode(204);
+
+        Float saldoDopoAnnullo = given()
+            .when().get("/api/cassa/saldo")
+            .then().statusCode(200).extract().path("saldo");
+
+        // Invariante: un movimento ANNULLATO non deve incidere sul saldo
+        org.junit.jupiter.api.Assertions.assertEquals(
+            saldoPre, saldoDopoAnnullo, 0.02f,
+            "Saldo deve tornare al valore originale dopo annullamento USCITA");
+    }
+
+    // ── Edge case ──────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(42)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testImportoZeroCassaRifiutato() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":0.00,"dataMovimento":"2026-12-01"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(43)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testMovimentoCassaNonTrovato() {
+        given()
+            .when().get("/api/cassa/movimenti/00000000-0000-0000-0000-999999999999")
+            .then()
+                .statusCode(404);
+    }
+
+    @Test
+    @Order(44)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testAnnullaGiaAnnullatoConflict() {
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":5.00,
+                     "dataMovimento":"2026-06-01","descrizione":"Doppio annullo cassa"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then().statusCode(201).extract().path("id");
+
+        given().when().delete("/api/cassa/movimenti/" + id).then().statusCode(204);
+        // Seconda annullazione → CONFLICT
+        given().when().delete("/api/cassa/movimenti/" + id).then().statusCode(409);
+    }
+
+    @Test
+    @Order(45)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testUpdateMovimentoCassa() {
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":60.00,
+                     "dataMovimento":"2026-06-02","descrizione":"Da aggiornare"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then().statusCode(201).extract().path("id");
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":70.00,
+                     "dataMovimento":"2026-06-02","descrizione":"Cassa aggiornata"}
+                    """)
+            .when().put("/api/cassa/movimenti/" + id)
+            .then()
+                .statusCode(200)
+                .body("importo",    equalTo(70.0f))
+                .body("descrizione", equalTo("Cassa aggiornata"));
+    }
+
+    @Test
+    @Order(46)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testFiltraMovimentiCassaPerDate() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":15.00,
+                     "dataMovimento":"2026-05-15","descrizione":"Filtro data cassa"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then().statusCode(201);
+
+        given()
+            .queryParam("from", "2026-05-15")
+            .queryParam("to", "2026-05-15")
+            .when().get("/api/cassa/movimenti")
+            .then()
+                .statusCode(200)
+                .body("content", hasSize(greaterThan(0)));
+    }
 }

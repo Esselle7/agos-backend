@@ -9,13 +9,14 @@ import jakarta.ws.rs.container.ContainerRequestFilter;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
 import lombok.extern.slf4j.Slf4j;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 import java.io.IOException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Rate limiter per IP: 100 richieste/minuto con reset automatico via scheduler.
+ * Rate limiter per IP: richieste/minuto configurabili, reset automatico via scheduler.
  * Aggiunge l'header X-RateLimit-Remaining a ogni risposta consentita.
  */
 @Slf4j
@@ -24,7 +25,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Priority(Priorities.USER)
 public class RateLimitFilter implements ContainerRequestFilter {
 
-    private static final int MAX_REQUESTS_PER_MINUTE = 100;
+    @ConfigProperty(name = "app.rate-limit.max-requests-per-minute", defaultValue = "100")
+    int maxRequestsPerMinute;
 
     private final ConcurrentHashMap<String, AtomicInteger> requestCounts = new ConcurrentHashMap<>();
 
@@ -34,9 +36,9 @@ public class RateLimitFilter implements ContainerRequestFilter {
         AtomicInteger counter = requestCounts.computeIfAbsent(clientIp, k -> new AtomicInteger(0));
         int current = counter.incrementAndGet();
 
-        int remaining = Math.max(0, MAX_REQUESTS_PER_MINUTE - current);
+        int remaining = Math.max(0, maxRequestsPerMinute - current);
 
-        if (current > MAX_REQUESTS_PER_MINUTE) {
+        if (current > maxRequestsPerMinute) {
             log.warn("Rate limit superato per IP: {}", clientIp);
             requestContext.abortWith(
                     Response.status(429)

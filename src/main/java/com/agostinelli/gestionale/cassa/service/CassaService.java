@@ -111,6 +111,13 @@ public class CassaService {
                 .createNativeQuery("SELECT id FROM piano_dei_conti_coge WHERE codice LIKE '10.03%' LIMIT 1")
                 .getSingleResult();
 
+        Short buId = req.businessUnitId();
+        if (buId == null) {
+            buId = ((Number) em
+                    .createNativeQuery("SELECT id FROM business_units ORDER BY id LIMIT 1")
+                    .getSingleResult()).shortValue();
+        }
+
         Movimento banco = new Movimento();
         banco.tipo = "PRELIEVO_DA_BANCA".equals(req.tipo()) ? "USCITA" : "ENTRATA";
         banco.importo = req.importo();
@@ -119,7 +126,7 @@ public class CassaService {
         banco.contoBancarioId = req.contoBancaId();
         banco.metodoPagamentoId = metodoCONTANTI;
         banco.contoCoge = cogeGiroconti;
-        banco.businessUnitId = req.businessUnitId();
+        banco.businessUnitId = buId;
         banco.descrizione = "Giroconto automatico da/per cassa: " +
                 (req.descrizione() != null ? req.descrizione() : req.tipo());
         banco.fonte = "MANUALE";

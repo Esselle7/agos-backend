@@ -422,9 +422,6 @@ class AnagraficaIntegrationTest {
             .when().post("/api/fornitori")
             .then().statusCode(201);
 
-        // Seconda creazione con stessa P.IVA → DB UNIQUE constraint violation
-        // Il servizio non gestisce esplicitamente il duplicato (nessun 409 custom),
-        // quindi ci si aspetta un errore server-side (4xx o 5xx)
         given()
             .contentType(ContentType.JSON)
             .body("""
@@ -432,7 +429,7 @@ class AnagraficaIntegrationTest {
                     """.formatted(piva))
             .when().post("/api/fornitori")
             .then()
-                .statusCode(greaterThanOrEqualTo(400));
+                .statusCode(409);
     }
 
     @Test

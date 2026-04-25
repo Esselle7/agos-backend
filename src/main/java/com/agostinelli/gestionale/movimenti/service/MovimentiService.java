@@ -6,6 +6,7 @@ import com.agostinelli.gestionale.movimenti.dto.*;
 import com.agostinelli.gestionale.movimenti.mapper.MovimentoMapper;
 import com.agostinelli.gestionale.movimenti.repository.MovimentiRepository;
 import com.agostinelli.gestionale.shared.dto.PagedResponse;
+import io.quarkus.cache.CacheInvalidateAll;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
@@ -31,6 +32,9 @@ public class MovimentiService {
      * automaticamente dal trigger DB trg_z_aggiorna_totali_evento – non serve
      * aggiornare l'evento da qui.
      */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
     @Transactional
     public MovimentoDTO createMovimento(MovimentoCreateRequest req, UUID userId) {
         validateCrossFields(req);
@@ -50,6 +54,9 @@ public class MovimentiService {
      * Solo l'autore originale o un ADMIN possono modificare.
      * L'audit trail è gestito dal trigger DB trg_audit_movimenti.
      */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
     @Transactional
     public MovimentoDTO updateMovimento(UUID id, MovimentoUpdateRequest req, UUID userId, boolean isAdmin) {
         Movimento m = findActiveOrThrow(id);

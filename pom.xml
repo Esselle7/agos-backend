@@ -81,6 +81,12 @@
             <artifactId>quarkus-scheduler</artifactId>
         </dependency>
 
+        <!-- MicroProfile Fault Tolerance (per @Timeout su P&L asincrono) -->
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-smallrye-fault-tolerance</artifactId>
+        </dependency>
+
         <!-- Health -->
         <dependency>
             <groupId>io.quarkus</groupId>

@@ -45,6 +45,9 @@ public class AuthResource {
     @ConfigProperty(name = "app.google.redirect-uri")
     String redirectUri;
 
+    @ConfigProperty(name = "app.frontend.url", defaultValue = "http://localhost:4200")
+    String frontendUrl;
+
     /**
      * Avvia il flusso OAuth2: genera uno state CSRF e redirige verso Google.
      */
@@ -94,7 +97,17 @@ public class AuthResource {
             .maxAge(0)
             .build();
 
-        return Response.ok(loginResponse).cookie(clearedCookie).build();
+        String redirectUrl = frontendUrl + "/auth/callback"
+            + "?accessToken=" + loginResponse.accessToken()
+            + "&refreshToken=" + loginResponse.refreshToken()
+            + "&id=" + loginResponse.user().id()
+            + "&nome=" + encode(loginResponse.user().nome())
+            + "&email=" + encode(loginResponse.user().email())
+            + "&ruolo=" + loginResponse.user().ruolo();
+
+        return Response.seeOther(URI.create(redirectUrl))
+            .cookie(clearedCookie)
+            .build();
     }
 
     /**

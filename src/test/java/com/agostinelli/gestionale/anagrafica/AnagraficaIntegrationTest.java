@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.util.List;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 
@@ -524,5 +526,114 @@ class AnagraficaIntegrationTest {
                 .body("find { it.id == 1 }.nome", containsString("BPM"))
                 .body("find { it.id == 3 }.tipo", equalTo("CASSA"))
                 .body("find { it.id == 4 }.tipo", equalTo("DIGITALE"));
+    }
+
+    // ── PIANO DEI CONTI COGE ───────────────────────────────────────────────────
+
+    @Test
+    @Order(50)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testGetPianoContiListaCompleta() {
+        given()
+            .when().get("/api/piano-dei-conti")
+            .then()
+                .statusCode(200)
+                .contentType(ContentType.JSON)
+                .body("$", hasSize(greaterThan(50)))
+                .body("[0].codice", notNullValue())
+                .body("[0].nome",   notNullValue())
+                .body("[0].tipo",   notNullValue());
+    }
+
+    @Test
+    @Order(51)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testGetPianoContiOrdinatiPerCodice() {
+        List<String> codici = given()
+            .when().get("/api/piano-dei-conti")
+            .then()
+                .statusCode(200)
+                .extract().jsonPath().getList("codice", String.class);
+
+        for (int i = 0; i < codici.size() - 1; i++) {
+            org.junit.jupiter.api.Assertions.assertTrue(
+                codici.get(i).compareTo(codici.get(i + 1)) <= 0,
+                "Codici non ordinati: " + codici.get(i) + " > " + codici.get(i + 1)
+            );
+        }
+    }
+
+    @Test
+    @Order(52)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testGetPianoContiFiltroTipoCosto() {
+        given()
+            .queryParam("tipo", "COSTO")
+            .when().get("/api/piano-dei-conti")
+            .then()
+                .statusCode(200)
+                .body("$", hasSize(greaterThan(0)))
+                .body("tipo", everyItem(equalTo("COSTO")));
+    }
+
+    @Test
+    @Order(53)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testGetPianoContiFiltroTipoRicavo() {
+        given()
+            .queryParam("tipo", "RICAVO")
+            .when().get("/api/piano-dei-conti")
+            .then()
+                .statusCode(200)
+                .body("$", hasSize(greaterThan(0)))
+                .body("tipo", everyItem(equalTo("RICAVO")));
+    }
+
+    @Test
+    @Order(54)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testGetPianoContiContieneContiNoti() {
+        given()
+            .when().get("/api/piano-dei-conti")
+            .then()
+                .statusCode(200)
+                .body("find { it.codice == '10.01.001' }.nome", containsString("BPM"))
+                .body("find { it.codice == '10.01.003' }.nome", containsString("contanti"))
+                .body("find { it.codice == '10.01.001' }.tipo", equalTo("ATTIVITA"));
+    }
+
+    @Test
+    @Order(55)
+    @TestSecurity(user = "test-dipendente", roles = {"DIPENDENTE"})
+    void testGetPianoContiComeDipendente() {
+        given()
+            .when().get("/api/piano-dei-conti")
+            .then()
+                .statusCode(200)
+                .body("$", hasSize(greaterThan(0)));
+    }
+
+    @Test
+    @Order(56)
+    void testGetPianoContiSenzaToken() {
+        given()
+            .when().get("/api/piano-dei-conti")
+            .then()
+                .statusCode(401);
+    }
+
+    @Test
+    @Order(57)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testGetPianoContiDtoContieneTuttiCampi() {
+        given()
+            .when().get("/api/piano-dei-conti")
+            .then()
+                .statusCode(200)
+                .body("[0].id",      notNullValue())
+                .body("[0].codice",  notNullValue())
+                .body("[0].nome",    notNullValue())
+                .body("[0].tipo",    notNullValue())
+                .body("[0].livello", notNullValue());
     }
 }

@@ -47,11 +47,9 @@ public class DashboardService {
     @Transactional
     public DashboardKpiDTO getKpi(LocalDate from, LocalDate to, String userId) {
         validateRange(from, to);
-        int fromYM = from.getYear() * 100 + from.getMonthValue();
-        int toYM   = to.getYear()   * 100 + to.getMonthValue();
 
-        // Query 1: aggregati KPI da mv_kpi_mensili
-        Object[] kpi = queryKpiAggregati(fromYM, toYM);
+        // Query 1: aggregati KPI diretti su movimenti (real-time, no MV)
+        Object[] kpi = queryKpiDirect(from, to);
         BigDecimal totalEntrate = toBD(kpi[0]);
         BigDecimal totalUscite  = toBD(kpi[1]);
         BigDecimal margine      = toBD(kpi[2]);
@@ -61,10 +59,21 @@ public class DashboardService {
                 ? margine.divide(totalEntrate, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
                 : null;
 
-        // Query 2: saldi conti da mv_saldi_conti (max 5 righe)
+        // Query 2: saldi conti — diretti su conti_bancari + movimenti liquidati (no MV)
         @SuppressWarnings("unchecked")
         List<Object[]> saldiRows = em.createNativeQuery(
-                "SELECT conto_id, saldo_calcolato FROM mv_saldi_conti ORDER BY conto_id")
+                "SELECT cb.id, " +
+                "cb.saldo_iniziale + COALESCE(SUM(" +
+                "  CASE WHEN m.tipo='ENTRATA' THEN  m.importo_lordo " +
+                "       WHEN m.tipo='USCITA'  THEN -m.importo_lordo " +
+                "       ELSE 0 END), 0) AS saldo_calcolato " +
+                "FROM conti_bancari cb " +
+                "LEFT JOIN movimenti m ON m.conto_bancario_id = cb.id " +
+                "  AND m.stato != 'ANNULLATO' " +
+                "  AND m.data_finanziaria IS NOT NULL " +
+                "WHERE cb.is_active = true " +
+                "GROUP BY cb.id, cb.saldo_iniziale " +
+                "ORDER BY cb.id")
                 .getResultList();
 
         Map<Integer, BigDecimal> saldiMap = new HashMap<>();
@@ -72,7 +81,7 @@ public class DashboardService {
             saldiMap.put(toInt(row[0]), toBD(row[1]));
         }
 
-        // variazioneMese per conti bancari (1=BPM, 2=CA) dal cash flow del mese corrente
+        // variazioneMese per conti bancari (1=BPM, 2=CA) — diretti su movimenti
         Map<Integer, BigDecimal> variazioneMap = queryVariazioneMese(to.getYear(), to.getMonthValue());
 
         BigDecimal saldoBpm    = saldiMap.getOrDefault(1, BigDecimal.ZERO);
@@ -90,7 +99,6 @@ public class DashboardService {
         DashboardKpiDTO.PeriodoDTO periodo = new DashboardKpiDTO.PeriodoDTO(
                 from, to, totalEntrate, totalUscite, margine, marginePct, nMovimenti);
 
-        // calcolaMesePrecedente: stessa query spostata indietro di 1 mese (stessa sessione)
         DashboardKpiDTO.DeltaMesePrecedenteDTO delta =
                 calcolaMesePrecedente(from, to, totalEntrate, totalUscite, margine);
 
@@ -109,13 +117,15 @@ public class DashboardService {
 
         @SuppressWarnings("unchecked")
         List<Object[]> rows = em.createNativeQuery(
-                "SELECT anno, mese, " +
-                "COALESCE(SUM(totale_entrate),0), " +
-                "COALESCE(SUM(totale_uscite),0), " +
-                "COALESCE(SUM(margine),0) " +
-                "FROM mv_kpi_mensili " +
-                "WHERE anno >= :startYear " +
-                "GROUP BY anno, mese ORDER BY anno ASC, mese ASC")
+                "SELECT CAST(EXTRACT(YEAR  FROM m.data_movimento) AS INTEGER), " +
+                "CAST(EXTRACT(MONTH FROM m.data_movimento) AS INTEGER), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='USCITA'  THEN m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE -m.importo_lordo END),0) " +
+                "FROM movimenti m " +
+                "WHERE m.stato != 'ANNULLATO' " +
+                "AND EXTRACT(YEAR FROM m.data_movimento) >= :startYear " +
+                "GROUP BY 1, 2 ORDER BY 1 ASC, 2 ASC")
                 .setParameter("startYear", startYear)
                 .getResultList();
 
@@ -130,20 +140,20 @@ public class DashboardService {
     @Transactional
     public List<FatturatoPerBuDTO> getFatturatoPerBu(LocalDate from, LocalDate to, String userId) {
         validateRange(from, to);
-        int fromYM = from.getYear() * 100 + from.getMonthValue();
-        int toYM   = to.getYear()   * 100 + to.getMonthValue();
 
         @SuppressWarnings("unchecked")
         List<Object[]> rows = em.createNativeQuery(
-                "SELECT business_unit_id, business_unit_nome, " +
-                "COALESCE(SUM(totale_entrate),0), " +
-                "COALESCE(SUM(totale_uscite),0), " +
-                "COALESCE(SUM(margine),0) " +
-                "FROM mv_kpi_mensili " +
-                "WHERE (anno * 100 + mese) >= :fromYM AND (anno * 100 + mese) <= :toYM " +
-                "GROUP BY business_unit_id, business_unit_nome")
-                .setParameter("fromYM", fromYM)
-                .setParameter("toYM", toYM)
+                "SELECT m.business_unit_id, bu.nome, " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='USCITA'  THEN m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE -m.importo_lordo END),0) " +
+                "FROM movimenti m " +
+                "JOIN business_units bu ON bu.id = m.business_unit_id " +
+                "WHERE m.stato != 'ANNULLATO' " +
+                "AND m.data_movimento >= :from AND m.data_movimento <= :to " +
+                "GROUP BY m.business_unit_id, bu.nome")
+                .setParameter("from", from)
+                .setParameter("to", to)
                 .getResultList();
 
         Map<Short, FatturatoPerBuDTO> risultati = new LinkedHashMap<>();
@@ -177,6 +187,9 @@ public class DashboardService {
     // WHY query nativa e NON MV: dati real-time; un movimento appena inserito
     // deve apparire subito. Le MV si aggiornano ogni 30 min.
 
+    // WHY LEFT JOIN su conti_bancari: i movimenti DA_LIQUIDARE non hanno conto_bancario_id,
+    // ma devono comunque comparire nelle ultime transazioni (sono economicamente rilevanti).
+    // Ordinati per created_at DESC: mostra sempre il movimento più recentemente inserito per primo.
     @Transactional
     public List<MovimentoDTO> getUltimeTransazioni(int limit) {
         int safeLimit = Math.min(limit, 50);
@@ -184,14 +197,14 @@ public class DashboardService {
         @SuppressWarnings("unchecked")
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT m.id, m.data_movimento, m.tipo, m.importo_lordo, " +
-                "m.descrizione, m.stato, m.fonte, " +
+                "m.descrizione, m.stato, m.fonte, m.data_finanziaria, " +
                 "c.nome AS categoria_nome, bu.nome AS bu_nome, cb.nome AS conto_nome " +
                 "FROM movimenti m " +
                 "LEFT JOIN categorie c ON c.id = m.categoria_id " +
                 "JOIN business_units bu ON bu.id = m.business_unit_id " +
-                "JOIN conti_bancari cb ON cb.id = m.conto_bancario_id " +
+                "LEFT JOIN conti_bancari cb ON cb.id = m.conto_bancario_id " +
                 "WHERE m.stato != 'ANNULLATO' " +
-                "ORDER BY m.data_movimento DESC, m.created_at DESC NULLS LAST " +
+                "ORDER BY m.created_at DESC NULLS LAST " +
                 "LIMIT :limit")
                 .setParameter("limit", safeLimit)
                 .getResultList();
@@ -237,25 +250,33 @@ public class DashboardService {
 
     // ── helpers privati ───────────────────────────────────────────────────────
 
-    private Object[] queryKpiAggregati(int fromYM, int toYM) {
+    private Object[] queryKpiDirect(LocalDate from, LocalDate to) {
         return (Object[]) em.createNativeQuery(
-                "SELECT COALESCE(SUM(totale_entrate),0), COALESCE(SUM(totale_uscite),0), " +
-                "COALESCE(SUM(margine),0), COALESCE(SUM(n_movimenti),0) " +
-                "FROM mv_kpi_mensili " +
-                "WHERE (anno * 100 + mese) >= :fromYM AND (anno * 100 + mese) <= :toYM")
-                .setParameter("fromYM", fromYM)
-                .setParameter("toYM", toYM)
+                "SELECT " +
+                "COALESCE(SUM(CASE WHEN tipo='ENTRATA' THEN importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN tipo='USCITA'  THEN importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN tipo='ENTRATA' THEN importo_lordo ELSE -importo_lordo END),0), " +
+                "COUNT(*) " +
+                "FROM movimenti " +
+                "WHERE stato != 'ANNULLATO' " +
+                "AND data_movimento >= :from AND data_movimento <= :to")
+                .setParameter("from", from)
+                .setParameter("to", to)
                 .getSingleResult();
     }
 
     private Map<Integer, BigDecimal> queryVariazioneMese(int anno, int mese) {
         @SuppressWarnings("unchecked")
         List<Object[]> rows = em.createNativeQuery(
-                "SELECT conto_bancario_id, " +
-                "entrate_operative + entrate_finanziarie " +
-                "- uscite_operative - uscite_investimento - uscite_finanziarie " +
-                "FROM mv_cash_flow_statement " +
-                "WHERE anno = :anno AND mese = :mese AND conto_bancario_id IN (1, 2)")
+                "SELECT m.conto_bancario_id, " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE -m.importo_lordo END),0) " +
+                "FROM movimenti m " +
+                "WHERE m.stato != 'ANNULLATO' " +
+                "AND m.data_finanziaria IS NOT NULL " +
+                "AND EXTRACT(YEAR  FROM m.data_finanziaria) = :anno " +
+                "AND EXTRACT(MONTH FROM m.data_finanziaria) = :mese " +
+                "AND m.conto_bancario_id IN (1, 2) " +
+                "GROUP BY m.conto_bancario_id")
                 .setParameter("anno", anno)
                 .setParameter("mese", mese)
                 .getResultList();
@@ -273,10 +294,8 @@ public class DashboardService {
 
         LocalDate prevFrom = from.minusMonths(1);
         LocalDate prevTo   = to.minusMonths(1);
-        int prevFromYM = prevFrom.getYear() * 100 + prevFrom.getMonthValue();
-        int prevToYM   = prevTo.getYear()   * 100 + prevTo.getMonthValue();
 
-        Object[] prev = queryKpiAggregati(prevFromYM, prevToYM);
+        Object[] prev = queryKpiDirect(prevFrom, prevTo);
         BigDecimal prevEntrate = toBD(prev[0]);
         BigDecimal prevUscite  = toBD(prev[1]);
         BigDecimal prevMargine = toBD(prev[2]);
@@ -293,41 +312,42 @@ public class DashboardService {
 
     private MovimentoDTO mapRowToMovimentoDTO(Object[] r) {
         // r[0]=id, r[1]=data_movimento, r[2]=tipo, r[3]=importo_lordo,
-        // r[4]=descrizione, r[5]=stato, r[6]=fonte,
-        // r[7]=categoria_nome, r[8]=bu_nome, r[9]=conto_nome
+        // r[4]=descrizione, r[5]=stato, r[6]=fonte, r[7]=data_finanziaria,
+        // r[8]=categoria_nome, r[9]=bu_nome, r[10]=conto_nome
         BigDecimal importoLordo = toBD(r[3]);
         return new MovimentoDTO(
-                toUUID(r[0]),        // id
-                (String) r[2],       // tipo
-                importoLordo,        // importo
-                toLocalDate(r[1]),   // dataMovimento
-                null,                // dataCompetenza
-                null,                // dataLiquidita
-                null,                // canale
-                null,                // contoId
-                (String) r[9],       // contoNome
-                null,                // businessUnitId
-                (String) r[8],       // businessUnitNome
-                null,                // categoriaId
-                (String) r[7],       // categoriaNome
-                null,                // sottocategoriaId
-                null,                // sottocategoriaNome
-                null,                // fornitoreId
-                null,                // fornitoreNome
-                null,                // eventoId
-                null,                // eventoNome
-                null,                // tipoEventoMovimento
-                (String) r[4],       // descrizione
-                null,                // note
-                importoLordo,        // importoLordo
-                null,                // importoCommissione
-                null,                // aliquotaIva
-                null,                // importoIva
-                (String) r[5],       // stato
-                (String) r[6],       // fonte
-                null,                // allegatoPath
-                null,                // createdAt
-                null                 // createdBy
+                toUUID(r[0]),          // id
+                (String) r[2],         // tipo
+                importoLordo,          // importo
+                toLocalDate(r[1]),     // dataMovimento (competenza economica)
+                null,                  // dataCompetenza
+                toLocalDate(r[7]),     // dataFinanziaria
+                null,                  // dataLiquidita
+                null,                  // canale
+                null,                  // contoId
+                (String) r[10],        // contoNome
+                null,                  // businessUnitId
+                (String) r[9],         // businessUnitNome
+                null,                  // categoriaId
+                (String) r[8],         // categoriaNome
+                null,                  // sottocategoriaId
+                null,                  // sottocategoriaNome
+                null,                  // fornitoreId
+                null,                  // fornitoreNome
+                null,                  // eventoId
+                null,                  // eventoNome
+                null,                  // tipoEventoMovimento
+                (String) r[4],         // descrizione
+                null,                  // note
+                importoLordo,          // importoLordo
+                null,                  // importoCommissione
+                null,                  // aliquotaIva
+                null,                  // importoIva
+                (String) r[5],         // stato
+                (String) r[6],         // fonte
+                null,                  // allegatoPath
+                null,                  // createdAt
+                null                   // createdBy
         );
     }
 

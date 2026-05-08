@@ -44,19 +44,28 @@ public class Movimento {
     @Column(name = "importo_commissione", precision = 15, scale = 2)
     public BigDecimal importoCommissione;
 
+    /** Data di competenza economica (impatto P&L / EBITDA). Partition key, sempre valorizzata. */
     @Column(name = "data_movimento", nullable = false)
     public LocalDate dataMovimento;
 
+    /** Alias economico per mv_conto_economico_mensile. Auto-impostato = dataMovimento in @PrePersist. */
     @Column(name = "data_competenza")
     public LocalDate dataCompetenza;
 
+    /** Data di liquidazione effettiva (quando i soldi entrano/escono dal conto).
+     *  null = DA_LIQUIDARE; valorizzata = REGISTRATO (liquidato). */
+    @Column(name = "data_finanziaria")
+    public LocalDate dataFinanziaria;
+
+    /** Scadenza finanziaria attesa. Obbligatoria quando dataFinanziaria è null.
+     *  Auto-impostata = dataFinanziaria quando il movimento viene liquidato. */
     @Column(name = "data_liquidita")
     public LocalDate dataLiquidita;
 
-    @Column(name = "conto_bancario_id", nullable = false)
+    @Column(name = "conto_bancario_id")
     public Short contoBancarioId;
 
-    @Column(name = "metodo_pagamento_id", nullable = false)
+    @Column(name = "metodo_pagamento_id")
     public Integer metodoPagamentoId;
 
     @Column(name = "aliquota_iva_id")
@@ -123,6 +132,8 @@ public class Movimento {
         if (stato == null) stato = "REGISTRATO";
         if (fonte == null) fonte = "MANUALE";
         if (importoCommissione == null) importoCommissione = BigDecimal.ZERO;
+        // Garantisce che data_competenza sia sempre valorizzata per mv_conto_economico_mensile
+        if (dataCompetenza == null) dataCompetenza = dataMovimento;
     }
 
     @PreUpdate

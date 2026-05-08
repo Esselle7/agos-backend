@@ -16,6 +16,8 @@ public record MovimentoUpdateRequest(
         BigDecimal aliquotaIva,
         LocalDate dataMovimento,
         LocalDate dataCompetenza,
+        /** Impostare per liquidare il movimento (REGISTRATO). null = rimane DA_LIQUIDARE. */
+        LocalDate dataFinanziaria,
         LocalDate dataLiquidita,
         Short contoBancarioId,
         Integer metodoPagamentoId,

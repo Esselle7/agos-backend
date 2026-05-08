@@ -28,9 +28,11 @@ public class MovimentiService {
     /**
      * Crea un movimento con validazione cross-field e calcolo dei campi derivati.
      *
-     * I totali sull'evento (importo_incassato, caparre, ecc.) vengono aggiornati
-     * automaticamente dal trigger DB trg_z_aggiorna_totali_evento – non serve
-     * aggiornare l'evento da qui.
+     * LOGICA DI LIQUIDAZIONE:
+     *   dataFinanziaria != null → REGISTRATO (liquidato); dataLiquidita = dataFinanziaria
+     *   dataFinanziaria == null → DA_LIQUIDARE; dataLiquidita (scadenzaFinanziaria) obbligatoria
+     *
+     * I totali sull'evento vengono aggiornati automaticamente dal trigger DB.
      */
     @CacheInvalidateAll(cacheName = "dashboard-kpi")
     @CacheInvalidateAll(cacheName = "dashboard-andamento")
@@ -43,6 +45,13 @@ public class MovimentiService {
         m.createdBy = userId;
         m.fonte = req.fonte() != null ? req.fonte() : "MANUALE";
 
+        if (req.dataFinanziaria() != null) {
+            m.stato = "REGISTRATO";
+            m.dataLiquidita = req.dataFinanziaria(); // scadenzaFinanziaria = dataFinanziaria
+        } else {
+            m.stato = "DA_LIQUIDARE";
+        }
+
         applyDerivedAmounts(m, req.importoLordo(), req.aliquotaIva());
 
         repo.persist(m);
@@ -52,7 +61,9 @@ public class MovimentiService {
     /**
      * Aggiorna parzialmente un movimento (PATCH semantics).
      * Solo l'autore originale o un ADMIN possono modificare.
-     * L'audit trail è gestito dal trigger DB trg_audit_movimenti.
+     *
+     * Se la richiesta imposta dataFinanziaria su un DA_LIQUIDARE, il movimento
+     * viene promosso a REGISTRATO e dataLiquidita viene sincronizzata.
      */
     @CacheInvalidateAll(cacheName = "dashboard-kpi")
     @CacheInvalidateAll(cacheName = "dashboard-andamento")
@@ -68,11 +79,16 @@ public class MovimentiService {
 
         mapper.updateFromRequest(m, req);
 
-        // Ricalcola gli importi derivati se vengono aggiornati
-        BigDecimal newImportoLordo = req.importoLordo() != null ? req.importoLordo() : null;
-        BigDecimal newAliquotaIva  = req.aliquotaIva()  != null ? req.aliquotaIva()  : null;
-        if (newImportoLordo != null || newAliquotaIva != null) {
-            applyDerivedAmounts(m, newImportoLordo, newAliquotaIva);
+        if (req.importoLordo() != null || req.aliquotaIva() != null) {
+            applyDerivedAmounts(m, req.importoLordo(), req.aliquotaIva());
+        }
+
+        // Sincronizza stato e scadenzaFinanziaria in base alla presenza di dataFinanziaria
+        if (m.dataFinanziaria != null && !"ANNULLATO".equals(m.stato) && !"RICONCILIATO".equals(m.stato)) {
+            m.stato = "REGISTRATO";
+            m.dataLiquidita = m.dataFinanziaria;
+        } else if (m.dataFinanziaria == null && !"ANNULLATO".equals(m.stato) && !"RICONCILIATO".equals(m.stato)) {
+            m.stato = "DA_LIQUIDARE";
         }
 
         return mapper.toDTO(m);
@@ -179,10 +195,43 @@ public class MovimentiService {
         return m;
     }
 
+    /**
+     * Validazione cross-field per create.
+     *
+     * Regola 1 — dataFinanziaria presente (LIQUIDATO):
+     *   - contoBancarioId e metodoPagamentoId obbligatori
+     *   - dataLiquidita facoltativa (verrà auto-impostata = dataFinanziaria)
+     *
+     * Regola 2 — dataFinanziaria assente (DA_LIQUIDARE):
+     *   - dataLiquidita (scadenzaFinanziaria) obbligatoria
+     *   - contoBancarioId e metodoPagamentoId devono essere assenti
+     */
     private void validateCrossFields(MovimentoCreateRequest req) {
         if (req.tipoEventoMovimento() != null && req.eventoId() == null) {
             throw new ApiException(Response.Status.BAD_REQUEST, "EVENTO_MANCANTE",
                     "tipoEventoMovimento richiede la presenza di eventoId");
+        }
+
+        boolean isLiquidato = req.dataFinanziaria() != null;
+
+        if (isLiquidato) {
+            if (req.contoBancarioId() == null || req.metodoPagamentoId() == null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "LIQUIDATO_INCOMPLETO",
+                        "Conto bancario e metodo pagamento sono obbligatori per movimenti liquidati (dataFinanziaria valorizzata)");
+            }
+            if (req.dataFinanziaria().isAfter(LocalDate.now())) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "DATA_FINANZIARIA_FUTURA",
+                        "La data di liquidazione effettiva non può essere nel futuro");
+            }
+        } else {
+            if (req.dataLiquidita() == null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "SCADENZA_FINANZIARIA_MANCANTE",
+                        "La scadenza finanziaria (dataLiquidita) è obbligatoria per movimenti non ancora liquidati");
+            }
+            if (req.contoBancarioId() != null || req.metodoPagamentoId() != null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "LIQUIDITA_INCONSISTENTE",
+                        "Non puoi specificare conto bancario o metodo pagamento per movimenti non ancora liquidati (dataFinanziaria assente)");
+            }
         }
     }
 

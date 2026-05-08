@@ -18,6 +18,7 @@ public interface MovimentoMapper {
     @Mapping(target = "stato", constant = "REGISTRATO")
     @Mapping(target = "fonteImportazioneId", ignore = true)
     @Mapping(target = "fonte", expression = "java(req.fonte() != null ? req.fonte() : \"MANUALE\")")
+    // dataFinanziaria, dataLiquidita, dataCompetenza mappati per nome automaticamente
     Movimento fromRequest(MovimentoCreateRequest req);
 
     @Mapping(source = "importo", target = "importo")
@@ -25,7 +26,8 @@ public interface MovimentoMapper {
 
     /**
      * PATCH semantics: aggiorna solo i campi non-null.
-     * importoCommissione e importoIva vengono ricalcolati dal service, non qui.
+     * importoCommissione, importoIva e stato vengono ricalcolati dal service, non qui.
+     * dataFinanziaria viene mappata automaticamente per nome.
      */
     @BeanMapping(nullValuePropertyMappingStrategy = NullValuePropertyMappingStrategy.IGNORE)
     @Mapping(target = "id", ignore = true)

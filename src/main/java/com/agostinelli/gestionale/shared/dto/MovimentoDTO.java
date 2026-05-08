@@ -15,6 +15,8 @@ public record MovimentoDTO(
         BigDecimal importo,
         LocalDate dataMovimento,
         LocalDate dataCompetenza,
+        /** Data di liquidazione effettiva. null = DA_LIQUIDARE. */
+        LocalDate dataFinanziaria,
         LocalDate dataLiquidita,
         String canale,
         UUID contoId,

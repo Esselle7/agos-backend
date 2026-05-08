@@ -136,16 +136,20 @@ public class ReportingService {
         int safeGiorni = Math.min(giorni, 365);
         LocalDate oggi = LocalDate.now();
 
-        // Parte 1 – STORICO: ultimi 30 giorni con granularità giornaliera
+        // Parte 1 – STORICO: ultimi 30 giorni con granularità giornaliera.
+        // WHY data_finanziaria: il cash flow storico deve usare la data di liquidazione
+        // effettiva (non quella economica) per riflettere i soldi realmente mossi.
         LocalDate storFrom = oggi.minusDays(30);
         @SuppressWarnings("unchecked")
         List<Object[]> storRows = em.createNativeQuery(
-                "SELECT data_movimento, " +
+                "SELECT data_finanziaria, " +
                 "COALESCE(SUM(CASE WHEN tipo='ENTRATA' THEN importo_lordo ELSE 0 END),0), " +
                 "COALESCE(SUM(CASE WHEN tipo='USCITA'  THEN importo_lordo ELSE 0 END),0) " +
                 "FROM movimenti " +
-                "WHERE stato != 'ANNULLATO' AND data_movimento BETWEEN :from AND :oggi " +
-                "GROUP BY data_movimento ORDER BY data_movimento ASC")
+                "WHERE stato != 'ANNULLATO' " +
+                "AND data_finanziaria IS NOT NULL " +
+                "AND data_finanziaria BETWEEN :from AND :oggi " +
+                "GROUP BY data_finanziaria ORDER BY data_finanziaria ASC")
                 .setParameter("from", storFrom)
                 .setParameter("oggi", oggi)
                 .getResultList();

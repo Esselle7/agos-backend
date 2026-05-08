@@ -246,26 +246,38 @@ public class ReportingResource {
         // r[10]=categoria_nome, r[11]=fornitore_nome, r[12]=bu_nome, r[13]=conto_nome
         BigDecimal importoLordo = toBD(r[3]);
         return new MovimentoDTO(
-                toUUID(r[0]),
-                (String) r[2],
-                importoLordo,
-                toLocalDate(r[1]),
-                null, null, null,
-                null, (String) r[13],
-                null, (String) r[12],
-                null, (String) r[10],
-                null, null,
-                null, (String) r[11],
-                null, null, null,
-                (String) r[7],
-                null,
-                importoLordo,
-                toBD(r[6]),
-                null,
-                toBD(r[5]),
-                (String) r[8],
-                (String) r[9],
-                null, null, null
+                toUUID(r[0]),          // id
+                (String) r[2],         // tipo
+                importoLordo,          // importo
+                toLocalDate(r[1]),     // dataMovimento
+                null,                  // dataCompetenza
+                null,                  // dataFinanziaria
+                null,                  // dataLiquidita
+                null,                  // canale
+                null,                  // contoId
+                (String) r[13],        // contoNome
+                null,                  // businessUnitId
+                (String) r[12],        // businessUnitNome
+                null,                  // categoriaId
+                (String) r[10],        // categoriaNome
+                null,                  // sottocategoriaId
+                null,                  // sottocategoriaNome
+                null,                  // fornitoreId
+                (String) r[11],        // fornitoreNome
+                null,                  // eventoId
+                null,                  // eventoNome
+                null,                  // tipoEventoMovimento
+                (String) r[7],         // descrizione
+                null,                  // note
+                importoLordo,          // importoLordo
+                toBD(r[6]),            // importoCommissione
+                null,                  // aliquotaIva
+                toBD(r[5]),            // importoIva
+                (String) r[8],         // stato
+                (String) r[9],         // fonte
+                null,                  // allegatoPath
+                null,                  // createdAt
+                null                   // createdBy
         );
     }
 

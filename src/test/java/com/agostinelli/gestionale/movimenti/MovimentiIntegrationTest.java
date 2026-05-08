@@ -738,6 +738,87 @@ class MovimentiIntegrationTest {
                 .body("stato", equalTo("RICONCILIATO"));
     }
 
+    // ── Liquidità immediata vs futura ──────────────────────────────────────────
+
+    @Test
+    @Order(110)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testMovimentoLiquiditaFuturaSenzaContoOk() {
+        // dataLiquidita > dataMovimento: conto e metodo NON richiesti → 201
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"USCITA","importo":300.00,
+                     "dataMovimento":"2026-05-03","dataCompetenza":"2026-05-03",
+                     "dataLiquidita":"2026-08-01",
+                     "businessUnitId":1,"contoCoge":%d,
+                     "descrizione":"Fattura a 90 giorni"}
+                    """.formatted(validContoCoge))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(201)
+                .body("stato", equalTo("DA_LIQUIDARE"))
+                .body("contoBancarioId", nullValue())
+                .body("metodoPagamentoId", nullValue());
+    }
+
+    @Test
+    @Order(111)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testMovimentoLiquiditaOggiSenzaContoRifiutato() {
+        // dataLiquidita == dataMovimento: liquidità immediata → conto obbligatorio → 400
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"USCITA","importo":300.00,
+                     "dataMovimento":"2026-05-03","dataLiquidita":"2026-05-03",
+                     "businessUnitId":1,"contoCoge":%d,
+                     "descrizione":"Pagamento immediato senza conto"}
+                    """.formatted(validContoCoge))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(112)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testMovimentoLiquiditaFuturaConContoRifiutato() {
+        // dataLiquidita futura ma conto presente: inconsistente → 400
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"USCITA","importo":300.00,
+                     "dataMovimento":"2026-05-03","dataLiquidita":"2026-08-01",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "descrizione":"Futuro con conto specificato"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(400);
+    }
+
+    @Test
+    @Order(113)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testMovimentoSenzaDataLiquiditaConContoOk() {
+        // dataLiquidita null: liquidità immediata → conto obbligatorio e presente → 201
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":150.00,
+                     "dataMovimento":"2026-05-03",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "descrizione":"Pagamento immediato completo"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(201)
+                .body("stato", equalTo("REGISTRATO"));
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private String buildCreateRequest(String tipo, String importo, String descrizione, String tipoEvento) {

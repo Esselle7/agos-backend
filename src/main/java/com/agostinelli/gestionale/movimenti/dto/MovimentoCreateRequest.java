@@ -27,13 +27,26 @@ public record MovimentoCreateRequest(
         @NotNull
         LocalDate dataMovimento,
 
+        /** Alias economico, auto-impostato = dataMovimento dal backend se null. */
         LocalDate dataCompetenza,
+
+        /**
+         * Data di liquidazione effettiva (quando i soldi entrano/escono dal conto).
+         * null = movimento DA_LIQUIDARE; valorizzata = REGISTRATO (liquidato).
+         * Quando valorizzata: contoBancarioId e metodoPagamentoId diventano obbligatori
+         * e dataLiquidita viene auto-impostata uguale a dataFinanziaria.
+         */
+        LocalDate dataFinanziaria,
+
+        /**
+         * Scadenza finanziaria attesa (informativa).
+         * Obbligatoria quando dataFinanziaria è null.
+         * Auto-impostata = dataFinanziaria quando il movimento è liquidato.
+         */
         LocalDate dataLiquidita,
 
-        @NotNull
         Short contoBancarioId,
 
-        @NotNull
         Integer metodoPagamentoId,
 
         @NotNull

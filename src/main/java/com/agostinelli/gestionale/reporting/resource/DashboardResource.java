@@ -75,13 +75,24 @@ public class DashboardResource {
 
     @GET
     @Path("/scadenze-imminenti")
-    public List<ScadenzaDTO> scadenzeImminenti(
-            @QueryParam("giorni") @DefaultValue("30") int giorni) {
+    public ScadenzeImminentiDTO scadenzeImminenti(
+            @QueryParam("from")    LocalDate from,
+            @QueryParam("to")      LocalDate to,
+            @QueryParam("period")  @DefaultValue("MTD") String period) {
 
-        if (giorni > 90) {
-            throw new ApiException(Response.Status.BAD_REQUEST, "PARAM_OUT_OF_RANGE", "giorni max 90");
+        DateRangeFilter.Period p;
+        try {
+            p = DateRangeFilter.Period.valueOf(period);
+        } catch (IllegalArgumentException e) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "INVALID_PERIOD",
+                    "Periodo non valido: " + period + ". Usare MTD, QTD, YTD o CUSTOM");
         }
-        return service.getScadenzeImminenti(giorni);
+        if (p == DateRangeFilter.Period.CUSTOM && (from == null || to == null)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "MISSING_RANGE",
+                    "from e to sono obbligatori per period=CUSTOM");
+        }
+        DateRangeFilter range = DateRangeFilter.resolveFullPeriod(p, from, to);
+        return service.getScadenzeImminenti(range.from(), range.to());
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

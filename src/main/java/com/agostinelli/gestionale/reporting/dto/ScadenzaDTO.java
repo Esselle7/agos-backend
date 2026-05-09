@@ -10,5 +10,6 @@ public record ScadenzaDTO(
         String descrizione,
         BigDecimal importoAtteso,
         LocalDate dataScadenza,
-        String urgenza
+        String urgenza,
+        String stato
 ) {}

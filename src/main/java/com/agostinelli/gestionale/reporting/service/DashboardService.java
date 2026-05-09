@@ -217,35 +217,55 @@ public class DashboardService {
     // real-time; la MV mv_redditivita_eventi sarebbe stale in modo inaccettabile.
 
     @Transactional
-    public List<ScadenzaDTO> getScadenzeImminenti(int giorni) {
-        int safeGiorni = Math.min(giorni, 90);
-        LocalDate oggi  = LocalDate.now();
-        LocalDate limite = oggi.plusDays(safeGiorni);
+    public ScadenzeImminentiDTO getScadenzeImminenti(LocalDate from, LocalDate to) {
+        LocalDate oggi = LocalDate.now();
 
+        // ── Query 1: tutti gli eventi CONFERMATI nel periodo ─────────────
         @SuppressWarnings("unchecked")
-        List<Object[]> rows = em.createNativeQuery(
+        List<Object[]> eventiRows = em.createNativeQuery(
                 "SELECT e.id, e.nome, e.data_evento, " +
                 "(e.importo_totale_preventivato - e.importo_incassato) AS importo_residuo " +
                 "FROM eventi e " +
                 "WHERE e.stato = 'CONFERMATO' " +
-                "AND (e.importo_totale_preventivato - e.importo_incassato) > 0 " +
-                "AND e.data_evento BETWEEN :oggi AND :limite " +
+                "AND e.data_evento BETWEEN :from AND :to " +
                 "ORDER BY e.data_evento ASC")
-                .setParameter("oggi", oggi)
-                .setParameter("limite", limite)
+                .setParameter("from", from)
+                .setParameter("to", to)
                 .getResultList();
 
-        return rows.stream().map(r -> {
+        List<ScadenzaDTO> eventi = eventiRows.stream().map(r -> {
             LocalDate dataEvento = toLocalDate(r[2]);
-            long giorniAllaScadenza = ChronoUnit.DAYS.between(oggi, dataEvento);
-            String urgenza;
-            if      (giorniAllaScadenza < 7)  urgenza = "ALTA";
-            else if (giorniAllaScadenza < 15) urgenza = "MEDIA";
-            else                              urgenza = "BASSA";
-
+            long gg = ChronoUnit.DAYS.between(oggi, dataEvento);
+            String urgenza = gg < 7 ? "ALTA" : gg < 15 ? "MEDIA" : "BASSA";
+            BigDecimal residuo = toBD(r[3]);
+            String stato = residuo.compareTo(BigDecimal.ZERO) > 0 ? "PENDING" : "PAID";
             return new ScadenzaDTO("SALDO_EVENTO", toUUID(r[0]), (String) r[1],
-                    toBD(r[3]), dataEvento, urgenza);
+                    residuo, dataEvento, urgenza, stato);
         }).toList();
+
+        // ── Query 2: rate ricorrenti PENDING e PAID nel periodo ───────────
+        @SuppressWarnings("unchecked")
+        List<Object[]> rateRows = em.createNativeQuery(
+                "SELECT rei.id, rep.descrizione, rei.data_scadenza, rei.importo, rei.stato " +
+                "FROM recurring_expense_installment rei " +
+                "JOIN recurring_expense_plan rep ON rep.id = rei.piano_id " +
+                "WHERE rei.stato IN ('PENDING', 'PAID') " +
+                "AND rep.stato IN ('ATTIVO', 'COMPLETATO') " +
+                "AND rei.data_scadenza BETWEEN :from AND :to " +
+                "ORDER BY rei.stato ASC, rei.data_scadenza ASC")
+                .setParameter("from", from)
+                .setParameter("to", to)
+                .getResultList();
+
+        List<ScadenzaDTO> rateRicorrenti = rateRows.stream().map(r -> {
+            LocalDate dataScadenza = toLocalDate(r[2]);
+            long gg = ChronoUnit.DAYS.between(oggi, dataScadenza);
+            String urgenza = gg < 7 ? "ALTA" : gg < 15 ? "MEDIA" : "BASSA";
+            return new ScadenzaDTO("RATA_RICORRENTE", toUUID(r[0]), (String) r[1],
+                    toBD(r[3]), dataScadenza, urgenza, (String) r[4]);
+        }).toList();
+
+        return new ScadenzeImminentiDTO(eventi, rateRicorrenti);
     }
 
     // ── helpers privati ───────────────────────────────────────────────────────

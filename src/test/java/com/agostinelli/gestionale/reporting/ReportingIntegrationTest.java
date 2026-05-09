@@ -467,51 +467,62 @@ class ReportingIntegrationTest {
     @Test
     @Order(60)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void scadenzeImminentiDefault_200_lista() {
+    void scadenzeImminentiDefault_200_splitDTO() {
         given()
             .when().get("/api/dashboard/scadenze-imminenti")
             .then()
                 .statusCode(200)
-                .body("$", instanceOf(java.util.List.class));
+                .body("eventi", instanceOf(java.util.List.class))
+                .body("rateRicorrenti", instanceOf(java.util.List.class));
     }
 
     @Test
     @Order(61)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void scadenzeImminentiGiorni91_400() {
+    void scadenzeImminentiPeriodoInvalido_400() {
         given()
-            .queryParam("giorni", 91)
+            .queryParam("period", "INVALID")
             .when().get("/api/dashboard/scadenze-imminenti")
             .then()
                 .statusCode(400)
-                .body("code", equalTo("PARAM_OUT_OF_RANGE"));
+                .body("code", equalTo("INVALID_PERIOD"));
     }
 
     @Test
     @Order(62)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void scadenzeImminentiGiorni90_200_valoreConfineBoundary() {
-        // giorni=90 è esattamente il limite – deve restituire 200 (non 400)
+    void scadenzeImminentiCustomSenzaDate_400() {
         given()
-            .queryParam("giorni", 90)
+            .queryParam("period", "CUSTOM")
             .when().get("/api/dashboard/scadenze-imminenti")
-            .then().statusCode(200);
+            .then()
+                .statusCode(400)
+                .body("code", equalTo("MISSING_RANGE"));
     }
 
     @Test
     @Order(63)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void scadenzeImminenti_urgenzaValida() {
-        List<Map<String, Object>> scadenze = given()
-            .queryParam("giorni", 90)
+        io.restassured.path.json.JsonPath jp = given()
             .when().get("/api/dashboard/scadenze-imminenti")
             .then().statusCode(200)
-            .extract().jsonPath().getList("$");
+            .extract().jsonPath();
 
-        for (Map<String, Object> s : scadenze) {
+        List<Map<String, Object>> eventi       = jp.getList("eventi");
+        List<Map<String, Object>> rateRicorr   = jp.getList("rateRicorrenti");
+
+        List<Map<String, Object>> tutti = new java.util.ArrayList<>();
+        tutti.addAll(eventi);
+        tutti.addAll(rateRicorr);
+
+        for (Map<String, Object> s : tutti) {
             String urgenza = (String) s.get("urgenza");
             assertTrue(urgenza != null && List.of("ALTA","MEDIA","BASSA").contains(urgenza),
                 "urgenza deve essere ALTA|MEDIA|BASSA, trovato: " + urgenza);
+            String stato = (String) s.get("stato");
+            assertTrue(stato != null && List.of("PENDING","PAID").contains(stato),
+                "stato deve essere PENDING|PAID, trovato: " + stato);
         }
     }
 

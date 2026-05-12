@@ -75,8 +75,7 @@ public class EventiResource {
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
     public Response create(@Valid EventoCreateRequest req, @Context SecurityContext ctx) {
         UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
-        boolean isAdmin = ctx.isUserInRole("ADMIN");
-        EventoDTO dto = service.createEvento(req, userId, isAdmin);
+        EventoDTO dto = service.createEvento(req, userId);
         return Response.status(Response.Status.CREATED).entity(dto).build();
     }
 
@@ -96,7 +95,7 @@ public class EventiResource {
 
     @DELETE
     @Path("/{id}")
-    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    @RolesAllowed("ADMIN")
     public Response delete(@PathParam("id") UUID id) {
         service.deleteEvento(id);
         return Response.noContent().build();
@@ -106,7 +105,7 @@ public class EventiResource {
 
     @POST
     @Path("/{id}/pagamenti")
-    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    @RolesAllowed("ADMIN")
     public Response registraPagamento(
             @PathParam("id") UUID id,
             @Valid PagamentoRequest req,
@@ -114,14 +113,10 @@ public class EventiResource {
 
         UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
         RegistraPagamentoResult result = service.registraPagamento(id, req, userId);
-
         Response.ResponseBuilder rb = Response.status(Response.Status.CREATED).entity(result.dto());
-
-        // Suggerisce al client di completare l'evento quando il saldo è stato azzerato
-        if (result.suggerisciCompletamento()) {
+        if (result.suggestCompletamento()) {
             rb.header("X-Suggest-Completamento", "true");
         }
-
         return rb.build();
     }
 
@@ -149,7 +144,7 @@ public class EventiResource {
 
     @POST
     @Path("/{id}/partecipanti")
-    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    @RolesAllowed("ADMIN")
     public Response aggiungiPartecipante(
             @PathParam("id") UUID id,
             @Valid AggiungiPartecipanteRequest req) {
@@ -167,7 +162,7 @@ public class EventiResource {
 
     @DELETE
     @Path("/partecipanti/{id}")
-    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    @RolesAllowed("ADMIN")
     public Response rimuoviPartecipante(@PathParam("id") Long id) {
         service.rimuoviPartecipante(id);
         return Response.noContent().build();

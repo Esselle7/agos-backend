@@ -1,8 +1,10 @@
 package com.agostinelli.gestionale.eventi.dto;
 
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.Positive;
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.util.List;
 
 public record EventoUpdateRequest(
 
@@ -17,10 +19,24 @@ public record EventoUpdateRequest(
         String contattoNome,
         String contattoTelefono,
         String contattoEmail,
-        Integer nOspiti,
+
+        @Min(1)
+        Integer numeroTotalePartecipanti,
+
+        Integer numeroBambini,
+
+        /**
+         * Se non null, sostituisce integralmente la lista allergie dell'evento.
+         * Lista vuota = cancella tutte le allergie.
+         */
+        List<String> allergie,
+
         String note,
 
-        /** Transizione di stato: PREVENTIVO→CONFERMATO→COMPLETATO o qualsiasi→ANNULLATO. */
+        /**
+         * Transizione di stato manuale (solo ADMIN):
+         * PREVENTIVATO→CONFERMATO, qualsiasi→ANNULLATO.
+         */
         String stato,
 
         /** Obbligatoria in business logic quando stato=ANNULLATO. */

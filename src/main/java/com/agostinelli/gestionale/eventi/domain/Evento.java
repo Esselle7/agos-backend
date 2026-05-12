@@ -62,7 +62,7 @@ public class Evento {
     @Column(name = "costi_diretti_imputati", nullable = false, precision = 15, scale = 2)
     public BigDecimal costiDirettiImputati;
 
-    /** Codice lookup: PREVENTIVO, CONFERMATO, COMPLETATO, ANNULLATO. */
+    /** Codice lookup: PREVENTIVATO, CONFERMATO, SALDATO, ANNULLATO. */
     @Column(name = "stato", nullable = false, length = 50)
     public String stato;
 
@@ -80,6 +80,13 @@ public class Evento {
 
     @Column(name = "n_ospiti")
     public Integer nOspiti;
+
+    /** Numero totale partecipanti — obbligatorio in API, default 0 in DB per migrazione. */
+    @Column(name = "numero_totale_partecipanti", nullable = false)
+    public int numeroTotalePartecipanti;
+
+    @Column(name = "numero_bambini")
+    public Integer numeroBambini;
 
     @Column(name = "note", columnDefinition = "text")
     public String note;
@@ -103,7 +110,7 @@ public class Evento {
     @PrePersist
     void onCreate() {
         if (createdAt == null) createdAt = Instant.now();
-        if (stato == null) stato = "PREVENTIVO";
+        if (stato == null) stato = "PREVENTIVATO";
         if (importoIncassato == null) importoIncassato = BigDecimal.ZERO;
         if (caparreIncassate == null) caparreIncassate = BigDecimal.ZERO;
         if (costiDirettiImputati == null) costiDirettiImputati = BigDecimal.ZERO;

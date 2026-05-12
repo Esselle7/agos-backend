@@ -407,6 +407,7 @@ class MovimentiIntegrationTest {
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":1.00,"dataMovimento":"2000-01-01",
+                     "dataFinanziaria":"2000-01-01",
                      "contoBancarioId":1,"metodoPagamentoId":%d,
                      "businessUnitId":1,"contoCoge":%d,"descrizione":"Data passato remoto"}
                     """.formatted(validMetodoPagamento, validContoCoge))
@@ -420,17 +421,19 @@ class MovimentiIntegrationTest {
     @Order(62)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void testDataFuturaAccettata() {
+        // dataFinanziaria futura è rifiutata dal servizio; usiamo DA_LIQUIDARE (senza contoBancarioId)
         given()
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":1.00,"dataMovimento":"2099-12-31",
-                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "dataLiquidita":"2099-12-31",
                      "businessUnitId":1,"contoCoge":%d,"descrizione":"Data futura"}
-                    """.formatted(validMetodoPagamento, validContoCoge))
+                    """.formatted(validContoCoge))
             .when().post("/api/movimenti")
             .then()
                 .statusCode(201)
-                .body("dataMovimento", equalTo("2099-12-31"));
+                .body("dataMovimento", equalTo("2099-12-31"))
+                .body("stato", equalTo("DA_LIQUIDARE"));
     }
 
     // ── Stato machine ──────────────────────────────────────────────────────────
@@ -554,9 +557,9 @@ class MovimentiIntegrationTest {
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":5.00,"dataMovimento":"2026-11-15",
-                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "dataLiquidita":"2026-11-15",
                      "businessUnitId":1,"contoCoge":%d,"descrizione":"Filtro date range"}
-                    """.formatted(validMetodoPagamento, validContoCoge))
+                    """.formatted(validContoCoge))
             .when().post("/api/movimenti")
             .then().statusCode(201);
 
@@ -578,9 +581,9 @@ class MovimentiIntegrationTest {
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":1.00,"dataMovimento":"2026-10-01",
-                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "dataLiquidita":"2026-10-01",
                      "businessUnitId":2,"contoCoge":%d,"descrizione":"Filtro buId 2"}
-                    """.formatted(validMetodoPagamento, validContoCoge))
+                    """.formatted(validContoCoge))
             .when().post("/api/movimenti")
             .then().statusCode(201);
 
@@ -615,7 +618,8 @@ class MovimentiIntegrationTest {
         String id = given()
             .contentType(ContentType.JSON)
             .body("""
-                    {"tipo":"ENTRATA","importo":88.00,"dataMovimento":"2026-09-01",
+                    {"tipo":"ENTRATA","importo":88.00,"dataMovimento":"2026-01-15",
+                     "dataFinanziaria":"2026-01-15",
                      "contoBancarioId":2,"metodoPagamentoId":%d,
                      "businessUnitId":1,"contoCoge":%d,
                      "fonte":"IMPORT_BANCA","descrizione":"Movimento da riconciliare"}
@@ -643,17 +647,18 @@ class MovimentiIntegrationTest {
     void testMatchAutomaticoConCoppiaBillyBanca() {
         // Importo univoco (13579.24) per non interferire con dati seed
         String importoUnico = "13579.24";
-        String data = "2026-08-10";
+        String data = "2026-01-10";
 
         given()
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "dataFinanziaria":"%s",
                      "contoBancarioId":2,"metodoPagamentoId":%d,
                      "businessUnitId":1,"contoCoge":%d,
                      "fonte":"IMPORT_BILLY","riferimentoEsterno":"BILLY-MATCH-102",
                      "descrizione":"Billy per match automatico"}
-                    """.formatted(importoUnico, data, validMetodoPagamento, validContoCoge))
+                    """.formatted(importoUnico, data, data, validMetodoPagamento, validContoCoge))
             .when().post("/api/movimenti")
             .then().statusCode(201);
 
@@ -661,11 +666,12 @@ class MovimentiIntegrationTest {
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "dataFinanziaria":"%s",
                      "contoBancarioId":2,"metodoPagamentoId":%d,
                      "businessUnitId":1,"contoCoge":%d,
                      "fonte":"IMPORT_BANCA","riferimentoEsterno":"BANCA-MATCH-102",
                      "descrizione":"Banca per match automatico"}
-                    """.formatted(importoUnico, data, validMetodoPagamento, validContoCoge))
+                    """.formatted(importoUnico, data, data, validMetodoPagamento, validContoCoge))
             .when().post("/api/movimenti")
             .then().statusCode(201);
 
@@ -685,17 +691,18 @@ class MovimentiIntegrationTest {
         // NOTA: questa è una limitazione nota del match automatico — un pagamento Billy
         // viene associato a più estratti conto bancari se l'importo coincide.
         String importoAmbiguo = "24680.13";
-        String data = "2026-07-20";
+        String data = "2025-12-20";
 
         String billyId = given()
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "dataFinanziaria":"%s",
                      "contoBancarioId":2,"metodoPagamentoId":%d,
                      "businessUnitId":1,"contoCoge":%d,
                      "fonte":"IMPORT_BILLY","riferimentoEsterno":"BILLY-AMB-103",
                      "descrizione":"Billy ambiguo"}
-                    """.formatted(importoAmbiguo, data, validMetodoPagamento, validContoCoge))
+                    """.formatted(importoAmbiguo, data, data, validMetodoPagamento, validContoCoge))
             .when().post("/api/movimenti")
             .then().statusCode(201).extract().path("id");
 
@@ -703,11 +710,12 @@ class MovimentiIntegrationTest {
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "dataFinanziaria":"%s",
                      "contoBancarioId":2,"metodoPagamentoId":%d,
                      "businessUnitId":1,"contoCoge":%d,
                      "fonte":"IMPORT_BANCA","riferimentoEsterno":"BANCA-AMB1-103",
                      "descrizione":"Banca ambigua 1"}
-                    """.formatted(importoAmbiguo, data, validMetodoPagamento, validContoCoge))
+                    """.formatted(importoAmbiguo, data, data, validMetodoPagamento, validContoCoge))
             .when().post("/api/movimenti")
             .then().statusCode(201);
 
@@ -715,11 +723,12 @@ class MovimentiIntegrationTest {
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":%s,"dataMovimento":"%s",
+                     "dataFinanziaria":"%s",
                      "contoBancarioId":2,"metodoPagamentoId":%d,
                      "businessUnitId":1,"contoCoge":%d,
                      "fonte":"IMPORT_BANCA","riferimentoEsterno":"BANCA-AMB2-103",
                      "descrizione":"Banca ambigua 2"}
-                    """.formatted(importoAmbiguo, data, validMetodoPagamento, validContoCoge))
+                    """.formatted(importoAmbiguo, data, data, validMetodoPagamento, validContoCoge))
             .when().post("/api/movimenti")
             .then().statusCode(201);
 
@@ -765,15 +774,15 @@ class MovimentiIntegrationTest {
     @Test
     @Order(111)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
-    void testMovimentoLiquiditaOggiSenzaContoRifiutato() {
-        // dataLiquidita == dataMovimento: liquidità immediata → conto obbligatorio → 400
+    void testMovimentoLiquidatoSenzaContoBancarioRifiutato() {
+        // dataFinanziaria presente ma contoBancarioId assente → 400
         given()
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"USCITA","importo":300.00,
-                     "dataMovimento":"2026-05-03","dataLiquidita":"2026-05-03",
+                     "dataMovimento":"2026-05-03","dataFinanziaria":"2026-05-03",
                      "businessUnitId":1,"contoCoge":%d,
-                     "descrizione":"Pagamento immediato senza conto"}
+                     "descrizione":"Liquidato senza conto bancario"}
                     """.formatted(validContoCoge))
             .when().post("/api/movimenti")
             .then()
@@ -803,12 +812,12 @@ class MovimentiIntegrationTest {
     @Order(113)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void testMovimentoSenzaDataLiquiditaConContoOk() {
-        // dataLiquidita null: liquidità immediata → conto obbligatorio e presente → 201
+        // dataFinanziaria presente con conto e metodo → 201 REGISTRATO
         given()
             .contentType(ContentType.JSON)
             .body("""
                     {"tipo":"ENTRATA","importo":150.00,
-                     "dataMovimento":"2026-05-03",
+                     "dataMovimento":"2026-05-03","dataFinanziaria":"2026-05-03",
                      "contoBancarioId":1,"metodoPagamentoId":%d,
                      "businessUnitId":1,"contoCoge":%d,
                      "descrizione":"Pagamento immediato completo"}
@@ -827,6 +836,7 @@ class MovimentiIntegrationTest {
                 : "";
         return """
                 {"tipo":"%s","importo":%s,"dataMovimento":"2025-06-01",
+                 "dataFinanziaria":"2025-06-01",
                  "contoBancarioId":1,"metodoPagamentoId":%d,
                  "businessUnitId":1,"contoCoge":%d,
                  %s"descrizione":"%s"}
@@ -837,7 +847,8 @@ class MovimentiIntegrationTest {
     private String buildCreateRequestConCommissione(String tipo, String importo, String importoLordo) {
         return """
                 {"tipo":"%s","importo":%s,"importoLordo":%s,
-                 "dataMovimento":"2025-06-01","contoBancarioId":1,
+                 "dataMovimento":"2025-06-01","dataFinanziaria":"2025-06-01",
+                 "contoBancarioId":1,
                  "metodoPagamentoId":%d,"businessUnitId":1,"contoCoge":%d,
                  "descrizione":"Test commissione"}
                 """.formatted(tipo, importo, importoLordo,
@@ -847,6 +858,7 @@ class MovimentiIntegrationTest {
     private String buildCreateRequestConRif(String tipo, String importo, String descrizione, String rif) {
         return """
                 {"tipo":"%s","importo":%s,"dataMovimento":"2025-06-01",
+                 "dataFinanziaria":"2025-06-01",
                  "contoBancarioId":1,"metodoPagamentoId":%d,
                  "businessUnitId":1,"contoCoge":%d,
                  "descrizione":"%s","fonte":"IMPORT_BILLY","riferimentoEsterno":"%s"}

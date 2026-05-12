@@ -72,34 +72,24 @@ public class EventiRepository implements PanacheRepositoryBase<Evento, UUID> {
         }
     }
 
-    /**
-     * Restituisce gli eventi CONFERMATI con caparra non ancora incassata
-     * la cui data evento cade nei prossimi {@code giorni} giorni.
-     */
+    /** CONFERMATI senza caparra con data evento nei prossimi {@code giorni} giorni. */
     public List<Evento> findEventiConCaparraMancanteEntroDays(int giorni) {
-        LocalDate oggi = LocalDate.now();
+        LocalDate oggi  = LocalDate.now();
         LocalDate limite = oggi.plusDays(giorni);
         return list(
                 "stato = 'CONFERMATO' AND caparreIncassate = 0 AND dataEvento >= ?1 AND dataEvento <= ?2",
                 oggi, limite);
     }
 
-    /**
-     * Restituisce gli eventi COMPLETATI con residuo positivo
-     * (importoTotalePreviventivato - importoIncassato > 0.01).
-     */
-    public List<Evento> findCompletatiConResiduoPositivo() {
+    /** SALDATI con residuo ancora positivo (anomalia scheduler). */
+    public List<Evento> findSaldatiConResiduoPositivo() {
         return em.createQuery(
-                "FROM Evento e WHERE e.stato = 'COMPLETATO' " +
+                "FROM Evento e WHERE e.stato = 'SALDATO' " +
                 "AND e.importoTotalePreviventivato IS NOT NULL " +
                 "AND (e.importoTotalePreviventivato - e.importoIncassato) > 0.01",
                 Evento.class).getResultList();
     }
 
-    /**
-     * Restituisce gli eventi con data_evento nel periodo indicato,
-     * ordinati per data_evento ASC (usato per il calendario).
-     */
     public List<Evento> findCalendario(LocalDate from, LocalDate to) {
         return list("dataEvento >= ?1 AND dataEvento <= ?2 ORDER BY dataEvento ASC", from, to);
     }

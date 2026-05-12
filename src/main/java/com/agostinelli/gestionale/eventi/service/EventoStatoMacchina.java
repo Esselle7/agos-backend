@@ -8,36 +8,27 @@ import jakarta.ws.rs.core.Response;
 import java.math.BigDecimal;
 
 /**
- * Macchina a stati per le transizioni di stato degli eventi cerimonie.
- * Estratta in una classe separata per garantire testabilità unitaria
- * senza dipendenze da DB, HTTP o CDI.
+ * Macchina a stati per le transizioni manuali degli eventi.
  *
  * Flusso ammesso:
- *   PREVENTIVO → CONFERMATO (richiede importoTotalePreviventivato > 0)
- *   CONFERMATO → COMPLETATO (richiede residuo ≤ 0.01)
- *   qualsiasi  → ANNULLATO  (richiede ADMIN + noteAnnullamento)
- *   COMPLETATO → qualsiasi  → sempre vietato
+ *   PREVENTIVATO → CONFERMATO  (qualsiasi ruolo — importo > 0 richiesto)
+ *   CONFERMATO   → SALDATO     (qualsiasi ruolo — residuo ≤ €0.01 richiesto)
+ *   qualsiasi    → ANNULLATO   (solo ADMIN + noteAnnullamento obbligatoria)
+ *   SALDATO      → qualsiasi   → sempre vietato (stato terminale)
  */
 final class EventoStatoMacchina {
 
     private EventoStatoMacchina() {}
 
-    /**
-     * Valida la transizione di stato {@code nuovoStato} sull'evento {@code e}.
-     * Lancia un'eccezione se la transizione non è ammessa.
-     *
-     * @throws ForbiddenException se mancano i permessi ADMIN o l'evento è COMPLETATO
-     * @throws ApiException       se la transizione viola una regola di business
-     */
     static void valida(Evento e, String nuovoStato, boolean isAdmin, String noteAnnullamento) {
         String attuale = e.stato;
 
-        // COMPLETATO → qualsiasi: evento completato è immutabile per design
-        if ("COMPLETATO".equals(attuale)) {
-            throw new ForbiddenException("Evento completato non modificabile");
+        // SALDATO è terminale
+        if ("SALDATO".equals(attuale)) {
+            throw new ForbiddenException("Evento saldato: stato non modificabile");
         }
 
-        // QUALSIASI → ANNULLATO: richiede ruolo ADMIN e noteAnnullamento obbligatoria
+        // → ANNULLATO: solo ADMIN + nota obbligatoria
         if ("ANNULLATO".equals(nuovoStato)) {
             if (!isAdmin) {
                 throw new ForbiddenException("Solo gli ADMIN possono annullare un evento");
@@ -49,8 +40,8 @@ final class EventoStatoMacchina {
             return;
         }
 
-        // PREVENTIVO → CONFERMATO: importoTotalePreviventivato > 0 obbligatorio
-        if ("PREVENTIVO".equals(attuale) && "CONFERMATO".equals(nuovoStato)) {
+        // PREVENTIVATO → CONFERMATO: importo > 0 richiesto
+        if ("PREVENTIVATO".equals(attuale) && "CONFERMATO".equals(nuovoStato)) {
             if (e.importoTotalePreviventivato == null
                     || e.importoTotalePreviventivato.compareTo(BigDecimal.ZERO) <= 0) {
                 throw new ApiException(Response.Status.BAD_REQUEST, "IMPORTO_PREVENTIVATO_MANCANTE",
@@ -59,23 +50,22 @@ final class EventoStatoMacchina {
             return;
         }
 
-        // CONFERMATO → COMPLETATO: residuo da incassare ≤ 0.01 (tolleranza centesimi)
-        if ("CONFERMATO".equals(attuale) && "COMPLETATO".equals(nuovoStato)) {
+        // CONFERMATO → SALDATO: residuo ≤ €0.01 richiesto
+        if ("CONFERMATO".equals(attuale) && "SALDATO".equals(nuovoStato)) {
             if (e.importoTotalePreviventivato == null) {
                 throw new ApiException(Response.Status.BAD_REQUEST, "IMPORTO_PREVENTIVATO_MANCANTE",
-                        "importoTotalePreviventivato non impostato");
+                        "importoTotalePreviventivato richiesto per completare l'evento");
             }
-            BigDecimal residuo = e.importoTotalePreviventivato.subtract(e.importoIncassato);
+            BigDecimal incassato = e.importoIncassato != null ? e.importoIncassato : BigDecimal.ZERO;
+            BigDecimal residuo = e.importoTotalePreviventivato.subtract(incassato);
             if (residuo.compareTo(new BigDecimal("0.01")) > 0) {
                 throw new ApiException(Response.Status.CONFLICT, "RESIDUO_NON_AZZERATO",
-                        "Residuo da incassare: EUR " + residuo
-                        + ". L'evento può essere completato solo a saldo azzerato (tolleranza €0.01)");
+                        "Residuo ancora da incassare: EUR " + residuo);
             }
             return;
         }
 
-        // Transizione non definita nel flusso di business
         throw new ApiException(Response.Status.BAD_REQUEST, "TRANSIZIONE_NON_AMMESSA",
-                "Transizione " + attuale + " → " + nuovoStato + " non consentita");
+                "Transizione manuale " + attuale + " → " + nuovoStato + " non consentita");
     }
 }

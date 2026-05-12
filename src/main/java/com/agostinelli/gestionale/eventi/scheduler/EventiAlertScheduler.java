@@ -31,13 +31,13 @@ public class EventiAlertScheduler {
     /**
      * Eseguito ogni giorno alle 08:00.
      * Controlla eventi CONFERMATI senza caparra nei prossimi 30 giorni
-     * ed eventi COMPLETATI con residuo positivo (saldo non interamente incassato).
+     * ed eventi SALDATI con residuo positivo (anomalia dati).
      */
     @Scheduled(cron = "0 0 8 * * ?")
     @Transactional
     void checkEventiAlert() {
         checkCaparreMancantiEntroDays(30);
-        checkCompletatiConResiduoPositivo();
+        checkSaldatiConResiduoPositivo();
     }
 
     private void checkCaparreMancantiEntroDays(int giorni) {
@@ -49,11 +49,11 @@ public class EventiAlertScheduler {
         }
     }
 
-    private void checkCompletatiConResiduoPositivo() {
-        List<Evento> eventi = repo.findCompletatiConResiduoPositivo();
+    private void checkSaldatiConResiduoPositivo() {
+        List<Evento> eventi = repo.findSaldatiConResiduoPositivo();
         for (Evento e : eventi) {
             BigDecimal residuo = e.importoTotalePreviventivato.subtract(e.importoIncassato);
-            LOG.warnf("ALERT: Evento [%s] id=%s completato con residuo EUR %s ancora da incassare",
+            LOG.warnf("ALERT: Evento [%s] id=%s SALDATO con residuo EUR %s ancora da incassare (anomalia)",
                     e.nome, e.id, residuo);
             // TODO [evolutiva]: inviare email di alert all'amministrazione
         }

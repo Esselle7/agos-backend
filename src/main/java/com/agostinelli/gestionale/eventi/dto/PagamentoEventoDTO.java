@@ -7,11 +7,14 @@ import java.util.UUID;
 public record PagamentoEventoDTO(
         UUID movimentoId,
 
-        /** CAPARRA | ACCONTO | SALDO | RIMBORSO. */
+        /** CAPARRA | ACCONTO | SALDO | PENALE. */
         String tipo,
 
         BigDecimal importo,
-        LocalDate data,
+
+        /** Data effettiva del pagamento (data finanziaria). */
+        LocalDate dataFinanziaria,
+
         String note,
         String stato
 ) {}

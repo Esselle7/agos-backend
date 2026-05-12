@@ -74,34 +74,39 @@ class AnagraficaIntegrationTest {
     @Test
     @Order(11)
     @TestSecurity(user = "test-admin", roles = {"ADMIN"})
-    void testCreaERecuperaCategoria() {
-        // Crea categoria radice per BU1
-        int id = given()
-            .contentType(ContentType.JSON)
-            .body("""
-                    {
-                      "nome": "Test Categoria",
-                      "tipo": "ENTRATA",
-                      "buId": 1,
-                      "ordinamento": 0
-                    }
-                    """)
-            .when().post("/api/categorie")
-            .then()
-                .statusCode(201)
-                .body("nome", equalTo("Test Categoria"))
-                .body("tipo", equalTo("ENTRATA"))
-                .extract().path("id");
-
-        // Verifica che appaia nell'albero
+    void testSeedCategoriePresenti() {
+        // BU1 ENTRATE – seeded in V23
         given()
             .queryParam("tipo", "ENTRATA")
             .queryParam("buId", 1)
             .when().get("/api/categorie")
             .then()
                 .statusCode(200)
-                .body("$", hasSize(greaterThan(0)))
-                .body("find { it.id == " + id + " }.nome", equalTo("Test Categoria"));
+                .body("$", hasSize(greaterThanOrEqualTo(5)))
+                .body("nome", hasItem("Incassi cassa ristorazione (Billy)"))
+                .body("nome", hasItem("B&B / Ospitalità"));
+
+        // BU2 USCITE – seeded in V23
+        given()
+            .queryParam("tipo", "USCITA")
+            .queryParam("buId", 2)
+            .when().get("/api/categorie")
+            .then()
+                .statusCode(200)
+                .body("$", hasSize(greaterThanOrEqualTo(4)))
+                .body("nome", hasItem("Food & Beverage per eventi"))
+                .body("nome", hasItem("Allestimenti e noleggi"));
+
+        // BU5 USCITE – seeded in V23
+        given()
+            .queryParam("tipo", "USCITA")
+            .queryParam("buId", 5)
+            .when().get("/api/categorie")
+            .then()
+                .statusCode(200)
+                .body("$", hasSize(greaterThanOrEqualTo(10)))
+                .body("nome", hasItem("Mutui e rate finanziamenti"))
+                .body("nome", hasItem("Imposte e tasse (F24)"));
     }
 
     @Test

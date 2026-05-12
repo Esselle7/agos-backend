@@ -1,10 +1,12 @@
 package com.agostinelli.gestionale.eventi.dto;
 
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.util.List;
 
 public record EventoCreateRequest(
 
@@ -29,7 +31,14 @@ public record EventoCreateRequest(
 
         String contattoEmail,
 
-        Integer nOspiti,
+        /** Numero totale partecipanti previsti — obbligatorio. */
+        @NotNull @Min(1)
+        Integer numeroTotalePartecipanti,
+
+        Integer numeroBambini,
+
+        /** Lista allergie dichiarate — opzionale, stringhe libere. */
+        List<String> allergie,
 
         String note,
 

@@ -8,15 +8,10 @@ import java.time.LocalDate;
 
 public record PagamentoRequest(
 
-        /** CAPARRA | ACCONTO | SALDO | RIMBORSO. */
+        /** CAPARRA | ACCONTO | SALDO | PENALE. */
         @NotBlank
         String tipo,
 
-        /**
-         * Importo sempre positivo dal client.
-         * Il service lo converte in negativo per tipo=RIMBORSO
-         * (ENTRATA con importo_lordo negativo per ridurre importoIncassato via trigger DB).
-         */
         @NotNull @Positive
         BigDecimal importo,
 

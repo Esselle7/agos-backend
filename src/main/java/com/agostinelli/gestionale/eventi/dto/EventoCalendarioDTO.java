@@ -15,15 +15,15 @@ public record EventoCalendarioDTO(
 
         /**
          * Colore esadecimale associato allo stato:
-         * PREVENTIVO=#FFA500, CONFERMATO=#2196F3, COMPLETATO=#4CAF50, ANNULLATO=#9E9E9E.
+         * PREVENTIVATO=#FFA500, CONFERMATO=#2196F3, SALDATO=#4CAF50, ANNULLATO=#9E9E9E.
          */
         String coloreStato
 ) {
     private static final Map<String, String> COLORI = Map.of(
-            "PREVENTIVO",  "#FFA500",
-            "CONFERMATO",  "#2196F3",
-            "COMPLETATO",  "#4CAF50",
-            "ANNULLATO",   "#9E9E9E"
+            "PREVENTIVATO", "#FFA500",
+            "CONFERMATO",   "#2196F3",
+            "SALDATO",      "#4CAF50",
+            "ANNULLATO",    "#9E9E9E"
     );
 
     public static String colorePerStato(String stato) {

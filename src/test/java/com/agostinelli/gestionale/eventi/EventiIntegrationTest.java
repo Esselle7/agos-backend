@@ -56,7 +56,6 @@ class EventiIntegrationTest {
                     .getSingleResult()).intValue();
         }
         if (personaleId == null) {
-            // Inserisce un record personale di test se non esiste già
             em.createNativeQuery(
                     "INSERT INTO personale (nome, cognome, is_active) " +
                     "VALUES ('Test', 'Personale', true) " +
@@ -109,7 +108,7 @@ class EventiIntegrationTest {
                      "contattoNome":"Luca Bianchi",
                      "contattoTelefono":"+39 333 1111111",
                      "contattoEmail":"luca@bianchi.it",
-                     "nOspiti":70,
+                     "numeroTotalePartecipanti":70,
                      "note":"Menu 5 portate",
                      "businessUnitId":2}
                     """)
@@ -119,7 +118,7 @@ class EventiIntegrationTest {
                 .body("id",                          notNullValue())
                 .body("nome",                        equalTo("Matrimonio Bianchi-Verdi"))
                 .body("tipo",                        equalTo("MATRIMONIO"))
-                .body("stato",                       equalTo("PREVENTIVO"))
+                .body("stato",                       equalTo("PREVENTIVATO"))
                 .body("importoTotalePreviventivato", equalTo(8000.0f))
                 .body("importoIncassato",            equalTo(0))
                 .body("importoResiduo",              equalTo(8000.0f))
@@ -137,12 +136,13 @@ class EventiIntegrationTest {
             .contentType(ContentType.JSON)
             .body("""
                     {"nome":"Evento Minimo","tipo":"ALTRO",
-                     "dataEvento":"2026-10-01","contattoNome":"Mario Rossi"}
+                     "dataEvento":"2026-10-01","contattoNome":"Mario Rossi",
+                     "numeroTotalePartecipanti":1}
                     """)
             .when().post("/api/eventi")
             .then()
                 .statusCode(201)
-                .body("stato", equalTo("PREVENTIVO"))
+                .body("stato", equalTo("PREVENTIVATO"))
                 .body("businessUnitId", equalTo(2));  // default BU2
     }
 
@@ -150,7 +150,6 @@ class EventiIntegrationTest {
     @Order(12)
     @TestSecurity(user = TEST_USER_UUID, roles = {"DIPENDENTE"})
     void creaEvento_dipendente_201() {
-        // Anche DIPENDENTE può creare eventi
         given()
             .contentType(ContentType.JSON)
             .body(buildCreateRequest("Evento da Dipendente", "500"))
@@ -167,7 +166,8 @@ class EventiIntegrationTest {
             .contentType(ContentType.JSON)
             .body("""
                     {"nome":"Evento nel passato","tipo":"ALTRO",
-                     "dataEvento":"2020-01-01","contattoNome":"Test"}
+                     "dataEvento":"2020-01-01","contattoNome":"Test",
+                     "numeroTotalePartecipanti":1}
                     """)
             .when().post("/api/eventi")
             .then()
@@ -182,7 +182,8 @@ class EventiIntegrationTest {
         given()
             .contentType(ContentType.JSON)
             .body("""
-                    {"nome":"","tipo":"ALTRO","dataEvento":"2026-12-01","contattoNome":"Test"}
+                    {"nome":"","tipo":"ALTRO","dataEvento":"2026-12-01",
+                     "contattoNome":"Test","numeroTotalePartecipanti":1}
                     """)
             .when().post("/api/eventi")
             .then()
@@ -196,7 +197,8 @@ class EventiIntegrationTest {
         given()
             .contentType(ContentType.JSON)
             .body("""
-                    {"nome":"Evento senza tipo","dataEvento":"2026-12-01","contattoNome":"Test"}
+                    {"nome":"Evento senza tipo","dataEvento":"2026-12-01",
+                     "contattoNome":"Test","numeroTotalePartecipanti":1}
                     """)
             .when().post("/api/eventi")
             .then()
@@ -217,7 +219,7 @@ class EventiIntegrationTest {
                 .statusCode(200)
                 .body("id",    equalTo(id))
                 .body("nome",  equalTo("Get By Id Test"))
-                .body("stato", equalTo("PREVENTIVO"));
+                .body("stato", equalTo("PREVENTIVATO"));
     }
 
     @Test
@@ -259,13 +261,13 @@ class EventiIntegrationTest {
     @Test
     @Order(24)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
-    void listaEventi_filtroStato_soloPreventivi() {
+    void listaEventi_filtroStato_soloPreventivati() {
         given()
-            .queryParam("stato", "PREVENTIVO")
+            .queryParam("stato", "PREVENTIVATO")
             .when().get("/api/eventi")
             .then()
                 .statusCode(200)
-                .body("content.stato", everyItem(equalTo("PREVENTIVO")));
+                .body("content.stato", everyItem(equalTo("PREVENTIVATO")));
     }
 
     // ── 4. CRUD – Aggiornamento campo ──────────────────────────────────────────
@@ -279,14 +281,14 @@ class EventiIntegrationTest {
         given()
             .contentType(ContentType.JSON)
             .body("""
-                    {"nome":"Nome Aggiornato","nOspiti":50}
+                    {"nome":"Nome Aggiornato","numeroTotalePartecipanti":50}
                     """)
             .when().put("/api/eventi/" + id)
             .then()
                 .statusCode(200)
-                .body("nome",    equalTo("Nome Aggiornato"))
-                .body("nOspiti", equalTo(50))
-                .body("stato",   equalTo("PREVENTIVO")); // stato invariato
+                .body("nome",                      equalTo("Nome Aggiornato"))
+                .body("numeroTotalePartecipanti",   equalTo(50))
+                .body("stato",                     equalTo("PREVENTIVATO"));
     }
 
     @Test
@@ -301,7 +303,7 @@ class EventiIntegrationTest {
                 .statusCode(404);
     }
 
-    // ── 5. Macchina a stati – PREVENTIVO → CONFERMATO ─────────────────────────
+    // ── 5. Macchina a stati – PREVENTIVATO → CONFERMATO ──────────────────────
 
     @Test
     @Order(40)
@@ -339,10 +341,9 @@ class EventiIntegrationTest {
     @Order(42)
     @TestSecurity(user = TEST_USER_UUID, roles = {"DIPENDENTE"})
     void confermazione_dipendente_senzaStato_ok() {
-        // DIPENDENTE può modificare il nome, ma non fare transizioni
+        // DIPENDENTE può modificare il nome senza cambiare stato
         String id = creaEventoTest_comeAdmin("Evento per DIPENDENTE update", "500");
 
-        // solo aggiornamento di nome – nessun cambio stato
         given()
             .contentType(ContentType.JSON)
             .body("{\"nome\":\"Nome Modificato da Dipendente\"}")
@@ -350,7 +351,7 @@ class EventiIntegrationTest {
             .then()
                 .statusCode(200)
                 .body("nome",  equalTo("Nome Modificato da Dipendente"))
-                .body("stato", equalTo("PREVENTIVO"));
+                .body("stato", equalTo("PREVENTIVATO"));
     }
 
     // ── 6. Macchina a stati – ANNULLAMENTO ────────────────────────────────────
@@ -410,7 +411,6 @@ class EventiIntegrationTest {
                 .when().put("/api/eventi/" + id)
                 .then().statusCode(200);
 
-        // ADMIN vede noteAnnullamento
         given()
             .when().get("/api/eventi/" + id)
             .then()
@@ -422,14 +422,13 @@ class EventiIntegrationTest {
     @Order(54)
     @TestSecurity(user = TEST_USER_UUID, roles = {"DIPENDENTE"})
     void noteAnnullamento_nullPerDipendente() {
-        // Cerca un evento ANNULLATO (creato nel test precedente)
         String id = given()
                 .queryParam("stato", "ANNULLATO")
                 .when().get("/api/eventi")
                 .then().statusCode(200)
                 .extract().path("content[0].id");
 
-        if (id == null) return; // nessun annullato → skip silenzioso
+        if (id == null) return;
 
         given()
             .when().get("/api/eventi/" + id)
@@ -448,7 +447,6 @@ class EventiIntegrationTest {
 
         given().when().delete("/api/eventi/" + id).then().statusCode(204);
 
-        // Deve essere eliminato
         given().when().get("/api/eventi/" + id).then().statusCode(404);
     }
 
@@ -457,7 +455,6 @@ class EventiIntegrationTest {
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void deleteEvento_nonPreventivo_403() {
         String id = creaEventoTest("Evento Confermato da non eliminare", "2000");
-        // Passa a CONFERMATO
         given().contentType(ContentType.JSON)
                 .body("{\"stato\":\"CONFERMATO\"}")
                 .when().put("/api/eventi/" + id)
@@ -479,17 +476,14 @@ class EventiIntegrationTest {
     @Order(70)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void registraCaparra_verificaTriggerImportoIncassato() {
-        // Crea e conferma evento con importo 5000
         String id = creaEventoConfermato("Evento Caparra Trigger", "5000");
 
-        // Prima: importoIncassato = 0
         given()
             .when().get("/api/eventi/" + id)
             .then()
                 .body("importoIncassato", equalTo(0.0f))
                 .body("caparreIncassate", equalTo(0.0f));
 
-        // Registra CAPARRA di 1500
         given()
             .contentType(ContentType.JSON)
             .body(buildPagamentoRequest("CAPARRA", "1500.00"))
@@ -498,16 +492,15 @@ class EventiIntegrationTest {
                 .statusCode(201)
                 .body("tipo",    equalTo("CAPARRA"))
                 .body("importo", equalTo(1500.0f))
-                .body("stato",   equalTo("REGISTRATO"));
+                .body("stato",   equalTo("ATTIVO"));
 
-        // Il trigger DB deve aver aggiornato importoIncassato e caparreIncassate
         given()
             .when().get("/api/eventi/" + id)
             .then()
                 .statusCode(200)
-                .body("importoIncassato", equalTo(1500.0f))   // trigger aggiornato
-                .body("caparreIncassate", equalTo(1500.0f))   // trigger aggiornato
-                .body("importoResiduo",   equalTo(3500.0f))   // 5000 - 1500
+                .body("importoIncassato", equalTo(1500.0f))
+                .body("caparreIncassate", equalTo(1500.0f))
+                .body("importoResiduo",   equalTo(3500.0f))
                 .body("pagamenti",        hasSize(1));
     }
 
@@ -515,10 +508,8 @@ class EventiIntegrationTest {
     @Order(71)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void registraSaldo_headerXSuggestCompletamento() {
-        // Crea un evento con importo 1000, paga tutto con SALDO
         String id = creaEventoConfermato("Evento Saldo Pieno", "1000");
 
-        // Paga SALDO completo
         given()
             .contentType(ContentType.JSON)
             .body(buildPagamentoRequest("SALDO", "1000.00"))
@@ -527,7 +518,6 @@ class EventiIntegrationTest {
                 .statusCode(201)
                 .header("X-Suggest-Completamento", equalTo("true"));
 
-        // Verifica residuo = 0
         given()
             .when().get("/api/eventi/" + id)
             .then()
@@ -539,7 +529,6 @@ class EventiIntegrationTest {
     @Order(72)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void registraAcconto_headerNonPresente() {
-        // Header X-Suggest-Completamento presente solo per SALDO con residuo azzerato
         String id = creaEventoConfermato("Evento Acconto Parziale", "2000");
 
         given()
@@ -559,7 +548,7 @@ class EventiIntegrationTest {
 
         given()
             .contentType(ContentType.JSON)
-            .body(buildPagamentoRequest("ACCONTO", "999.00"))  // 999 > 500 residuo
+            .body(buildPagamentoRequest("ACCONTO", "999.00"))
             .when().post("/api/eventi/" + id + "/pagamenti")
             .then()
                 .statusCode(409)
@@ -585,7 +574,7 @@ class EventiIntegrationTest {
                 .body("code", equalTo("EVENTO_ANNULLATO"));
     }
 
-    // ── 9. Pagamenti – RIMBORSO (importo negativo sul trigger) ────────────────
+    // ── 9. Pagamenti – RIMBORSO ───────────────────────────────────────────────
 
     @Test
     @Order(80)
@@ -593,13 +582,11 @@ class EventiIntegrationTest {
     void rimborso_riduceImportoIncassato() {
         String id = creaEventoConfermato("Evento con Rimborso", "2000");
 
-        // Prima paga 800 di caparra
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("CAPARRA", "800.00"))
                 .when().post("/api/eventi/" + id + "/pagamenti")
                 .then().statusCode(201);
 
-        // Poi rimborsa 200
         given()
             .contentType(ContentType.JSON)
             .body(buildPagamentoRequest("RIMBORSO", "200.00"))
@@ -607,9 +594,8 @@ class EventiIntegrationTest {
             .then()
                 .statusCode(201)
                 .body("tipo",    equalTo("RIMBORSO"))
-                .body("importo", lessThan(0.0f)); // importo negativo nel movimento
+                .body("importo", lessThan(0.0f));
 
-        // Il trigger deve aver ridotto importoIncassato: 800 - 200 = 600
         given()
             .when().get("/api/eventi/" + id)
             .then()
@@ -617,28 +603,24 @@ class EventiIntegrationTest {
                 .body("importoResiduo",   equalTo(1400.0f));
     }
 
-    // ── 10. Flusso completo: PREVENTIVO → CONFERMATO → COMPLETATO ─────────────
+    // ── 10. Flusso completo: PREVENTIVATO → CONFERMATO → SALDATO ─────────────
 
     @Test
     @Order(90)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
-    void flussoPagamentoCompleto_e_transitaACompletato() {
-        // Crea e conferma evento da 1000
+    void flussoPagamentoCompleto_e_transitaASaldato() {
         String id = creaEventoConfermato("Evento Flusso Completo", "1000");
 
-        // Paga CAPARRA 400
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("CAPARRA", "400.00"))
                 .when().post("/api/eventi/" + id + "/pagamenti")
                 .then().statusCode(201);
 
-        // Paga ACCONTO 300
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("ACCONTO", "300.00"))
                 .when().post("/api/eventi/" + id + "/pagamenti")
                 .then().statusCode(201);
 
-        // Paga SALDO 300 – azzeramento del residuo
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("SALDO", "300.00"))
                 .when().post("/api/eventi/" + id + "/pagamenti")
@@ -646,30 +628,20 @@ class EventiIntegrationTest {
                     .statusCode(201)
                     .header("X-Suggest-Completamento", equalTo("true"));
 
-        // Verifica stato economico prima di completare
         given()
             .when().get("/api/eventi/" + id)
             .then()
                 .body("importoIncassato",     equalTo(1000.0f))
                 .body("importoResiduo",       equalTo(0.0f))
                 .body("percentualeIncassata", equalTo(100.0f))
+                .body("stato",                equalTo("SALDATO"))  // auto-transitioned on payment
                 .body("pagamenti",            hasSize(3));
-
-        // Transizione CONFERMATO → COMPLETATO (residuo = 0 ≤ 0.01)
-        given()
-            .contentType(ContentType.JSON)
-            .body("{\"stato\":\"COMPLETATO\"}")
-            .when().put("/api/eventi/" + id)
-            .then()
-                .statusCode(200)
-                .body("stato", equalTo("COMPLETATO"));
     }
 
     @Test
     @Order(91)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void completamento_conResiduoPositivo_409() {
-        // Evento con 1000, pago solo 900 → residuo = 100 > 0.01
         String id = creaEventoConfermato("Evento Residuo Positivo", "1000");
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("ACCONTO", "900.00"))
@@ -678,7 +650,7 @@ class EventiIntegrationTest {
 
         given()
             .contentType(ContentType.JSON)
-            .body("{\"stato\":\"COMPLETATO\"}")
+            .body("{\"stato\":\"SALDATO\"}")
             .when().put("/api/eventi/" + id)
             .then()
                 .statusCode(409)
@@ -688,18 +660,15 @@ class EventiIntegrationTest {
     @Test
     @Order(92)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
-    void completato_nonModificabile_403() {
-        String id = creaEventoConfermato("Evento Completato Imm.", "500");
+    void saldato_nonModificabile_403() {
+        String id = creaEventoConfermato("Evento Saldato Imm.", "500");
+        // SALDO pari all'importo: residuo = 0 → auto-transizione a SALDATO
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("SALDO", "500.00"))
                 .when().post("/api/eventi/" + id + "/pagamenti")
-                .then().statusCode(201);
-        given().contentType(ContentType.JSON)
-                .body("{\"stato\":\"COMPLETATO\"}")
-                .when().put("/api/eventi/" + id)
-                .then().statusCode(200);
+                .then().statusCode(201).header("X-Suggest-Completamento", equalTo("true"));
 
-        // Tentativo di modifica su COMPLETATO → 403
+        // Evento ora SALDATO: qualsiasi modifica deve essere respinta
         given()
             .contentType(ContentType.JSON)
             .body("{\"nome\":\"Tentativo modifica\"}")
@@ -714,10 +683,10 @@ class EventiIntegrationTest {
     void transitazioneNonAmmessa_400() {
         String id = creaEventoTest("Evento Trans Illegale", "1000");
 
-        // PREVENTIVO → COMPLETATO (salto CONFERMATO) → non ammesso
+        // PREVENTIVATO → SALDATO (salto CONFERMATO) → non ammesso
         given()
             .contentType(ContentType.JSON)
-            .body("{\"stato\":\"COMPLETATO\"}")
+            .body("{\"stato\":\"SALDATO\"}")
             .when().put("/api/eventi/" + id)
             .then()
                 .statusCode(400)
@@ -731,16 +700,11 @@ class EventiIntegrationTest {
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void deleteEvento_conMovimentiCollegati_403() {
         String id = creaEventoConfermato("Evento Con Movimenti", "2000");
-        // Registra un pagamento → crea un movimento collegato
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("CAPARRA", "200.00"))
                 .when().post("/api/eventi/" + id + "/pagamenti")
                 .then().statusCode(201);
 
-        // Deve tornare all'evento PREVENTIVO per poterlo eliminare.
-        // Ma ha movimenti → non può essere eliminato
-        // Prima annulliamo i movimenti e poi torniamo in PREVENTIVO... ma non è possibile
-        // Verifica diretta: eliminazione di CONFERMATO con movimenti → 403
         given().when().delete("/api/eventi/" + id).then().statusCode(403);
     }
 
@@ -774,12 +738,12 @@ class EventiIntegrationTest {
     @Order(112)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void calendario_coloriStato_corretti() {
-        // Crea un evento futuro visibile nel calendario default (oggi + 90gg)
         given()
             .contentType(ContentType.JSON)
             .body("""
                     {"nome":"Evento Calendario Colore","tipo":"AZIENDALE",
-                     "dataEvento":"2026-05-20","contattoNome":"Test"}
+                     "dataEvento":"2026-05-20","contattoNome":"Test",
+                     "numeroTotalePartecipanti":1}
                     """)
             .when().post("/api/eventi")
             .then().statusCode(201);
@@ -791,7 +755,7 @@ class EventiIntegrationTest {
             .then()
                 .statusCode(200)
                 .body("find { it.nome == 'Evento Calendario Colore' }.coloreStato",
-                        equalTo("#FFA500")); // PREVENTIVO = arancione
+                        equalTo("#FFA500")); // PREVENTIVATO = arancione
     }
 
     // ── 13. Dashboard ─────────────────────────────────────────────────────────
@@ -818,7 +782,6 @@ class EventiIntegrationTest {
     @Order(121)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void dashboard_profittoCoerente_conIncassatiECosti() {
-        // profittoTotale = totaleIncassato - totaleCosti (invariante)
         io.restassured.response.ValidatableResponse resp = given()
             .queryParam("from", "2026-01-01")
             .queryParam("to",   "2026-12-31")
@@ -870,7 +833,6 @@ class EventiIntegrationTest {
                 .when().post("/api/eventi/" + eventoId + "/partecipanti")
                 .then().statusCode(201);
 
-        // Secondo inserimento dello stesso personale → 409
         given()
             .contentType(ContentType.JSON)
             .body(body)
@@ -934,7 +896,6 @@ class EventiIntegrationTest {
             .then()
                 .statusCode(204);
 
-        // Lista partecipanti deve essere vuota dopo la rimozione
         given()
             .when().get("/api/eventi/" + eventoId + "/partecipanti")
             .then()
@@ -975,13 +936,11 @@ class EventiIntegrationTest {
     void profittoEvento_calcolatoDaMovimentiUscita() {
         String id = creaEventoConfermato("Evento Profitto", "3000");
 
-        // Pagamento CAPARRA 1000 (ENTRATA)
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("CAPARRA", "1000.00"))
                 .when().post("/api/eventi/" + id + "/pagamenti")
                 .then().statusCode(201);
 
-        // Verifica profitto = importoIncassato - costiReali = 1000 - 0 = 1000
         given()
             .when().get("/api/eventi/" + id)
             .then()
@@ -992,28 +951,26 @@ class EventiIntegrationTest {
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
-    /** Crea un evento PREVENTIVO come ADMIN e ritorna l'ID. */
     private String creaEventoTest(String nome, String importo) {
         String importoJson = importo != null ? "\"importoTotalePreviventivato\":" + importo + "," : "";
         return given()
-                .auth().none() // verrà sovrascritto da @TestSecurity corrente
+                .auth().none()
                 .contentType(ContentType.JSON)
                 .body("""
                         {"nome":"%s","tipo":"BANCHETTO_PRIVATO","dataEvento":"2026-12-15",
-                         "contattoNome":"Test Contatto",%s"businessUnitId":2}
+                         "contattoNome":"Test Contatto","numeroTotalePartecipanti":50,
+                         %s"businessUnitId":2}
                         """.formatted(nome, importoJson))
                 .when().post("/api/eventi")
                 .then().statusCode(201)
                 .extract().path("id");
     }
 
-    /** Crea un evento PREVENTIVO con autenticazione ADMIN esplicita (usato da test DIPENDENTE). */
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     private String creaEventoTest_comeAdmin(String nome, String importo) {
         return creaEventoTest(nome, importo);
     }
 
-    /** Crea un evento e lo porta a stato CONFERMATO. */
     private String creaEventoConfermato(String nome, String importo) {
         String id = creaEventoTest(nome, importo);
         given()
@@ -1027,7 +984,8 @@ class EventiIntegrationTest {
     private String buildCreateRequest(String nome, String importo) {
         return """
                 {"nome":"%s","tipo":"BANCHETTO_PRIVATO","dataEvento":"2026-12-10",
-                 "contattoNome":"Test","importoTotalePreviventivato":%s,"businessUnitId":2}
+                 "contattoNome":"Test","importoTotalePreviventivato":%s,
+                 "numeroTotalePartecipanti":50,"businessUnitId":2}
                 """.formatted(nome, importo);
     }
 

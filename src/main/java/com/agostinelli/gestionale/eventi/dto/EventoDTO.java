@@ -14,7 +14,7 @@ public record EventoDTO(
         LocalDate dataPreventivo,
         BigDecimal importoTotalePreviventivato,
 
-        /** Aggiornato dal trigger DB trg_z_aggiorna_totali_evento – solo lettura. */
+        /** Totale incassato — ricalcolato in Java dopo ogni pagamento. */
         BigDecimal importoIncassato,
 
         BigDecimal caparreIncassate,
@@ -24,24 +24,23 @@ public record EventoDTO(
         String contattoNome,
         String contattoTelefono,
         String contattoEmail,
-        Integer nOspiti,
+        Integer numeroTotalePartecipanti,
+        Integer numeroBambini,
+        List<String> allergie,
         String note,
 
-        /**
-         * Visibile solo ai chiamanti con ruolo ADMIN.
-         * Sempre null nelle risposte verso DIPENDENTE.
-         */
+        /** Visibile solo agli ADMIN. */
         String noteAnnullamento,
 
-        // ── Campi calcolati in Java ────────────────────────────────────────────
+        // ── Campi calcolati ────────────────────────────────────────────────────
 
         /** importoTotalePreviventivato - importoIncassato. */
         BigDecimal importoResiduo,
 
-        /** (importoIncassato / importoTotalePreviventivato) * 100. Null se preventivo non impostato. */
+        /** (importoIncassato / importoTotalePreviventivato) * 100. */
         BigDecimal percentualeIncassata,
 
-        /** Somma dei movimenti USCITA collegati all'evento. Fonte primaria per i costi reali. */
+        /** Somma movimenti USCITA collegati all'evento. */
         BigDecimal costiReali,
 
         /** importoIncassato - costiReali. */

@@ -10,7 +10,10 @@ import com.agostinelli.gestionale.infrastructure.exception.UnauthorizedException
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
+import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
@@ -33,8 +36,8 @@ public class AuthService {
     @Inject
     UserRepository userRepository;
 
-    @ConfigProperty(name = "app.security.allowed-auto-create-users", defaultValue = "false")
-    boolean allowedAutoCreateUsers;
+    @ConfigProperty(name = "app.security.allowed-emails", defaultValue = "")
+    Optional<List<String>> allowedEmails;
 
     /**
      * Gestisce il callback Google OAuth2: scambia il codice, valida l'ID token,
@@ -120,8 +123,14 @@ public class AuthService {
     }
 
     private User createOrRejectUser(GoogleUserInfo googleUser) {
-        if (!allowedAutoCreateUsers) {
-            log.warn("Tentativo di accesso da utente non registrato: sub={}", googleUser.sub());
+        Set<String> allowed = allowedEmails
+            .orElse(List.of())
+            .stream()
+            .map(String::trim)
+            .collect(Collectors.toSet());
+
+        if (!allowed.contains(googleUser.email())) {
+            log.warn("Accesso negato a email non in allowlist: {}", googleUser.email());
             throw new UnauthorizedException("Accesso non autorizzato");
         }
 
@@ -134,7 +143,7 @@ public class AuthService {
         newUser.createdAt  = Instant.now();
 
         userRepository.persist(newUser);
-        log.info("Nuovo utente creato automaticamente: email={}", googleUser.email());
+        log.info("Nuovo utente creato da allowlist: email={}", googleUser.email());
         return newUser;
     }
 

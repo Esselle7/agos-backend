@@ -1,15 +1,14 @@
-# Stage 1: Build
-FROM eclipse-temurin:17-jdk-alpine AS build
+# Stage 1: Build — immagine Maven ufficiale, non richiede mvnw né .mvn/
+FROM maven:3.9-eclipse-temurin-17-alpine AS build
 WORKDIR /build
 
-# Cache Maven dependencies separately from source
-COPY pom.xml mvnw ./
-COPY .mvn .mvn
-RUN ./mvnw dependency:go-offline -q
+# Cache dipendenze Maven prima del sorgente
+COPY pom.xml .
+RUN mvn dependency:go-offline -q
 
-# Build fast-jar (tests run separately in CI)
+# Build fast-jar senza test
 COPY src src
-RUN ./mvnw package -DskipTests -q
+RUN mvn package -DskipTests -q
 
 # Stage 2: Runtime — minimal JRE
 FROM eclipse-temurin:17-jre-alpine

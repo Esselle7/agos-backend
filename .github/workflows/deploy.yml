@@ -39,8 +39,9 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      # I test usano %test.mp.jwt.verify.publickey.location=publicKey.pem
-      # → generiamo una coppia RSA temporanea (non serve sicurezza, solo che il formato sia valido)
+      # Genera chiavi RSA temporanee per i test:
+      # - publicKey.pem / privateKey.pem  → usati da %test.mp.jwt.verify.publickey.location
+      # - BASE64_PRIVATE_KEY / BASE64_PUBLIC_KEY → richiesti da @ConfigProperty in JwtService
       - name: Generate test RSA keys
         run: |
           openssl genrsa -out /tmp/rsa.pem 2048 2>/dev/null
@@ -48,6 +49,11 @@ jobs:
             -out src/main/resources/publicKey.pem 2>/dev/null
           openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
             -in /tmp/rsa.pem -out src/main/resources/privateKey.pem 2>/dev/null
+          # Esporta le versioni base64 DER come env var per i @ConfigProperty
+          echo "BASE64_PRIVATE_KEY=$(openssl pkcs8 -topk8 -inform PEM -outform DER -nocrypt \
+            -in /tmp/rsa.pem 2>/dev/null | base64 -w 0)" >> $GITHUB_ENV
+          echo "BASE64_PUBLIC_KEY=$(openssl rsa -in /tmp/rsa.pem -pubout -outform DER \
+            2>/dev/null | base64 -w 0)" >> $GITHUB_ENV
 
       - name: Run tests
         run: mvn test -Dquarkus.profile=test

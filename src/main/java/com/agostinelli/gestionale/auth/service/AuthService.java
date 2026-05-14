@@ -10,7 +10,7 @@ import com.agostinelli.gestionale.infrastructure.exception.UnauthorizedException
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
-import java.util.List;
+import java.util.Arrays;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -36,17 +36,10 @@ public class AuthService {
     @Inject
     UserRepository userRepository;
 
+    // Comma-separated allowlist — vuoto = nessun nuovo utente ammesso
     @ConfigProperty(name = "app.security.allowed-emails", defaultValue = "")
-    Optional<List<String>> allowedEmails;
+    String allowedEmailsRaw;
 
-    /**
-     * Gestisce il callback Google OAuth2: scambia il codice, valida l'ID token,
-     * crea o aggiorna l'utente e genera la coppia di token interni.
-     *
-     * @param code il codice di autorizzazione ricevuto da Google
-     * @return risposta di login con access token, refresh token e dati utente
-     * @throws UnauthorizedException se l'utente non è autorizzato o il suo account è disabilitato
-     */
     @Transactional
     public LoginResponse handleGoogleCallback(String code) {
         GoogleTokenResponse googleTokens = googleOAuthService.exchangeCodeForToken(code);
@@ -70,13 +63,6 @@ public class AuthService {
         return LoginResponse.of(accessToken, refreshToken, toUserInfo(user));
     }
 
-    /**
-     * Rinnova la coppia di token a partire da un refresh token valido (token rotation).
-     *
-     * @param refreshToken il refresh token corrente
-     * @return nuova coppia di token
-     * @throws UnauthorizedException se il refresh token è invalido o revocato
-     */
     @Transactional
     public TokenResponse refreshTokens(String refreshToken) {
         DecodedToken decoded = jwtService.validateToken(refreshToken);
@@ -104,11 +90,6 @@ public class AuthService {
         return TokenResponse.of(newAccessToken, newRefreshToken);
     }
 
-    /**
-     * Revoca il refresh token dell'utente. Accetta anche token scaduti (logout lenient).
-     *
-     * @param refreshToken il refresh token da revocare
-     */
     public void logout(String refreshToken) {
         String jti;
         try {
@@ -125,10 +106,9 @@ public class AuthService {
     }
 
     private User createOrRejectUser(GoogleUserInfo googleUser) {
-        Set<String> allowed = allowedEmails
-            .orElse(List.of())
-            .stream()
+        Set<String> allowed = Arrays.stream(allowedEmailsRaw.split(","))
             .map(String::trim)
+            .filter(e -> !e.isEmpty())
             .collect(Collectors.toSet());
 
         if (!allowed.contains(googleUser.email())) {

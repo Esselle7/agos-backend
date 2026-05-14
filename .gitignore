@@ -1,0 +1,13 @@
+
+docs/
+.claude/
+**application.properties
+target/
+.mvn/
+.env
+src/main/resources/privateKey.pem
+src/main/resources/publicKey.pem
+generate-keys.sh
+.venv/
+Makefile
+Prompt/

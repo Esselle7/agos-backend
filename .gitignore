@@ -1,15 +1,16 @@
-
 docs/
 .claude/
-src/main/resources/privateKey.pem
-src/main/resources/publicKey.pem
 target/
-.mvn/**
-!.mvn/wrapper/maven-wrapper.properties
 .env
-src/main/resources/privateKey.pem
-src/main/resources/publicKey.pem
-generate-keys.sh
 .venv/
 Makefile
 Prompt/
+generate-keys.sh
+
+# Chiavi private — mai in git
+src/main/resources/privateKey.pem
+src/main/resources/publicKey.pem
+
+# Maven wrapper: ignora tutto tranne maven-wrapper.properties
+.mvn/**
+!.mvn/wrapper/maven-wrapper.properties

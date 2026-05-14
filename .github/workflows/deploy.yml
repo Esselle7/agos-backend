@@ -39,6 +39,16 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
+      # I test usano %test.mp.jwt.verify.publickey.location=publicKey.pem
+      # → generiamo una coppia RSA temporanea (non serve sicurezza, solo che il formato sia valido)
+      - name: Generate test RSA keys
+        run: |
+          openssl genrsa -out /tmp/rsa.pem 2048 2>/dev/null
+          openssl rsa -in /tmp/rsa.pem -pubout -outform PEM \
+            -out src/main/resources/publicKey.pem 2>/dev/null
+          openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
+            -in /tmp/rsa.pem -out src/main/resources/privateKey.pem 2>/dev/null
+
       - name: Run tests
         run: ./mvnw test -Dquarkus.profile=test
 

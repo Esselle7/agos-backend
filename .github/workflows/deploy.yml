@@ -50,7 +50,7 @@ jobs:
             -in /tmp/rsa.pem -out src/main/resources/privateKey.pem 2>/dev/null
 
       - name: Run tests
-        run: ./mvnw test -Dquarkus.profile=test
+        run: mvn test -Dquarkus.profile=test
 
   # ── Build & Push immagine Docker ─────────────────────────────────────────
   build-and-push:

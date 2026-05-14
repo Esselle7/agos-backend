@@ -53,7 +53,9 @@ public class AuthService {
         GoogleUserInfo googleUser = googleOAuthService.validateIdToken(googleTokens.idToken());
 
         User user = userRepository.findByGoogleSub(googleUser.sub())
-            .orElseGet(() -> createOrRejectUser(googleUser));
+            .orElseGet(() -> userRepository.findByEmail(googleUser.email())
+                .map(u -> { u.googleSub = googleUser.sub(); return u; })
+                .orElseGet(() -> createOrRejectUser(googleUser)));
 
         if (!user.isActive) {
             throw new UnauthorizedException("Account disabilitato");

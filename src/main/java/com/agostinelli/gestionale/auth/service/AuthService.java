@@ -14,6 +14,7 @@ import java.util.Arrays;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.Collections;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
@@ -36,9 +37,9 @@ public class AuthService {
     @Inject
     UserRepository userRepository;
 
-    // Comma-separated allowlist — vuoto = nessun nuovo utente ammesso
-    @ConfigProperty(name = "app.security.allowed-emails", defaultValue = "")
-    String allowedEmailsRaw;
+    // Comma-separated allowlist — assente/vuoto = nessun nuovo utente ammesso
+    @ConfigProperty(name = "app.security.allowed-emails")
+    Optional<String> allowedEmailsRaw;
 
     @Transactional
     public LoginResponse handleGoogleCallback(String code) {
@@ -106,10 +107,12 @@ public class AuthService {
     }
 
     private User createOrRejectUser(GoogleUserInfo googleUser) {
-        Set<String> allowed = Arrays.stream(allowedEmailsRaw.split(","))
-            .map(String::trim)
-            .filter(e -> !e.isEmpty())
-            .collect(Collectors.toSet());
+        Set<String> allowed = allowedEmailsRaw
+            .map(raw -> Arrays.stream(raw.split(","))
+                .map(String::trim)
+                .filter(e -> !e.isEmpty())
+                .collect(Collectors.toSet()))
+            .orElse(Collections.emptySet());
 
         if (!allowed.contains(googleUser.email())) {
             log.warn("Accesso negato a email non in allowlist: {}", googleUser.email());

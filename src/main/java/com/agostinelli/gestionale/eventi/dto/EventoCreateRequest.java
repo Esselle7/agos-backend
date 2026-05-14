@@ -7,6 +7,7 @@ import jakarta.validation.constraints.Positive;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.UUID;
 
 public record EventoCreateRequest(
 
@@ -43,5 +44,11 @@ public record EventoCreateRequest(
         String note,
 
         /** BU di appartenenza; default BU2 – Cerimonie ed Eventi se null. */
-        Short businessUnitId
+        Short businessUnitId,
+
+        /**
+         * Dipendenti (personale.id) da associare all'evento.
+         * Se null o vuota nessun partecipante viene creato.
+         */
+        List<UUID> personaleIds
 ) {}

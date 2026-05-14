@@ -18,6 +18,8 @@ public interface EventoMapper {
     @Mapping(target = "costiDirettiImputati",       ignore = true)
     @Mapping(target = "noteAnnullamento",           ignore = true)
     @Mapping(target = "nOspiti",                    ignore = true)
+    // personaleIds è gestito direttamente dal service — non mappato sull'entità
+    @BeanMapping(ignoreUnmappedSourceProperties = {"personaleIds"})
     Evento fromRequest(EventoCreateRequest req);
 
     /**
@@ -25,7 +27,10 @@ public interface EventoMapper {
      * stato e noteAnnullamento sono gestiti dalla macchina a stati nel service.
      * allergie sono gestite manualmente nel service.
      */
-    @BeanMapping(nullValuePropertyMappingStrategy = NullValuePropertyMappingStrategy.IGNORE)
+    @BeanMapping(
+        nullValuePropertyMappingStrategy = NullValuePropertyMappingStrategy.IGNORE,
+        ignoreUnmappedSourceProperties = {"personaleIds"}
+    )
     @Mapping(target = "id",                   ignore = true)
     @Mapping(target = "createdAt",            ignore = true)
     @Mapping(target = "createdBy",            ignore = true)

@@ -7,6 +7,7 @@ public record PersonaleDTO(
         UUID id,
         String nome,
         String cognome,
+        UUID mansioneId,
         String mansione,
         Short businessUnitId,
         String businessUnitNome,

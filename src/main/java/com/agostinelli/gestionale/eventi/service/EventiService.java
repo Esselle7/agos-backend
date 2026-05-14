@@ -53,6 +53,7 @@ public class EventiService {
         }
         repo.persist(e);
         salvaAllergie(e.id, req.allergie());
+        bulkAssegnaPersonale(e.id, req.personaleIds());
         return buildEventoDTO(e, true);
     }
 
@@ -99,6 +100,14 @@ public class EventiService {
         }
         if (req.allergie() != null) {
             salvaAllergie(e.id, req.allergie());
+        }
+
+        // Se personaleIds presente, sostituisce integralmente i partecipanti
+        if (req.personaleIds() != null) {
+            em.createQuery("DELETE FROM EventoPartecipante ep WHERE ep.eventoId = :eid")
+                    .setParameter("eid", e.id)
+                    .executeUpdate();
+            bulkAssegnaPersonale(e.id, req.personaleIds());
         }
 
         return buildEventoDTO(e, isAdmin);
@@ -295,8 +304,9 @@ public class EventiService {
         p.costo       = req.costo();
         p.note        = req.note();
         partecipantiRepo.persist(p);
+        em.flush();
 
-        return toPartecipanteDTO(p);
+        return toPartecipanteDTOEnriched(p.id);
     }
 
     @Transactional
@@ -307,11 +317,33 @@ public class EventiService {
         partecipantiRepo.delete(p);
     }
 
+    @SuppressWarnings("unchecked")
     public List<EventoPartecipanteDTO> getPartecipantiEvento(UUID eventoId) {
         findOrThrow(eventoId);
-        return partecipantiRepo.findByEventoId(eventoId).stream()
-                .map(this::toPartecipanteDTO)
-                .toList();
+        List<Object[]> rows = em.createNativeQuery("""
+                SELECT ep.id, CAST(ep.evento_id AS text), CAST(ep.personale_id AS text),
+                       per.nome, per.cognome, man.nome as mansione,
+                       ep.ruolo, ep.costo, ep.note
+                FROM evento_partecipanti ep
+                JOIN personale per ON per.id = ep.personale_id
+                LEFT JOIN mansioni man ON man.id = per.mansione_id
+                WHERE ep.evento_id = :eid
+                ORDER BY man.nome NULLS LAST, per.cognome, per.nome
+                """)
+                .setParameter("eid", eventoId)
+                .getResultList();
+
+        return rows.stream().map(r -> new EventoPartecipanteDTO(
+                ((Number) r[0]).longValue(),
+                UUID.fromString((String) r[1]),
+                UUID.fromString((String) r[2]),
+                (String) r[3],
+                (String) r[4],
+                (String) r[5],
+                (String) r[6],
+                (BigDecimal) r[7],
+                (String) r[8]
+        )).toList();
     }
 
     // ── HELPERS PRIVATI ───────────────────────────────────────────────────────
@@ -320,6 +352,22 @@ public class EventiService {
         return repo.findByIdOptional(id)
                 .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
                         "Evento non trovato: " + id));
+    }
+
+    /**
+     * Associa in bulk un elenco di personale a un evento.
+     * Ignora silenziosamente id non esistenti e duplicati.
+     */
+    private void bulkAssegnaPersonale(UUID eventoId, List<UUID> personaleIds) {
+        if (personaleIds == null || personaleIds.isEmpty()) return;
+        for (UUID pid : personaleIds) {
+            if (!personaleExists(pid)) continue;
+            if (partecipantiRepo.existsByEventoIdAndPersonaleId(eventoId, pid)) continue;
+            EventoPartecipante ep = new EventoPartecipante();
+            ep.eventoId    = eventoId;
+            ep.personaleId = pid;
+            partecipantiRepo.persist(ep);
+        }
     }
 
     /**
@@ -413,8 +461,34 @@ public class EventiService {
         }
     }
 
-    private EventoPartecipanteDTO toPartecipanteDTO(EventoPartecipante p) {
-        return new EventoPartecipanteDTO(p.id, p.eventoId, p.personaleId, p.ruolo, p.costo, p.note);
+    /** Restituisce un DTO arricchito per un EventoPartecipante appena persistito. */
+    @SuppressWarnings("unchecked")
+    private EventoPartecipanteDTO toPartecipanteDTOEnriched(Long partecipanteId) {
+        List<Object[]> rows = em.createNativeQuery("""
+                SELECT ep.id, CAST(ep.evento_id AS text), CAST(ep.personale_id AS text),
+                       per.nome, per.cognome, man.nome as mansione,
+                       ep.ruolo, ep.costo, ep.note
+                FROM evento_partecipanti ep
+                JOIN personale per ON per.id = ep.personale_id
+                LEFT JOIN mansioni man ON man.id = per.mansione_id
+                WHERE ep.id = :pid
+                """)
+                .setParameter("pid", partecipanteId)
+                .getResultList();
+
+        if (rows.isEmpty()) throw new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND", "Partecipante non trovato");
+        Object[] r = rows.get(0);
+        return new EventoPartecipanteDTO(
+                ((Number) r[0]).longValue(),
+                UUID.fromString((String) r[1]),
+                UUID.fromString((String) r[2]),
+                (String) r[3],
+                (String) r[4],
+                (String) r[5],
+                (String) r[6],
+                (BigDecimal) r[7],
+                (String) r[8]
+        );
     }
 
     private boolean personaleExists(UUID personaleId) {

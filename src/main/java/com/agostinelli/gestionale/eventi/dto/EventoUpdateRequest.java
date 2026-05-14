@@ -5,6 +5,7 @@ import jakarta.validation.constraints.Positive;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.UUID;
 
 public record EventoUpdateRequest(
 
@@ -42,5 +43,11 @@ public record EventoUpdateRequest(
         /** Obbligatoria in business logic quando stato=ANNULLATO. */
         String noteAnnullamento,
 
-        Short businessUnitId
+        Short businessUnitId,
+
+        /**
+         * Se non null, sostituisce integralmente la lista del personale assegnato.
+         * Lista vuota = rimuove tutti i partecipanti.
+         */
+        List<UUID> personaleIds
 ) {}

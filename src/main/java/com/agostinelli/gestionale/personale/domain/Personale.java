@@ -19,8 +19,9 @@ public class Personale {
     @Column(name = "cognome", nullable = false, length = 100)
     public String cognome;
 
-    @Column(name = "mansione", length = 100)
-    public String mansione;
+    /** FK → mansioni.id. La mansione effettiva si ottiene tramite JOIN. */
+    @Column(name = "mansione_id", columnDefinition = "uuid")
+    public UUID mansioneId;
 
     @Column(name = "centro_di_costo_id")
     public Integer centroDiCostoId;

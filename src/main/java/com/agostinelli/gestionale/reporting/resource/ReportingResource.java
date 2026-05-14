@@ -7,6 +7,7 @@ import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.reporting.dto.*;
 import com.agostinelli.gestionale.reporting.service.ExportService;
 import com.agostinelli.gestionale.reporting.service.ReportJobService;
+import com.agostinelli.gestionale.reporting.service.ForecastingService;
 import com.agostinelli.gestionale.reporting.service.ReportingService;
 import com.agostinelli.gestionale.shared.dto.MovimentoDTO;
 import jakarta.annotation.security.RolesAllowed;
@@ -33,6 +34,7 @@ public class ReportingResource {
     private static final DateTimeFormatter FNAME_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
     @Inject ReportingService reportingService;
+    @Inject ForecastingService forecastingService;
     @Inject ReportJobService jobService;
     @Inject ExportService exportService;
     @Inject CassaMovimentiRepository cassaRepo;
@@ -99,6 +101,16 @@ public class ReportingResource {
             throw new ApiException(Response.Status.BAD_REQUEST, "PARAM_OUT_OF_RANGE", "giorni max 365");
         }
         return reportingService.getCashFlowForecast(giorni);
+    }
+
+    // ── Forecasting ───────────────────────────────────────────────────────────
+
+    @GET
+    @Path("/forecasting")
+    public ForecastingRispostaDTO forecasting(
+            @QueryParam("horizon") @DefaultValue("90") String horizon) {
+
+        return forecastingService.computeForecasting(horizon);
     }
 
     // ── Export ────────────────────────────────────────────────────────────────

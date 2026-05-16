@@ -97,7 +97,7 @@ public class AuthResource {
             .maxAge(0)
             .build();
 
-        String redirectUrl = frontendUrl + "/auth/callback"
+        String redirectUrl = frontendUrl + "/oauth/callback"
             + "?accessToken=" + loginResponse.accessToken()
             + "&refreshToken=" + loginResponse.refreshToken()
             + "&id=" + loginResponse.user().id()

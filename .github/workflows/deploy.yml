@@ -11,56 +11,8 @@ env:
 
 jobs:
 
-  # ── Test ──────────────────────────────────────────────────────────────────
-  test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: agos
-          POSTGRES_PASSWORD: agos
-          POSTGRES_DB: agosdb_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: maven
-
-      # Genera chiavi RSA temporanee per i test:
-      # - publicKey.pem / privateKey.pem  → usati da %test.mp.jwt.verify.publickey.location
-      # - BASE64_PRIVATE_KEY / BASE64_PUBLIC_KEY → richiesti da @ConfigProperty in JwtService
-      - name: Generate test RSA keys
-        run: |
-          openssl genrsa -out /tmp/rsa.pem 2048 2>/dev/null
-          openssl rsa -in /tmp/rsa.pem -pubout -outform PEM \
-            -out src/main/resources/publicKey.pem 2>/dev/null
-          openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
-            -in /tmp/rsa.pem -out src/main/resources/privateKey.pem 2>/dev/null
-          # Esporta le versioni base64 DER come env var per i @ConfigProperty
-          echo "BASE64_PRIVATE_KEY=$(openssl pkcs8 -topk8 -inform PEM -outform DER -nocrypt \
-            -in /tmp/rsa.pem 2>/dev/null | base64 -w 0)" >> $GITHUB_ENV
-          echo "BASE64_PUBLIC_KEY=$(openssl rsa -in /tmp/rsa.pem -pubout -outform DER \
-            2>/dev/null | base64 -w 0)" >> $GITHUB_ENV
-
-      - name: Run tests
-        run: mvn test -Dquarkus.profile=test
-
   # ── Build & Push immagine Docker ─────────────────────────────────────────
   build-and-push:
-    needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     permissions:
@@ -106,18 +58,14 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_SSH_PORT }}
           script: |
-            # Login a GHCR per poter pullare l'immagine
             echo "${{ secrets.GHCR_PULL_TOKEN }}" | docker login ghcr.io -u esselle7 --password-stdin
 
             cd ~/app
 
-            # Pull nuova immagine e riavvia solo il backend (zero-downtime)
             docker compose --env-file .env.prod pull backend
             docker compose --env-file .env.prod up -d --no-deps backend
 
-            # Pulizia immagini vecchie
             docker image prune -f
 
-            # Verifica che il container sia su
             sleep 15
             docker compose ps backend

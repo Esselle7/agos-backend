@@ -14,7 +14,6 @@ import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.*;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
-import org.eclipse.microprofile.jwt.JsonWebToken;
 
 import java.net.URI;
 import java.util.Map;
@@ -141,12 +140,12 @@ public class AuthResource {
     @GET
     @Path("/me")
     public UserInfo me(@Context SecurityContext securityContext) {
-        JsonWebToken jwt = (JsonWebToken) securityContext.getUserPrincipal();
-        if (jwt == null) {
+        java.security.Principal principal = securityContext.getUserPrincipal();
+        if (principal == null) {
             throw new UnauthorizedException("Token JWT mancante");
         }
 
-        UUID userId = UUID.fromString(jwt.getSubject());
+        UUID userId = UUID.fromString(principal.getName());
         User user = Optional.ofNullable(userRepository.findById(userId))
             .orElseThrow(() -> new UnauthorizedException("Utente non trovato"));
 

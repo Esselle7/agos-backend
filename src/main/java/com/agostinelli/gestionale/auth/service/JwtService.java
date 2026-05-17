@@ -60,7 +60,10 @@ public class JwtService {
                 privateKey = (RSAPrivateKey) KeyFactory.getInstance("RSA")
                     .generatePrivate(new PKCS8EncodedKeySpec(keyBytes));
             } else {
-                log.warn("BASE64_PRIVATE_KEY non configurata: la generazione di token fallirà");
+                privateKey = loadPrivateKeyFromClasspath("privateKey.pem");
+                if (privateKey == null) {
+                    log.warn("BASE64_PRIVATE_KEY non configurata e privateKey.pem non trovato: la generazione di token fallirà");
+                }
             }
 
             if (!base64PublicKey.isBlank()) {
@@ -68,10 +71,41 @@ public class JwtService {
                 publicKey = (RSAPublicKey) KeyFactory.getInstance("RSA")
                     .generatePublic(new X509EncodedKeySpec(keyBytes));
             } else {
-                log.warn("BASE64_PUBLIC_KEY non configurata: la validazione interna dei token fallirà");
+                publicKey = loadPublicKeyFromClasspath("publicKey.pem");
+                if (publicKey == null) {
+                    log.warn("BASE64_PUBLIC_KEY non configurata e publicKey.pem non trovato: la validazione interna dei token fallirà");
+                }
             }
         } catch (Exception e) {
             log.error("Errore caricamento chiavi RSA per JWT: {}", e.getMessage());
+        }
+    }
+
+    private RSAPrivateKey loadPrivateKeyFromClasspath(String resource) {
+        try (var is = getClass().getClassLoader().getResourceAsStream(resource)) {
+            if (is == null) return null;
+            String pem = new String(is.readAllBytes(), StandardCharsets.UTF_8)
+                .replaceAll("-----[^-]+-----", "").replaceAll("\\s+", "");
+            byte[] keyBytes = Base64.getDecoder().decode(pem);
+            return (RSAPrivateKey) KeyFactory.getInstance("RSA")
+                .generatePrivate(new PKCS8EncodedKeySpec(keyBytes));
+        } catch (Exception e) {
+            log.warn("Impossibile caricare chiave privata dal classpath ({}): {}", resource, e.getMessage());
+            return null;
+        }
+    }
+
+    private RSAPublicKey loadPublicKeyFromClasspath(String resource) {
+        try (var is = getClass().getClassLoader().getResourceAsStream(resource)) {
+            if (is == null) return null;
+            String pem = new String(is.readAllBytes(), StandardCharsets.UTF_8)
+                .replaceAll("-----[^-]+-----", "").replaceAll("\\s+", "");
+            byte[] keyBytes = Base64.getDecoder().decode(pem);
+            return (RSAPublicKey) KeyFactory.getInstance("RSA")
+                .generatePublic(new X509EncodedKeySpec(keyBytes));
+        } catch (Exception e) {
+            log.warn("Impossibile caricare chiave pubblica dal classpath ({}): {}", resource, e.getMessage());
+            return null;
         }
     }
 

@@ -1,8 +1,9 @@
 package com.agostinelli.gestionale.infrastructure.filter;
 
+import com.agostinelli.gestionale.auth.service.DecodedToken;
+import com.agostinelli.gestionale.auth.service.JwtService;
 import com.agostinelli.gestionale.infrastructure.exception.UnauthorizedException;
 import io.quarkus.arc.profile.UnlessBuildProfile;
-import io.smallrye.jwt.auth.principal.JWTParser;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -12,7 +13,6 @@ import jakarta.ws.rs.container.ContainerRequestFilter;
 import jakarta.ws.rs.core.SecurityContext;
 import jakarta.ws.rs.ext.Provider;
 import lombok.extern.slf4j.Slf4j;
-import org.eclipse.microprofile.jwt.JsonWebToken;
 
 import java.io.IOException;
 import java.security.Principal;
@@ -29,7 +29,7 @@ import java.security.Principal;
 public class JwtAuthFilter implements ContainerRequestFilter {
 
     @Inject
-    JWTParser jwtParser;
+    JwtService jwtService;
 
     @Override
     public void filter(ContainerRequestContext requestContext) throws IOException {
@@ -45,8 +45,10 @@ public class JwtAuthFilter implements ContainerRequestFilter {
 
         String token = authHeader.substring(7);
         try {
-            JsonWebToken jwt = jwtParser.parse(token);
-            requestContext.setSecurityContext(buildSecurityContext(jwt));
+            DecodedToken decoded = jwtService.validateToken(token);
+            requestContext.setSecurityContext(buildSecurityContext(decoded));
+        } catch (UnauthorizedException e) {
+            throw e;
         } catch (Exception e) {
             log.debug("JWT non valido: {}", e.getMessage());
             throw new UnauthorizedException("Token JWT non valido o scaduto");
@@ -62,16 +64,16 @@ public class JwtAuthFilter implements ContainerRequestFilter {
             || path.startsWith("/q/");
     }
 
-    private SecurityContext buildSecurityContext(JsonWebToken jwt) {
+    private SecurityContext buildSecurityContext(DecodedToken decoded) {
         return new SecurityContext() {
             @Override
             public Principal getUserPrincipal() {
-                return jwt;
+                return () -> decoded.userId().toString();
             }
 
             @Override
             public boolean isUserInRole(String role) {
-                return jwt.getGroups().contains(role);
+                return role != null && role.equals(decoded.role());
             }
 
             @Override

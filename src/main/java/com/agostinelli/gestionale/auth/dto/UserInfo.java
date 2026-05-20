@@ -9,5 +9,6 @@ public record UserInfo(
     UUID id,
     String email,
     String nome,
-    String ruolo
+    String ruolo,
+    UUID personaleId
 ) {}

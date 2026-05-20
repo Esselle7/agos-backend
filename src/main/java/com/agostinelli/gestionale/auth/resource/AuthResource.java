@@ -2,11 +2,14 @@ package com.agostinelli.gestionale.auth.resource;
 
 import com.agostinelli.gestionale.auth.domain.User;
 import com.agostinelli.gestionale.auth.domain.UserRepository;
+import com.agostinelli.gestionale.auth.dto.ExchangeCodeRequest;
 import com.agostinelli.gestionale.auth.dto.LoginResponse;
 import com.agostinelli.gestionale.auth.dto.RefreshRequest;
 import com.agostinelli.gestionale.auth.dto.TokenResponse;
 import com.agostinelli.gestionale.auth.dto.UserInfo;
 import com.agostinelli.gestionale.auth.service.AuthService;
+import com.agostinelli.gestionale.auth.service.AuthorizationCodeStore;
+import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.infrastructure.exception.UnauthorizedException;
 import jakarta.inject.Inject;
 import jakarta.validation.Valid;
@@ -22,7 +25,15 @@ import java.util.UUID;
 
 /**
  * Endpoint REST per il flusso di autenticazione OAuth2 Google e gestione sessioni JWT.
- * Tutti i path sotto /auth/google/* e /auth/refresh sono pubblici (senza JWT).
+ *
+ * Endpoint pubblici (senza JWT richiesto):
+ *   - GET  /auth/google/login       redirect verso Google
+ *   - GET  /auth/google/callback    callback Google, redirige al FE con code opaco
+ *   - POST /auth/google/exchange    scambia code opaco con i JWT interni
+ *   - POST /auth/refresh            rinnovo token tramite refresh token
+ *
+ * Endpoint autenticati:
+ *   - POST /auth/logout, GET /auth/me   richiedono JWT valido
  */
 @Slf4j
 @Path("/auth")
@@ -34,6 +45,9 @@ public class AuthResource {
 
     @Inject
     AuthService authService;
+
+    @Inject
+    AuthorizationCodeStore codeStore;
 
     @Inject
     UserRepository userRepository;
@@ -48,6 +62,14 @@ public class AuthResource {
     String frontendUrl;
 
     /**
+     * In dev/test il cookie non viene marcato {@code Secure} perché viaggia su
+     * HTTP localhost; in prod è obbligatorio per evitare downgrade su canali
+     * non cifrati. Override esplicito tramite {@code app.security.cookie-secure}.
+     */
+    @ConfigProperty(name = "app.security.cookie-secure", defaultValue = "false")
+    boolean cookieSecure;
+
+    /**
      * Avvia il flusso OAuth2: genera uno state CSRF e redirige verso Google.
      */
     @GET
@@ -55,13 +77,7 @@ public class AuthResource {
     public Response googleLogin() {
         String state = UUID.randomUUID().toString();
 
-        NewCookie stateCookie = new NewCookie.Builder(STATE_COOKIE)
-            .value(state)
-            .httpOnly(true)
-            .path("/auth")
-            .maxAge(600)
-            .sameSite(NewCookie.SameSite.LAX)
-            .build();
+        NewCookie stateCookie = stateCookieBuilder(state, 600);
 
         String googleAuthUrl = buildGoogleAuthUrl(state);
         return Response.status(302)
@@ -71,7 +87,11 @@ public class AuthResource {
     }
 
     /**
-     * Riceve il callback di Google, verifica lo state CSRF e completa il login.
+     * Riceve il callback di Google, verifica lo state CSRF e completa il login
+     * lato backend. Anziché redirigere il frontend con i token JWT in chiaro
+     * (cronologia, Referer, log), emette un codice opaco a 256 bit
+     * monouso/TTL-90s che il frontend scambierà con i token via
+     * {@link #exchangeCode(ExchangeCodeRequest)}.
      */
     @GET
     @Path("/google/callback")
@@ -89,24 +109,30 @@ public class AuthResource {
         }
 
         LoginResponse loginResponse = authService.handleGoogleCallback(code);
+        String opaqueCode = codeStore.issue(loginResponse);
 
-        NewCookie clearedCookie = new NewCookie.Builder(STATE_COOKIE)
-            .value("")
-            .path("/auth")
-            .maxAge(0)
-            .build();
+        NewCookie clearedCookie = stateCookieBuilder("", 0);
 
-        String redirectUrl = frontendUrl + "/oauth/callback"
-            + "?accessToken=" + loginResponse.accessToken()
-            + "&refreshToken=" + loginResponse.refreshToken()
-            + "&id=" + loginResponse.user().id()
-            + "&nome=" + encode(loginResponse.user().nome())
-            + "&email=" + encode(loginResponse.user().email())
-            + "&ruolo=" + loginResponse.user().ruolo();
+        // Solo il codice opaco viaggia nel redirect: nessun token, nessun PII.
+        String redirectUrl = frontendUrl + "/oauth/callback?code=" + opaqueCode;
 
         return Response.seeOther(URI.create(redirectUrl))
             .cookie(clearedCookie)
             .build();
+    }
+
+    /**
+     * Scambia il codice opaco emesso da {@link #googleCallback} con i JWT
+     * interni e i dati utente. Il codice è monouso: una seconda chiamata
+     * restituirà 401.
+     */
+    @POST
+    @Path("/google/exchange")
+    public LoginResponse exchangeCode(@Valid ExchangeCodeRequest request) {
+        return codeStore.consume(request.code())
+            .orElseThrow(() -> new ApiException(Response.Status.UNAUTHORIZED,
+                    "INVALID_OR_EXPIRED_CODE",
+                    "Codice di autorizzazione non valido o scaduto"));
     }
 
     /**
@@ -119,7 +145,8 @@ public class AuthResource {
     }
 
     /**
-     * Revoca il refresh token dell'utente corrente. Richiede JWT valido.
+     * Revoca il refresh token dell'utente corrente. Richiede JWT valido
+     * (enforcement via {@code JwtAuthFilter}).
      */
     @POST
     @Path("/logout")
@@ -127,6 +154,9 @@ public class AuthResource {
         Map<String, String> body,
         @Context SecurityContext securityContext
     ) {
+        // L'enforcement del JWT è fatto dal JwtAuthFilter: questo endpoint NON
+        // è nell'allow-list, quindi una richiesta senza JWT viene respinta a
+        // monte con 401. Qui possiamo presumere principal != null.
         String refreshToken = body != null ? body.get("refreshToken") : null;
         if (refreshToken != null && !refreshToken.isBlank()) {
             authService.logout(refreshToken);
@@ -149,25 +179,34 @@ public class AuthResource {
         User user = Optional.ofNullable(userRepository.findById(userId))
             .orElseThrow(() -> new UnauthorizedException("Utente non trovato"));
 
-        return new UserInfo(user.id, user.email, user.nome, user.ruolo.name());
+        return new UserInfo(user.id, user.email, user.nome, user.ruolo.name(), user.personaleId);
+    }
+
+    // ── helpers privati ───────────────────────────────────────────────────────
+
+    private NewCookie stateCookieBuilder(String value, int maxAgeSeconds) {
+        return new NewCookie.Builder(STATE_COOKIE)
+            .value(value)
+            .httpOnly(true)
+            .secure(cookieSecure)
+            .path("/auth")
+            .maxAge(maxAgeSeconds)
+            .sameSite(NewCookie.SameSite.LAX)
+            .build();
     }
 
     private String buildGoogleAuthUrl(String state) {
         return "https://accounts.google.com/o/oauth2/v2/auth" +
-            "?client_id=" + googleClientId +
+            "?client_id=" + encode(googleClientId) +
             "&redirect_uri=" + encode(redirectUri) +
             "&response_type=code" +
             "&scope=" + encode("openid email profile") +
-            "&state=" + state +
+            "&state=" + encode(state) +
             "&access_type=offline" +
             "&prompt=consent";
     }
 
     private String encode(String value) {
-        try {
-            return java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            return value;
-        }
+        return java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8);
     }
 }

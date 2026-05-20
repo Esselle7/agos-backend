@@ -93,4 +93,27 @@ public class EventiRepository implements PanacheRepositoryBase<Evento, UUID> {
     public List<Evento> findCalendario(LocalDate from, LocalDate to) {
         return list("dataEvento >= ?1 AND dataEvento <= ?2 ORDER BY dataEvento ASC", from, to);
     }
+
+    /**
+     * Restituisce gli eventi a cui il personale è assegnato come partecipante.
+     * Usata dall'endpoint {@code GET /api/eventi/miei}.
+     */
+    public List<Evento> findByPersonaleId(UUID personaleId, int page, int size) {
+        return em.createQuery(
+                "FROM Evento e WHERE e.id IN " +
+                "(SELECT ep.eventoId FROM EventoPartecipante ep WHERE ep.personaleId = :pid) " +
+                "ORDER BY e.dataEvento DESC", Evento.class)
+                .setParameter("pid", personaleId)
+                .setFirstResult(page * size)
+                .setMaxResults(size)
+                .getResultList();
+    }
+
+    public long countByPersonaleId(UUID personaleId) {
+        return (Long) em.createQuery(
+                "SELECT COUNT(e) FROM Evento e WHERE e.id IN " +
+                "(SELECT ep.eventoId FROM EventoPartecipante ep WHERE ep.personaleId = :pid)")
+                .setParameter("pid", personaleId)
+                .getSingleResult();
+    }
 }

@@ -24,6 +24,7 @@ public class EventiResource {
 
     private static final int DEFAULT_SIZE = 20;
     private static final int MAX_SIZE     = 100;
+    private static final String ROLE_ADMIN = "ADMIN";
 
     @Inject EventiService service;
 
@@ -41,9 +42,8 @@ public class EventiResource {
             @QueryParam("size")   @DefaultValue("20") int size,
             @Context SecurityContext ctx) {
 
-        int safeSize = Math.min(Math.max(size, 1), MAX_SIZE);
-        boolean isAdmin = ctx.isUserInRole("ADMIN");
-        return service.findWithFilters(stato, buId, from, to, search, page, safeSize, isAdmin);
+        int safeSize = clampSize(size);
+        return service.findWithFilters(stato, buId, from, to, search, page, safeSize, isAdmin(ctx));
     }
 
     @GET
@@ -51,51 +51,78 @@ public class EventiResource {
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
     public List<EventoCalendarioDTO> calendario(
             @QueryParam("from") LocalDate from,
-            @QueryParam("to")   LocalDate to) {
-        return service.getCalendario(from, to);
+            @QueryParam("to")   LocalDate to,
+            @Context SecurityContext ctx) {
+        return service.getCalendario(from, to, isAdmin(ctx));
     }
 
+    /**
+     * KPI dashboard. Visibile a entrambi i ruoli, ma il service nullifica
+     * i campi finanziari (totaleIncassato, totaleCosti, profittoTotale)
+     * per i DIPENDENTE.
+     */
     @GET
     @Path("/dashboard")
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
     public DashboardDTO dashboard(
             @QueryParam("from") LocalDate from,
-            @QueryParam("to")   LocalDate to) {
-        return service.getDashboard(from, to);
+            @QueryParam("to")   LocalDate to,
+            @Context SecurityContext ctx) {
+        return service.getDashboard(from, to, isAdmin(ctx));
+    }
+
+    /**
+     * Lista degli eventi a cui il DIPENDENTE è assegnato come partecipante.
+     * Riservato al ruolo DIPENDENTE (gli ADMIN usano l'endpoint generico).
+     *
+     * NOTA path routing: in JAX-RS i segmenti statici hanno priorità sui
+     * path parameter, quindi {@code /miei} viene risolto qui e non in
+     * {@link #findById(UUID, SecurityContext)}.
+     */
+    @GET
+    @Path("/miei")
+    @RolesAllowed("DIPENDENTE")
+    public PagedResponse<EventoDTO> getMiei(
+            @QueryParam("page") @DefaultValue("0")  int page,
+            @QueryParam("size") @DefaultValue("20") int size,
+            @Context SecurityContext ctx) {
+
+        UUID userId = currentUserId(ctx);
+        int safeSize = clampSize(size);
+        return service.getMieiEventi(userId, page, safeSize);
     }
 
     @GET
     @Path("/{id}")
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
     public EventoDTO findById(@PathParam("id") UUID id, @Context SecurityContext ctx) {
-        return service.findById(id, ctx.isUserInRole("ADMIN"));
+        return service.findById(id, isAdmin(ctx));
     }
 
     @POST
-    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    @RolesAllowed(ROLE_ADMIN)
     public Response create(@Valid EventoCreateRequest req, @Context SecurityContext ctx) {
-        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        UUID userId = currentUserId(ctx);
         EventoDTO dto = service.createEvento(req, userId);
         return Response.status(Response.Status.CREATED).entity(dto).build();
     }
 
     @PUT
     @Path("/{id}")
-    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    @RolesAllowed(ROLE_ADMIN)
     public Response update(
             @PathParam("id") UUID id,
             @Valid EventoUpdateRequest req,
             @Context SecurityContext ctx) {
 
-        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
-        boolean isAdmin = ctx.isUserInRole("ADMIN");
-        EventoDTO dto = service.updateEvento(id, req, userId, isAdmin);
+        UUID userId = currentUserId(ctx);
+        EventoDTO dto = service.updateEvento(id, req, userId, isAdmin(ctx));
         return Response.ok(dto).build();
     }
 
     @DELETE
     @Path("/{id}")
-    @RolesAllowed("ADMIN")
+    @RolesAllowed(ROLE_ADMIN)
     public Response delete(@PathParam("id") UUID id) {
         service.deleteEvento(id);
         return Response.noContent().build();
@@ -105,13 +132,13 @@ public class EventiResource {
 
     @POST
     @Path("/{id}/pagamenti")
-    @RolesAllowed("ADMIN")
+    @RolesAllowed(ROLE_ADMIN)
     public Response registraPagamento(
             @PathParam("id") UUID id,
             @Valid PagamentoRequest req,
             @Context SecurityContext ctx) {
 
-        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        UUID userId = currentUserId(ctx);
         RegistraPagamentoResult result = service.registraPagamento(id, req, userId);
         Response.ResponseBuilder rb = Response.status(Response.Status.CREATED).entity(result.dto());
         if (result.suggestCompletamento()) {
@@ -144,7 +171,7 @@ public class EventiResource {
 
     @POST
     @Path("/{id}/partecipanti")
-    @RolesAllowed("ADMIN")
+    @RolesAllowed(ROLE_ADMIN)
     public Response aggiungiPartecipante(
             @PathParam("id") UUID id,
             @Valid AggiungiPartecipanteRequest req) {
@@ -153,18 +180,39 @@ public class EventiResource {
         return Response.status(Response.Status.CREATED).entity(dto).build();
     }
 
+    /**
+     * Lista partecipanti di un evento. Il campo {@code costo} è nascosto
+     * ai DIPENDENTE (impostato a {@code null}) per non esporre informazioni
+     * di costo del personale a colleghi.
+     */
     @GET
     @Path("/{id}/partecipanti")
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
-    public List<EventoPartecipanteDTO> getPartecipanti(@PathParam("id") UUID id) {
-        return service.getPartecipantiEvento(id);
+    public List<EventoPartecipanteDTO> getPartecipanti(
+            @PathParam("id") UUID id,
+            @Context SecurityContext ctx) {
+        return service.getPartecipantiEvento(id, isAdmin(ctx));
     }
 
     @DELETE
     @Path("/partecipanti/{id}")
-    @RolesAllowed("ADMIN")
+    @RolesAllowed(ROLE_ADMIN)
     public Response rimuoviPartecipante(@PathParam("id") Long id) {
         service.rimuoviPartecipante(id);
         return Response.noContent().build();
+    }
+
+    // ── helpers privati ───────────────────────────────────────────────────────
+
+    private static boolean isAdmin(SecurityContext ctx) {
+        return ctx.isUserInRole(ROLE_ADMIN);
+    }
+
+    private static UUID currentUserId(SecurityContext ctx) {
+        return UUID.fromString(ctx.getUserPrincipal().getName());
+    }
+
+    private static int clampSize(int size) {
+        return Math.min(Math.max(size, 1), MAX_SIZE);
     }
 }

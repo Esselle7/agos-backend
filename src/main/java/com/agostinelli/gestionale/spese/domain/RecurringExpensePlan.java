@@ -63,6 +63,18 @@ public class RecurringExpensePlan {
     @Column(name = "updated_at")
     public Instant updatedAt;
 
+    @Column(name = "tipo_piano", nullable = false, length = 20)
+    public String tipoPiano = "FLAT";
+
+    @Column(name = "importo_debito_iniziale", precision = 12, scale = 2)
+    public BigDecimal importoDebitoIniziale;
+
+    @Column(name = "tasso_interesse_annuo", precision = 8, scale = 5)
+    public BigDecimal tassoInteresseAnnuo;
+
+    @Column(name = "conto_coge_interessi_id")
+    public Integer contoCogeInteressiId;
+
     @PrePersist
     void onCreate() {
         if (createdAt == null) createdAt = Instant.now();

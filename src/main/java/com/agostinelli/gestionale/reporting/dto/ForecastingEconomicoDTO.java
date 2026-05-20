@@ -7,4 +7,6 @@ public record ForecastingEconomicoDTO(
         BigDecimal ricaviPrevisti,
         BigDecimal costiPrevisti,
         BigDecimal ebitdaPrevisto,
+        BigDecimal oneriFinanziariPrevisti,
+        BigDecimal ebitPrevisto,
         List<ForecastingDettaglioDTO> dettaglio) {}

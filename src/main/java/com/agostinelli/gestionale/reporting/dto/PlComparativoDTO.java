@@ -15,6 +15,8 @@ public record PlComparativoDTO(
             BigDecimal ricavi,
             BigDecimal costi,
             BigDecimal ebitda,
+            BigDecimal ebit,
+            BigDecimal utileNetto,
             BigDecimal marginePct
     ) {}
 
@@ -22,6 +24,11 @@ public record PlComparativoDTO(
             BigDecimal ricavi,
             BigDecimal costi,
             BigDecimal ebitda,
+            BigDecimal ammortamenti,
+            BigDecimal ebit,
+            BigDecimal oneriFinanziari,
+            BigDecimal imposte,
+            BigDecimal utileNetto,
             BigDecimal marginePct
     ) {}
 }

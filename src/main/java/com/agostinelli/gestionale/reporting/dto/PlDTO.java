@@ -11,6 +11,12 @@ public record PlDTO(
         RicaviDTO ricavi,
         CostiDTO costi,
         BigDecimal ebitda,
+        BigDecimal ammortamenti,
+        BigDecimal ebit,
+        BigDecimal oneriFinanziari,
+        BigDecimal ebt,
+        BigDecimal imposte,
+        BigDecimal utileNetto,
         BigDecimal marginePct
 ) {
     public record RicaviDTO(BigDecimal totale, List<VoceDTO> perCategoria) {}

@@ -39,7 +39,8 @@ public class ReportingService {
         var query = em.createNativeQuery(
                 "SELECT codice_coge, descrizione_coge, tipo_coge, is_capex, " +
                 "COALESCE(SUM(ricavi),0), COALESCE(SUM(costi_operativi),0), " +
-                "COALESCE(SUM(investimenti_capex),0), COALESCE(SUM(ebitda_proxy),0) " +
+                "COALESCE(SUM(investimenti_capex),0), COALESCE(SUM(ebitda_proxy),0), " +
+                "COALESCE(SUM(oneri_finanziari),0), COALESCE(SUM(imposte),0) " +
                 "FROM mv_conto_economico_mensile " +
                 "WHERE (anno * 100 + mese) >= :fromYM AND (anno * 100 + mese) <= :toYM" + buFilter +
                 " GROUP BY codice_coge, descrizione_coge, tipo_coge, is_capex")
@@ -72,7 +73,8 @@ public class ReportingService {
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT business_unit_id, business_unit_nome, " +
                 "COALESCE(SUM(ricavi),0), COALESCE(SUM(costi_operativi),0), " +
-                "COALESCE(SUM(investimenti_capex),0), COALESCE(SUM(ebitda_proxy),0) " +
+                "COALESCE(SUM(investimenti_capex),0), COALESCE(SUM(ebitda_proxy),0), " +
+                "COALESCE(SUM(oneri_finanziari),0), COALESCE(SUM(imposte),0) " +
                 "FROM mv_conto_economico_mensile " +
                 "WHERE (anno * 100 + mese) >= :fromYM AND (anno * 100 + mese) <= :toYM " +
                 "GROUP BY business_unit_id, business_unit_nome")
@@ -81,33 +83,60 @@ public class ReportingService {
                 .getResultList();
 
         List<PlComparativoDTO.PlBuDTO> buList = new ArrayList<>();
-        BigDecimal totRicavi = BigDecimal.ZERO;
-        BigDecimal totCosti  = BigDecimal.ZERO;
-        BigDecimal totEbitda = BigDecimal.ZERO;
+        BigDecimal totRicavi          = BigDecimal.ZERO;
+        BigDecimal totCosti           = BigDecimal.ZERO;
+        BigDecimal totEbitda          = BigDecimal.ZERO;
+        BigDecimal totOneriFinanziari = BigDecimal.ZERO;
+        BigDecimal totImposte         = BigDecimal.ZERO;
+
+        BigDecimal ammortamenti = computeAmmortamenti(from, to);
+
+        // Prima passata per calcolare totale ebitda (necessario per pro-rata D&A per BU)
+        BigDecimal sumEbitda = BigDecimal.ZERO;
+        for (Object[] r : rows) {
+            sumEbitda = sumEbitda.add(toBD(r[5]));
+        }
 
         for (Object[] r : rows) {
-            short buId    = toShort(r[0]);
-            BigDecimal ric  = toBD(r[2]);
-            BigDecimal cos  = toBD(r[3]).add(toBD(r[4])); // operativi + capex
-            BigDecimal ebit = toBD(r[5]);
-            BigDecimal mPct = ric.compareTo(BigDecimal.ZERO) > 0
-                    ? ebit.divide(ric, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
+            short buId              = toShort(r[0]);
+            BigDecimal ric          = toBD(r[2]);
+            BigDecimal cos          = toBD(r[3]).add(toBD(r[4]));
+            BigDecimal ebitdaBu     = toBD(r[5]);
+            BigDecimal oneriBu      = toBD(r[6]);
+            BigDecimal imposteBu    = toBD(r[7]);
+
+            // Distribuisce D&A proporzionalmente all'EBITDA della BU
+            BigDecimal ammortBu = sumEbitda.compareTo(BigDecimal.ZERO) != 0
+                    ? ammortamenti.multiply(ebitdaBu).divide(sumEbitda, 2, RoundingMode.HALF_UP)
+                    : BigDecimal.ZERO;
+            BigDecimal ebitBu      = ebitdaBu.subtract(ammortBu).subtract(oneriBu);
+            BigDecimal utileNettoBu = ebitBu.subtract(imposteBu);
+            BigDecimal mPct        = ric.compareTo(BigDecimal.ZERO) > 0
+                    ? ebitdaBu.divide(ric, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
                     : BigDecimal.ZERO;
 
             buList.add(new PlComparativoDTO.PlBuDTO(
-                    new BuRefDTO(buId, (String) r[1]), ric, cos, ebit, mPct));
+                    new BuRefDTO(buId, (String) r[1]), ric, cos, ebitdaBu, ebitBu, utileNettoBu, mPct));
 
-            totRicavi = totRicavi.add(ric);
-            totCosti  = totCosti.add(cos);
-            totEbitda = totEbitda.add(ebit);
+            totRicavi          = totRicavi.add(ric);
+            totCosti           = totCosti.add(cos);
+            totEbitda          = totEbitda.add(ebitdaBu);
+            totOneriFinanziari = totOneriFinanziari.add(oneriBu);
+            totImposte         = totImposte.add(imposteBu);
         }
 
-        BigDecimal totMargPct = totRicavi.compareTo(BigDecimal.ZERO) > 0
+        BigDecimal totEbit      = totEbitda.subtract(ammortamenti).subtract(totOneriFinanziari);
+        BigDecimal totUtileNetto = totEbit.subtract(totImposte);
+        BigDecimal totMargPct   = totRicavi.compareTo(BigDecimal.ZERO) > 0
                 ? totEbitda.divide(totRicavi, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
                 : BigDecimal.ZERO;
 
         return new PlComparativoDTO(from, to, buList,
-                new PlComparativoDTO.ConsolidatoDTO(totRicavi, totCosti, totEbitda, totMargPct));
+                new PlComparativoDTO.ConsolidatoDTO(
+                        totRicavi, totCosti, totEbitda,
+                        ammortamenti, totEbit,
+                        totOneriFinanziari, totImposte,
+                        totUtileNetto, totMargPct));
     }
 
     // ── GET /api/reporting/cashflow/storico ───────────────────────────────────
@@ -212,17 +241,20 @@ public class ReportingService {
     private PlDTO buildPlDto(Short buId, LocalDate from, LocalDate to, List<Object[]> rows) {
         List<VoceDTO> vociRicavi  = new ArrayList<>();
         List<VoceDTO> vociCosti   = new ArrayList<>();
-        BigDecimal totRicavi = BigDecimal.ZERO;
-        BigDecimal totCosti  = BigDecimal.ZERO;
-        BigDecimal totCapex  = BigDecimal.ZERO;
-        BigDecimal totEbitda = BigDecimal.ZERO;
+        BigDecimal totRicavi          = BigDecimal.ZERO;
+        BigDecimal totCosti           = BigDecimal.ZERO;
+        BigDecimal totCapex           = BigDecimal.ZERO;
+        BigDecimal totEbitda          = BigDecimal.ZERO;
+        BigDecimal totOneriFinanziari = BigDecimal.ZERO;
+        BigDecimal totImposte         = BigDecimal.ZERO;
 
-        // Prima passata: calcola i totali per calcolare le percentuali
         for (Object[] r : rows) {
-            totRicavi = totRicavi.add(toBD(r[4]));
-            totCosti  = totCosti.add(toBD(r[5]));
-            totCapex  = totCapex.add(toBD(r[6]));
-            totEbitda = totEbitda.add(toBD(r[7]));
+            totRicavi          = totRicavi.add(toBD(r[4]));
+            totCosti           = totCosti.add(toBD(r[5]));
+            totCapex           = totCapex.add(toBD(r[6]));
+            totEbitda          = totEbitda.add(toBD(r[7]));
+            totOneriFinanziari = totOneriFinanziari.add(toBD(r[8]));
+            totImposte         = totImposte.add(toBD(r[9]));
         }
 
         BigDecimal baseRicavi = totRicavi.compareTo(BigDecimal.ZERO) > 0 ? totRicavi : BigDecimal.ONE;
@@ -246,6 +278,11 @@ public class ReportingService {
             }
         }
 
+        BigDecimal ammortamenti = computeAmmortamenti(from, to);
+        BigDecimal ebit         = totEbitda.subtract(ammortamenti);
+        BigDecimal ebt          = ebit.subtract(totOneriFinanziari);
+        BigDecimal utileNetto   = ebt.subtract(totImposte);
+
         BigDecimal marginePct = totRicavi.compareTo(BigDecimal.ZERO) > 0
                 ? totEbitda.divide(totRicavi, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
                 : null;
@@ -256,8 +293,20 @@ public class ReportingService {
                 buRef, from, to,
                 new PlDTO.RicaviDTO(totRicavi, vociRicavi),
                 new PlDTO.CostiDTO(totCosti.add(totCapex), totCapex, vociCosti),
-                totEbitda, marginePct
+                totEbitda, ammortamenti, ebit,
+                totOneriFinanziari, ebt, totImposte, utileNetto,
+                marginePct
         );
+    }
+
+    private BigDecimal computeAmmortamenti(LocalDate from, LocalDate to) {
+        long mesi = ChronoUnit.MONTHS.between(from.withDayOfMonth(1), to.withDayOfMonth(1)) + 1;
+        Object result = em.createNativeQuery(
+                "SELECT COALESCE(SUM(costo_storico * aliquota_ammortamento / 100.0 / 12.0), 0) " +
+                "FROM cespiti WHERE is_active = true")
+                .getSingleResult();
+        BigDecimal ammortamentoMensile = result instanceof BigDecimal bd ? bd : new BigDecimal(result.toString());
+        return ammortamentoMensile.multiply(BigDecimal.valueOf(mesi)).setScale(2, RoundingMode.HALF_UP);
     }
 
     private List<CashFlowPeriodoDTO> getCashFlowMensile(LocalDate from, LocalDate to) {

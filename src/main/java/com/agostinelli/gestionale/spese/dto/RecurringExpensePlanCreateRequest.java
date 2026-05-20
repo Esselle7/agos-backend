@@ -37,5 +37,15 @@ public record RecurringExpensePlanCreateRequest(
     @NotNull
     LocalDate dataInizio,          // mese/anno di partenza; il giorno viene sostituito con giornoDelMese
 
-    String note
+    String note,
+
+    @Pattern(regexp = "FLAT|FINANZIAMENTO")
+    String tipoPiano,              // default "FLAT" se null
+
+    BigDecimal importoDebitoIniziale,  // richiesto se tipoPiano = FINANZIAMENTO
+
+    @DecimalMin("0.001")
+    BigDecimal tassoInteresseAnnuo,    // % annuo, es. 3.5 = 3,5%. Richiesto se FINANZIAMENTO
+
+    Integer contoCogeInteressiId       // COGE di tipo ONERE_FINANZIARIO. Richiesto se FINANZIAMENTO
 ) {}

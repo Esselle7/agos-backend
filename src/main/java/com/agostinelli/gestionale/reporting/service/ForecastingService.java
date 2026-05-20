@@ -45,7 +45,8 @@ public class ForecastingService {
         if (!fine.isAfter(oggi)) {
             ForecastingAsIsDTO asIs = buildAsIs(oggi);
             ForecastingEconomicoDTO economico = new ForecastingEconomicoDTO(
-                    BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, List.of());
+                    BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO,
+                    BigDecimal.ZERO, BigDecimal.ZERO, List.of());
             ForecastingFinanziarioDTO finanziario = new ForecastingFinanziarioDTO(
                     asIs.saldoLiquidita(), BigDecimal.ZERO, BigDecimal.ZERO,
                     asIs.saldoLiquidita(), List.of());
@@ -118,14 +119,13 @@ public class ForecastingService {
     private ForecastingEconomicoDTO buildEconomico(LocalDate start, LocalDate end) {
         List<ForecastingDettaglioDTO> dettaglio = new ArrayList<>();
 
-        // 1. Movimenti con data economica futura (escludendo quelli legati a eventi,
-        //    già catturati dall'evento residuo)
+        // 1. Movimenti con data economica futura (escludendo quelli legati a eventi)
         dettaglio.addAll(buildMovimentiEconomici(start, end));
 
         // 2. Residuo atteso da eventi CONFERMATI
         dettaglio.addAll(buildEventiForecasting(start, end));
 
-        // 3. Rate ricorrenti PENDING
+        // 3. Rate ricorrenti PENDING (con split capitale/interessi per FINANZIAMENTO)
         dettaglio.addAll(buildRatePending(start, end));
 
         // 4. Stipendi
@@ -136,11 +136,35 @@ public class ForecastingService {
         BigDecimal ricavi = dettaglio.stream()
                 .map(ForecastingDettaglioDTO::importoEntrata)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal costi = dettaglio.stream()
+
+        // costiPrevisti: solo costi operativi (esclude quota capitale e interessi FINANZIAMENTO)
+        BigDecimal costiOperativi = dettaglio.stream()
+                .filter(d -> !"RATA_RICORRENTE_CAPITALE".equals(d.categoria())
+                          && !"RATA_RICORRENTE_INTERESSI".equals(d.categoria()))
                 .map(ForecastingDettaglioDTO::importoUscita)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        return new ForecastingEconomicoDTO(ricavi, costi, ricavi.subtract(costi), dettaglio);
+        BigDecimal oneriFinanziari = dettaglio.stream()
+                .filter(d -> "RATA_RICORRENTE_INTERESSI".equals(d.categoria()))
+                .map(ForecastingDettaglioDTO::importoUscita)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal ebitda = ricavi.subtract(costiOperativi);
+        BigDecimal ammortamenti = computeAmmortamentiPrevisione(start, end);
+        BigDecimal ebit = ebitda.subtract(ammortamenti);
+
+        return new ForecastingEconomicoDTO(ricavi, costiOperativi, ebitda, oneriFinanziari, ebit, dettaglio);
+    }
+
+    private BigDecimal computeAmmortamentiPrevisione(LocalDate from, LocalDate to) {
+        long mesi = java.time.temporal.ChronoUnit.MONTHS.between(
+                from.withDayOfMonth(1), to.withDayOfMonth(1)) + 1;
+        Object result = em.createNativeQuery(
+                "SELECT COALESCE(SUM(costo_storico * aliquota_ammortamento / 100.0 / 12.0), 0) " +
+                "FROM cespiti WHERE is_active = true")
+                .getSingleResult();
+        BigDecimal ammMensile = result instanceof BigDecimal bd ? bd : new BigDecimal(result.toString());
+        return ammMensile.multiply(BigDecimal.valueOf(mesi)).setScale(2, java.math.RoundingMode.HALF_UP);
     }
 
     // ── FINANZIARIO ───────────────────────────────────────────────────────────
@@ -275,7 +299,8 @@ public class ForecastingService {
     @SuppressWarnings("unchecked")
     private List<ForecastingDettaglioDTO> buildRatePending(LocalDate start, LocalDate end) {
         List<Object[]> rows = em.createNativeQuery(
-                "SELECT i.data_scadenza, COALESCE(p.descrizione, 'Spesa ricorrente'), i.importo " +
+                "SELECT i.data_scadenza, COALESCE(p.descrizione, 'Spesa ricorrente'), i.importo, " +
+                "p.tipo_piano, i.quota_capitale, i.quota_interessi " +
                 "FROM recurring_expense_installment i " +
                 "JOIN recurring_expense_plan p ON p.id = i.piano_id " +
                 "WHERE i.stato = 'PENDING' " +
@@ -287,13 +312,24 @@ public class ForecastingService {
 
         List<ForecastingDettaglioDTO> result = new ArrayList<>();
         for (Object[] r : rows) {
-            result.add(new ForecastingDettaglioDTO(
-                    toLocalDate(r[0]),
-                    "RATA_RICORRENTE",
-                    (String) r[1],
-                    BigDecimal.ZERO,
-                    toBD(r[2]),
-                    "ENTRAMBE"));
+            LocalDate data    = toLocalDate(r[0]);
+            String desc       = (String) r[1];
+            String tipoPiano  = r[3] != null ? (String) r[3] : "FLAT";
+
+            if ("FINANZIAMENTO".equals(tipoPiano) && r[4] != null && r[5] != null) {
+                BigDecimal quotaCapitale  = toBD(r[4]);
+                BigDecimal quotaInteressi = toBD(r[5]);
+                result.add(new ForecastingDettaglioDTO(
+                        data, "RATA_RICORRENTE_CAPITALE", desc + " (capitale)",
+                        BigDecimal.ZERO, quotaCapitale, "ENTRAMBE"));
+                result.add(new ForecastingDettaglioDTO(
+                        data, "RATA_RICORRENTE_INTERESSI", desc + " (interessi)",
+                        BigDecimal.ZERO, quotaInteressi, "ENTRAMBE"));
+            } else {
+                result.add(new ForecastingDettaglioDTO(
+                        data, "RATA_RICORRENTE", desc,
+                        BigDecimal.ZERO, toBD(r[2]), "ENTRAMBE"));
+            }
         }
         return result;
     }

@@ -391,18 +391,19 @@ class EventiAuthorizationTest {
 
             em.createNativeQuery("""
                     INSERT INTO movimenti (
-                        id, tipo, importo, importo_commissione,
+                        id, tipo, importo_lordo, importo_commissione,
                         data_movimento, data_finanziaria, data_liquidita,
                         stato, evento_id, tipo_evento_movimento,
-                        conto_bancario_id, metodo_pagamento_id, business_unit_id, conto_coge,
-                        descrizione, fonte, created_at)
+                        conto_bancario_id, metodo_pagamento_id, business_unit_id, conto_coge_id,
+                        descrizione, fonte, created_by, created_at)
                     VALUES (
                         gen_random_uuid(), 'ENTRATA', :importo, 0,
                         (SELECT data_evento FROM eventi WHERE id = CAST(:eid AS uuid)),
                         DATE '2026-08-01', DATE '2026-08-01',
                         'ATTIVO', CAST(:eid AS uuid), 'CAPARRA',
                         :conto, :metodo, 2, :coge,
-                        '[EVENTO TEST] caparra fixture', 'MANUALE', now())
+                        '[EVENTO TEST] caparra fixture', 'MANUALE',
+                        CAST('00000000-0000-0000-0000-000000000099' AS uuid), now())
                     """)
                     .setParameter("importo", importo)
                     .setParameter("eid", eventoId)
@@ -441,19 +442,24 @@ class EventiAuthorizationTest {
         }
 
         private void upsertUser(String userId, String email, String googleSub, String personaleId) {
+            // Bind :pid come UUID Java (anche quando null) per evitare l'errore
+            // PostgreSQL "could not determine data type of parameter $5":
+            // un :pid bind-ato come String null nella CASE WHEN ... THEN NULL ELSE
+            // CAST(... AS uuid) END lascia il parser PG senza tipo per il NULL branch.
+            UUID pidUuid = personaleId != null ? UUID.fromString(personaleId) : null;
             em.createNativeQuery("""
                     INSERT INTO users (id, email, google_sub, full_name, role, is_active, personale_id, created_at)
                     VALUES (CAST(:id AS uuid), :email, :sub, :name, 'DIPENDENTE', true,
-                            CASE WHEN :pid IS NULL THEN NULL ELSE CAST(:pid AS uuid) END,
+                            :pid,
                             now())
                     ON CONFLICT (id) DO UPDATE SET
-                        personale_id = CASE WHEN :pid IS NULL THEN NULL ELSE CAST(:pid AS uuid) END
+                        personale_id = :pid
                     """)
                     .setParameter("id", userId)
                     .setParameter("email", email)
                     .setParameter("sub", googleSub)
                     .setParameter("name", email)
-                    .setParameter("pid", personaleId)
+                    .setParameter("pid", pidUuid)
                     .executeUpdate();
         }
 

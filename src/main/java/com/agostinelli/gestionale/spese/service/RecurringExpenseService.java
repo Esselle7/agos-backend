@@ -192,10 +192,17 @@ public class RecurringExpenseService {
             installmentRepo.findNextPendingAfter(planId, rata.numeroRata)
                     .ifPresent(next -> {
                         next.importo = next.importo.add(rata.importo);
-                        // BUG 2 fix: merged importo no longer matches the original split — clear to force FLAT branch on pay
                         if ("FINANZIAMENTO".equals(plan.tipoPiano)) {
-                            next.quotaCapitale  = null;
-                            next.quotaInteressi = null;
+                            if (rata.quotaCapitale != null && next.quotaCapitale != null) {
+                                // Fonde le quote delle due rate: la prossima assorbe capitale e interessi della saltata
+                                next.quotaCapitale  = next.quotaCapitale.add(rata.quotaCapitale);
+                                next.quotaInteressi = (next.quotaInteressi != null ? next.quotaInteressi : BigDecimal.ZERO)
+                                        .add(rata.quotaInteressi != null ? rata.quotaInteressi : BigDecimal.ZERO);
+                            } else {
+                                // Split già perso in precedenza: forza ramo FLAT al pagamento
+                                next.quotaCapitale  = null;
+                                next.quotaInteressi = null;
+                            }
                         }
                     });
         } else {
@@ -397,6 +404,11 @@ public class RecurringExpenseService {
                     capitale  = debitoResiduo;
                     interessi = importo.subtract(capitale).max(BigDecimal.ZERO)
                             .setScale(2, RoundingMode.HALF_UP);
+                    // L'ultima rata chiude il debito esattamente, quindi può differire
+                    // leggermente dalla PMT (accumulo di arrotondamenti su 60 rate è
+                    // tipicamente qualche €). Aggiorniamo importo per mantenere
+                    // l'invariante rata.importo = quotaCapitale + quotaInteressi.
+                    importo = capitale.add(interessi);
                 }
                 debitoResiduo = debitoResiduo.subtract(capitale);
 

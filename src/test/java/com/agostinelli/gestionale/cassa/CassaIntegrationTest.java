@@ -298,6 +298,96 @@ class CassaIntegrationTest {
                 .body("content", hasSize(greaterThan(0)));
     }
 
+    // ── Atomicità giroconto ────────────────────────────────────────────────────
+
+    /**
+     * Verifica che PRELIEVO_DA_BANCA crei esattamente un cassa_movimento E un
+     * movimento bancario nella stessa transazione (atomicità happy path).
+     */
+    @Test
+    @Order(35)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testPrelievo_atomicita_entrambiCreati() {
+        // Conta i movimenti bancari USCITA su una data riservata a questo test
+        int movBancaBefore = given()
+            .queryParam("tipo",  "USCITA")
+            .queryParam("from",  "2099-01-10")
+            .queryParam("to",    "2099-01-10")
+            .when().get("/api/movimenti")
+            .then().statusCode(200)
+            .extract().path("content.size()");
+
+        int cassaBefore = given()
+            .queryParam("from", "2099-01-10")
+            .queryParam("to",   "2099-01-10")
+            .when().get("/api/cassa/movimenti")
+            .then().statusCode(200)
+            .extract().path("content.size()");
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"PRELIEVO_DA_BANCA","importo":111.11,
+                     "contoBancaId":1,"dataMovimento":"2099-01-10",
+                     "descrizione":"Test atomicità giroconto"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then().statusCode(201);
+
+        // Entrambe le scritture devono essere avvenute nella stessa transazione
+        given()
+            .queryParam("tipo", "USCITA")
+            .queryParam("from", "2099-01-10")
+            .queryParam("to",   "2099-01-10")
+            .when().get("/api/movimenti")
+            .then().statusCode(200)
+            .body("content.size()", org.hamcrest.Matchers.equalTo(movBancaBefore + 1));
+
+        given()
+            .queryParam("from", "2099-01-10")
+            .queryParam("to",   "2099-01-10")
+            .when().get("/api/cassa/movimenti")
+            .then().statusCode(200)
+            .body("content.size()", org.hamcrest.Matchers.equalTo(cassaBefore + 1));
+    }
+
+    /**
+     * Verifica il rollback atomico: se la leg bancaria fallisce (FK violation su
+     * conto_bancario_id inesistente), anche il cassa_movimento deve essere annullato.
+     * Garantisce che non esistano "mezzi giroconti" in DB.
+     */
+    @Test
+    @Order(36)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testPrelievo_rollback_seMovimentoBancaFallisce() {
+        int cassaBefore = given()
+            .queryParam("from", "2099-01-11")
+            .queryParam("to",   "2099-01-11")
+            .when().get("/api/cassa/movimenti")
+            .then().statusCode(200)
+            .extract().path("content.size()");
+
+        // contoBancaId=9999 non esiste → FK violation gestita da CassaService come
+        // ApiException CONFLICT (409) → rollback dell'intera transazione.
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"PRELIEVO_DA_BANCA","importo":222.22,
+                     "contoBancaId":9999,"dataMovimento":"2099-01-11",
+                     "descrizione":"Test rollback giroconto"}
+                    """)
+            .when().post("/api/cassa/movimenti")
+            .then().statusCode(409);
+
+        // Il cassa_movimento NON deve essere rimasto in DB (rollback avvenuto)
+        given()
+            .queryParam("from", "2099-01-11")
+            .queryParam("to",   "2099-01-11")
+            .when().get("/api/cassa/movimenti")
+            .then().statusCode(200)
+            .body("content.size()", org.hamcrest.Matchers.equalTo(cassaBefore));
+    }
+
     // ── Invariante saldo ───────────────────────────────────────────────────────
 
     @Test

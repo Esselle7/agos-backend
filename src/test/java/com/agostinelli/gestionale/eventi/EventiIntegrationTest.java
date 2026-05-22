@@ -737,19 +737,21 @@ class EventiIntegrationTest {
     @Order(112)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void calendario_coloriStato_corretti() {
+        // Data nel futuro lontano per evitare "DATA_NEL_PASSATO" quando la suite
+        // viene eseguita dopo la data che era originariamente hardcodata.
         given()
             .contentType(ContentType.JSON)
             .body("""
                     {"nome":"Evento Calendario Colore","tipo":"AZIENDALE",
-                     "dataEvento":"2026-05-20","contattoNome":"Test",
+                     "dataEvento":"2099-05-20","contattoNome":"Test",
                      "numeroTotalePartecipanti":1}
                     """)
             .when().post("/api/eventi")
             .then().statusCode(201);
 
         given()
-            .queryParam("from", "2026-05-01")
-            .queryParam("to",   "2026-05-31")
+            .queryParam("from", "2099-05-01")
+            .queryParam("to",   "2099-05-31")
             .when().get("/api/eventi/calendario")
             .then()
                 .statusCode(200)

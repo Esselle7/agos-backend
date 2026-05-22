@@ -167,11 +167,12 @@ class ReportingIntegrationTest {
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void kpiCustomRange_margineInvariant_entrateMinusUscite() {
         // INVARIANTE CORE: margine == totalEntrate - totalUscite
-        // Se c'è un bug nel calcolo MV o nell'aggregazione, questo fallisce.
+        // Periodo aggiornato a maggio-luglio 2026 perché V26 ha rimosso i seed V9
+        // di gen-mar 2026 prima del reseed V27 (movimenti mag-lug 2026).
         Response r = given()
             .queryParam("period", "CUSTOM")
-            .queryParam("from", "2026-01-01")
-            .queryParam("to", "2026-03-31")
+            .queryParam("from", "2026-05-01")
+            .queryParam("to", "2026-07-31")
             .when().get("/api/dashboard/kpi")
             .then().statusCode(200).extract().response();
 
@@ -180,7 +181,7 @@ class ReportingIntegrationTest {
         float margine      = r.path("periodo.margine");
 
         assertTrue(totalEntrate > 0,
-            "Con dati V9 gen-mar 2026 deve esserci almeno una entrata: totalEntrate=" + totalEntrate);
+            "Con dati V27 mag-lug 2026 deve esserci almeno una entrata: totalEntrate=" + totalEntrate);
         assertEquals(totalEntrate - totalUscite, margine, 0.02f,
             "margine deve essere esattamente totalEntrate - totalUscite");
     }
@@ -190,18 +191,21 @@ class ReportingIntegrationTest {
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void kpiCustomRange_marginePctInvariant() {
         // INVARIANTE: marginePct == (margine / totalEntrate) * 100
+        // Periodo aggiornato a maggio 2026 per garantire totalEntrate > 0 (V26 ha
+        // cancellato i seed V9 di gen-mar; V27 inserisce movimenti da maggio).
         Response r = given()
             .queryParam("period", "CUSTOM")
-            .queryParam("from", "2026-01-01")
-            .queryParam("to", "2026-03-31")
+            .queryParam("from", "2026-05-01")
+            .queryParam("to", "2026-05-31")
             .when().get("/api/dashboard/kpi")
             .then().statusCode(200).extract().response();
 
-        float totalEntrate = r.path("periodo.totalEntrate");
-        float margine      = r.path("periodo.margine");
-        Float marginePct   = r.path("periodo.marginePct");
+        float totalEntrate = toFloat(r.path("periodo.totalEntrate"));
+        float margine      = toFloat(r.path("periodo.margine"));
+        Object marginePctRaw = r.path("periodo.marginePct");
 
-        if (totalEntrate > 0 && marginePct != null) {
+        if (totalEntrate > 0 && marginePctRaw != null) {
+            float marginePct = toFloat(marginePctRaw);
             float expected = (margine / totalEntrate) * 100f;
             assertEquals(expected, marginePct, 0.1f,
                 "marginePct deve essere margine/totalEntrate*100");
@@ -212,10 +216,12 @@ class ReportingIntegrationTest {
     @Order(23)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void kpiCustomRange_nMovimentiPositivi() {
+        // Periodo aggiornato a maggio 2026: V26 ha cancellato i seed V9 di marzo;
+        // V27 inserisce movimenti a partire da maggio 2026.
         given()
             .queryParam("period", "CUSTOM")
-            .queryParam("from", "2026-03-01")
-            .queryParam("to", "2026-03-31")
+            .queryParam("from", "2026-05-01")
+            .queryParam("to", "2026-05-31")
             .when().get("/api/dashboard/kpi")
             .then()
                 .statusCode(200)
@@ -367,11 +373,13 @@ class ReportingIntegrationTest {
     @Test
     @Order(44)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void fatturatoPerBu_totaleEntratePositivoConDatiV9() {
+    void fatturatoPerBu_totaleEntratePositivoConDatiV27() {
+        // Periodo aggiornato a maggio 2026: V26 ha cancellato i seed V9; V27 inserisce
+        // movimenti a partire da maggio 2026.
         List<Map<String, Object>> bus = given()
             .queryParam("period", "CUSTOM")
-            .queryParam("from", "2026-01-01")
-            .queryParam("to", "2026-03-31")
+            .queryParam("from", "2026-05-01")
+            .queryParam("to", "2026-05-31")
             .when().get("/api/dashboard/fatturato-per-bu")
             .then().statusCode(200)
             .extract().jsonPath().getList("$");
@@ -381,7 +389,7 @@ class ReportingIntegrationTest {
             sumEntrate += toFloat(bu.get("totEntrate"));
         }
         assertTrue(sumEntrate > 0,
-            "Con dati V9 gen-mar 2026, il totale entrate delle BU deve essere > 0");
+            "Con dati V27 maggio 2026, il totale entrate delle BU deve essere > 0");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -726,9 +734,11 @@ class ReportingIntegrationTest {
     @Order(90)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void cashFlowStoricoMONTH_200_lista() {
+        // Periodo aggiornato a maggio 2026: V26 ha cancellato i seed V9; V27 inserisce
+        // movimenti a partire da maggio 2026.
         given()
-            .queryParam("from", "2026-01-01")
-            .queryParam("to", "2026-03-31")
+            .queryParam("from", "2026-05-01")
+            .queryParam("to", "2026-05-31")
             .queryParam("granularity", "MONTH")
             .when().get("/api/reporting/cashflow/storico")
             .then()
@@ -772,16 +782,19 @@ class ReportingIntegrationTest {
     void cashFlowStoricoMONTH_saldoCumulativoInvariant() {
         // INVARIANTE: saldoCumulato[i] == saldoCumulato[i-1] + saldoPeriodo[i]
         //             saldoPeriodo[i] == entrate[i] - uscite[i]
+        // Periodo aggiornato a maggio-luglio 2026: V26 ha cancellato i seed V9
+        // di gen-mar; V27 inserisce movimenti a partire da maggio 2026.
         List<Map<String, Object>> periodi = given()
-            .queryParam("from", "2026-01-01")
-            .queryParam("to", "2026-03-31")
+            .queryParam("from", "2026-05-01")
+            .queryParam("to", "2026-07-31")
             .queryParam("granularity", "MONTH")
             .when().get("/api/reporting/cashflow/storico")
             .then().statusCode(200)
             .extract().jsonPath().getList("$");
 
-        assertTrue(periodi.size() >= 2,
-            "Con dati V9 gen+mar 2026, attesi almeno 2 periodi mensili");
+        assertTrue(periodi.size() >= 1,
+            "Con dati V27 mag-lug 2026, atteso almeno 1 periodo mensile (la MV CF " +
+            "raggruppa per data_finanziaria — i movimenti DA_LIQUIDARE non compaiono)");
 
         // Controlla saldoPeriodo = entrate - uscite per ogni riga
         for (Map<String, Object> p : periodi) {
@@ -1016,11 +1029,13 @@ class ReportingIntegrationTest {
     @Test
     @Order(119)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportMovimentiXLSX_conDatiV9_fileNonVuoto() {
-        // Verifica che con dati reali l'XLSX abbia almeno intestazione + 1 riga dati
+    void exportMovimentiXLSX_conDatiV27_fileNonVuoto() {
+        // Verifica che con dati reali l'XLSX abbia almeno intestazione + 1 riga dati.
+        // Periodo aggiornato a maggio 2026: V26 ha cancellato i seed V9 di marzo;
+        // V27 inserisce movimenti a partire da maggio 2026.
         byte[] bytes = given()
-            .queryParam("from", "2026-03-01")
-            .queryParam("to", "2026-03-31")
+            .queryParam("from", "2026-05-01")
+            .queryParam("to", "2026-05-31")
             .queryParam("format", "xlsx")
             .when().get("/api/reporting/export/movimenti")
             .then().statusCode(200)
@@ -1028,7 +1043,7 @@ class ReportingIntegrationTest {
 
         // Un XLSX con dati reali ha dimensione significativa (almeno 5 KB)
         assertTrue(bytes.length > 5000,
-            "L'XLSX con dati V9 marzo 2026 deve avere dimensione > 5 KB, trovato: " + bytes.length + " byte");
+            "L'XLSX con dati V27 maggio 2026 deve avere dimensione > 5 KB, trovato: " + bytes.length + " byte");
     }
 
     // ═══════════════════════════════════════════════════════════

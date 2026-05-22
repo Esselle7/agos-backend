@@ -6,12 +6,12 @@ import io.restassured.http.ContentType;
 import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
 import jakarta.transaction.Transactional;
-import jakarta.transaction.UserTransaction;
 import org.junit.jupiter.api.*;
 
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -30,7 +30,7 @@ class SpeseRicorrentiIntegrationTest {
     static final String BASE      = "/api/spese-ricorrenti";
 
     @Inject EntityManager em;
-    @Inject UserTransaction tx;
+    @Inject TxHelper txHelper;
 
     private static Integer validContoCoge;
     private static String  createdPlanId;
@@ -628,6 +628,11 @@ class SpeseRicorrentiIntegrationTest {
         Assumptions.assumeTrue(finanziamentoPlanId != null,
                 "Piano finanziamento non creato nel test precedente");
 
+        // Garantisce saldo sufficiente per pagare una rata da 8 490€ anche quando
+        // il test viene eseguito in isolamento (conto 1 ha saldo_iniziale=0 da V6
+        // e V27 non ne accredita abbastanza).
+        txHelper.seedSaldoConto1(new java.math.BigDecimal("20000.00"));
+
         String rataId = given()
             .when().get(BASE + "/piani/" + finanziamentoPlanId)
             .then().statusCode(200)
@@ -647,19 +652,9 @@ class SpeseRicorrentiIntegrationTest {
         assertNotNull(movimentoId, "movimentoId (capitale) deve essere non null");
 
         // Verifica che nel DB ci sia anche il movimento interessi (movimento_interessi_id)
-        try {
-            tx.begin();
-            Number movIntCount = (Number) em.createNativeQuery(
-                    "SELECT COUNT(*) FROM recurring_expense_installment " +
-                    "WHERE id = :rataId::uuid AND movimento_interessi_id IS NOT NULL")
-                    .setParameter("rataId", rataId)
-                    .getSingleResult();
-            tx.commit();
-            assertEquals(1, movIntCount.intValue(),
-                    "movimento_interessi_id deve essere valorizzato dopo il pagamento");
-        } catch (Exception e) {
-            fail("Errore verifica movimento interessi: " + e.getMessage());
-        }
+        long movIntCount = txHelper.countInstallmentsWithInteresse(UUID.fromString(rataId), true);
+        assertEquals(1, movIntCount,
+                "movimento_interessi_id deve essere valorizzato dopo il pagamento");
     }
 
     // ── BUG fixes regression tests ────────────────────────────────────────────
@@ -707,34 +702,71 @@ class SpeseRicorrentiIntegrationTest {
     @Order(104)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void testFinanziamento_skipAccorpa_nullificaQuote() {
-        // BUG 2: ACCORPA on FINANZIAMENTO must nullify next rata's quotaCapitale/quotaInteressi
-        Assumptions.assumeTrue(finanziamentoPlanId != null,
-                "Piano finanziamento non creato");
+        // BUG 2 regression: ACCORPA su FINANZIAMENTO deve azzerare quotaCapitale/quotaInteressi
+        // della rata successiva quando la rata saltata aveva il piano di ammortamento
+        // già perso (es. importo aggiornato manualmente → BUG 4 fix in updateInstallment).
+        //
+        // Test autonomo: crea un proprio piano e azzera le quote della rata saltata
+        // PRIMA di chiamare ACCORPA, in modo che la branch "split già perso" del
+        // service venga esercitata indipendentemente da test precedenti.
+        Assumptions.assumeTrue(validContoCoge != null);
+        Assumptions.assumeTrue(validContoCogeInteressi != null);
 
-        io.restassured.path.json.JsonPath before = given()
-            .when().get(BASE + "/piani/" + finanziamentoPlanId)
-            .then().statusCode(200).extract().jsonPath();
+        String body = """
+            {
+              "descrizione": "Mutuo skipAccorpa autonomous",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 8490.67,
+              "variazionePct": 0,
+              "giornoDelMese": 1,
+              "frequenza": "MENSILE",
+              "numeroRate": 12,
+              "dataInizio": "2027-01-01",
+              "tipoPiano": "FINANZIAMENTO",
+              "importoDebitoIniziale": 100000.00,
+              "tassoInteresseAnnuo": 3.5,
+              "contoCogeInteressiId": %d
+            }
+            """.formatted(validContoCoge, validContoCogeInteressi);
 
-        String primaRataId = before.getString("rate.findAll { it.stato == 'PENDING' }[0].id");
-        Assumptions.assumeTrue(primaRataId != null);
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
 
+        String primaRataId = given()
+            .when().get(BASE + "/piani/" + planId)
+            .then().statusCode(200)
+            .extract().path("rate[0].id");
+
+        // Modifica importo della rata → updateInstallment azzera quotaCapitale/quotaInteressi
+        // su un piano FINANZIAMENTO (BUG 4 fix). La rata risultante ha quote NULL.
+        given()
+            .contentType(ContentType.JSON)
+            .body("{\"importo\": 9000.00}")
+            .when().put(BASE + "/piani/" + planId + "/rate/" + primaRataId)
+            .then().statusCode(200);
+
+        // Ora ACCORPA: la rata saltata ha quote null → ramo "split già perso"
+        // del service forza next.quotaCapitale = next.quotaInteressi = null.
         given()
             .contentType(ContentType.JSON).body("""
                 {"modalita": "ACCORPA"}
                 """)
-            .when().post(BASE + "/piani/" + finanziamentoPlanId + "/rate/" + primaRataId + "/skip")
+            .when().post(BASE + "/piani/" + planId + "/rate/" + primaRataId + "/skip")
             .then().statusCode(204);
 
         io.restassured.path.json.JsonPath after = given()
-            .when().get(BASE + "/piani/" + finanziamentoPlanId)
+            .when().get(BASE + "/piani/" + planId)
             .then().statusCode(200).extract().jsonPath();
 
-        // la prima PENDING ora ha importo doppio e quote devono essere null
+        // La rata successiva (prima PENDING dopo ACCORPA) ora deve avere quote null
         Object quotaCapitale  = after.get("rate.find { it.stato == 'PENDING' }.quotaCapitale");
         Object quotaInteressi = after.get("rate.find { it.stato == 'PENDING' }.quotaInteressi");
 
-        assertNull(quotaCapitale,  "BUG 2: quotaCapitale deve essere null dopo ACCORPA su FINANZIAMENTO");
-        assertNull(quotaInteressi, "BUG 2: quotaInteressi deve essere null dopo ACCORPA su FINANZIAMENTO");
+        assertNull(quotaCapitale,  "BUG 2: quotaCapitale deve essere null dopo ACCORPA su FINANZIAMENTO con split perso");
+        assertNull(quotaInteressi, "BUG 2: quotaInteressi deve essere null dopo ACCORPA su FINANZIAMENTO con split perso");
     }
 
     @Test
@@ -1060,15 +1092,8 @@ class SpeseRicorrentiIntegrationTest {
             .then().statusCode(200);
 
         // Verifica che movimento_interessi_id sia NULL nel DB (FLAT ha un solo movimento)
-        tx.begin();
-        Number noIntCount = (Number) em.createNativeQuery(
-                "SELECT COUNT(*) FROM recurring_expense_installment " +
-                "WHERE id = :rataId::uuid AND movimento_interessi_id IS NULL")
-                .setParameter("rataId", rataId)
-                .getSingleResult();
-        tx.commit();
-
-        assertEquals(1, noIntCount.intValue(),
+        long noIntCount = txHelper.countInstallmentsWithInteresse(UUID.fromString(rataId), false);
+        assertEquals(1, noIntCount,
                 "FLAT: movimento_interessi_id deve essere NULL dopo il pagamento");
     }
 
@@ -1076,18 +1101,16 @@ class SpeseRicorrentiIntegrationTest {
 
     private static volatile boolean plMvRefreshed = false;
 
-    private void ensurePlMvRefreshed() throws Exception {
+    private void ensurePlMvRefreshed() {
         if (plMvRefreshed) return;
-        tx.begin();
-        em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_conto_economico_mensile").executeUpdate();
-        tx.commit();
+        txHelper.refreshPlMv();
         plMvRefreshed = true;
     }
 
     @Test
     @Order(120)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void testPL_tutteBu_campiWaterfall_presenti() throws Exception {
+    void testPL_tutteBu_campiWaterfall_presenti() {
         ensurePlMvRefreshed();
 
         given()
@@ -1108,7 +1131,7 @@ class SpeseRicorrentiIntegrationTest {
     @Test
     @Order(121)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void testPL_tutteBu_waterfallInvariant_ebit_eq_ebitda_minus_da_minus_oneri() throws Exception {
+    void testPL_tutteBu_waterfallInvariant_ebit_eq_ebitda_minus_da() {
         ensurePlMvRefreshed();
 
         io.restassured.path.json.JsonPath jp = given()
@@ -1122,21 +1145,26 @@ class SpeseRicorrentiIntegrationTest {
         double imposte         = jp.getDouble("totaleConsolidato.imposte");
         double utileNetto      = jp.getDouble("totaleConsolidato.utileNetto");
 
-        // Invariante 1: EBIT = EBITDA − D&A − OneriFinanziari
-        assertEquals(ebitda - ammortamenti - oneriFinanziari, ebit, 0.05,
-                "Invariante waterfall: EBIT = EBITDA - D&A - OneriFinanziari");
+        // Invariante 1 (waterfall standard): EBIT = EBITDA − D&A
+        // Gli oneri finanziari NON impattano l'EBIT — sono sotto la linea EBIT.
+        // Cfr. ReportingService.getPlTutteBu (totEbit = totEbitda - ammortamenti).
+        assertEquals(ebitda - ammortamenti, ebit, 0.05,
+                "Invariante waterfall: EBIT = EBITDA - D&A");
 
-        // Invariante 2: UtileNetto = EBIT − Imposte
-        assertEquals(ebit - imposte, utileNetto, 0.05,
-                "Invariante waterfall: UtileNetto = EBIT - Imposte");
+        // Invariante 2: UtileNetto = EBIT − OneriFinanziari − Imposte
+        assertEquals(ebit - oneriFinanziari - imposte, utileNetto, 0.05,
+                "Invariante waterfall: UtileNetto = EBIT - OneriFinanziari - Imposte");
     }
 
     @Test
     @Order(122)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void testPL_dopoFinanziamentoPagato_oneriFinanziari_positivi() throws Exception {
+    void testPL_dopoFinanziamentoPagato_oneriFinanziari_positivi() {
         Assumptions.assumeTrue(validContoCoge != null);
         Assumptions.assumeTrue(validContoCogeInteressi != null);
+
+        // Top-up saldo per garantire il pagamento (vedi seedSaldoConto1 sopra).
+        txHelper.seedSaldoConto1(new java.math.BigDecimal("20000.00"));
 
         // Crea e paga un piano FINANZIAMENTO nello stesso mese (maggio 2026)
         // per garantire che oneriFinanziari > 0 nel periodo
@@ -1175,9 +1203,7 @@ class SpeseRicorrentiIntegrationTest {
             .then().statusCode(200);
 
         // Refresh MV per includere i nuovi movimenti
-        tx.begin();
-        em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_conto_economico_mensile").executeUpdate();
-        tx.commit();
+        txHelper.refreshPlMv();
 
         // Query P&L per maggio 2026 (mese del pagamento = mese corrente in test)
         io.restassured.path.json.JsonPath jp = given()
@@ -1189,16 +1215,20 @@ class SpeseRicorrentiIntegrationTest {
                 "Dopo il pagamento della prima rata FINANZIAMENTO, oneriFinanziari nel P&L " +
                 "deve essere > 0 (interessi = €291.67); trovato: " + oneriFinanziari);
 
-        // Verifica che gli interessi compaiano come oneri finanziari e NON come costi operativi
-        double costi = jp.getDouble("totaleConsolidato.costi");
         // Il capitale (PASSIVITA) non deve apparire in costi operativi
-        // (la registrazione PASSIVITA riduce il debito, non è un costo)
-        // Questa verifica è qualitativa: oneriFinanziari < costi o ≈ 0 dipende dai dati
-        // L'invariante chiave è che oneriFinanziari è separato
-        assertEquals(oneriFinanziari, jp.getDouble("totaleConsolidato.ebitda")
-                - jp.getDouble("totaleConsolidato.ammortamenti")
-                - jp.getDouble("totaleConsolidato.ebit"), 0.05,
-                "OneriFinanziari deve comparire separato nell'equazione waterfall");
+        // (la registrazione PASSIVITA riduce il debito, non è un costo).
+        // Invariante waterfall (cfr. ReportingService.getPlTutteBu):
+        //   EBIT = EBITDA - ammortamenti  (gli oneri finanziari sono SOTTO la linea EBIT)
+        //   UtileNetto = EBIT - oneriFinanziari - imposte
+        double ebitda       = jp.getDouble("totaleConsolidato.ebitda");
+        double ammortamenti = jp.getDouble("totaleConsolidato.ammortamenti");
+        double ebit         = jp.getDouble("totaleConsolidato.ebit");
+        double imposte      = jp.getDouble("totaleConsolidato.imposte");
+        double utileNetto   = jp.getDouble("totaleConsolidato.utileNetto");
+        assertEquals(ebitda - ammortamenti, ebit, 0.05,
+                "EBIT = EBITDA - ammortamenti (oneri finanziari sotto la linea EBIT)");
+        assertEquals(ebit - oneriFinanziari - imposte, utileNetto, 0.05,
+                "UtileNetto = EBIT - oneriFinanziari - imposte");
     }
 
     @Test
@@ -1227,5 +1257,73 @@ class SpeseRicorrentiIntegrationTest {
                 .body("rate[0].dataScadenza", equalTo("2026-02-15"))
                 .body("rate[1].dataScadenza", equalTo("2026-04-15"))
                 .body("rate[2].dataScadenza", equalTo("2026-06-15"));
+    }
+
+    // ── Helper CDI bean: isola le operazioni DB in una transazione propria ─────
+    // (REQUIRES_NEW) per evitare conflitti con la transazione già attiva sul
+    // thread del test — vedi ARJUNA016051 "thread already associated with a tx".
+
+    @jakarta.enterprise.context.ApplicationScoped
+    public static class TxHelper {
+
+        @Inject EntityManager em;
+
+        /**
+         * Conta le rate con id specificato, opzionalmente filtrate per la
+         * presenza/assenza di {@code movimento_interessi_id}.
+         */
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public long countInstallmentsWithInteresse(UUID rataId, boolean withInteresse) {
+            String predicate = withInteresse
+                    ? "movimento_interessi_id IS NOT NULL"
+                    : "movimento_interessi_id IS NULL";
+            Number n = (Number) em.createNativeQuery(
+                    "SELECT COUNT(*) FROM recurring_expense_installment " +
+                    "WHERE id = :rataId AND " + predicate)
+                    .setParameter("rataId", rataId)
+                    .getSingleResult();
+            return n.longValue();
+        }
+
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public void refreshPlMv() {
+            em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_conto_economico_mensile")
+                    .executeUpdate();
+        }
+
+        /**
+         * Inserisce un ENTRATA fittizia su conto 1 per garantire un saldo
+         * sufficiente per i pagamenti di rata grossa nel test FINANZIAMENTO.
+         * Le rate da 8 490€ supererebbero altrimenti il saldo dei conti seedati
+         * da V27 (alcuni a 0 di saldo iniziale).
+         */
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public void seedSaldoConto1(java.math.BigDecimal importo) {
+            int cogeRicavo = ((Number) em.createNativeQuery(
+                    "SELECT id FROM piano_dei_conti_coge WHERE codice = '30.01.001'")
+                    .getSingleResult()).intValue();
+            int metodo = ((Number) em.createNativeQuery(
+                    "SELECT id FROM metodi_pagamento WHERE codice = 'BONIFICO'")
+                    .getSingleResult()).intValue();
+            em.createNativeQuery("""
+                    INSERT INTO movimenti (
+                        id, data_movimento, tipo, importo_lordo, importo_commissione,
+                        data_competenza, data_finanziaria, data_liquidita,
+                        conto_bancario_id, metodo_pagamento_id,
+                        conto_coge_id, business_unit_id,
+                        descrizione, stato, fonte, created_by, created_at
+                    ) VALUES (
+                        gen_random_uuid(), DATE '2026-04-01', 'ENTRATA', :importo, 0,
+                        DATE '2026-04-01', DATE '2026-04-01', DATE '2026-04-01',
+                        1, :metodo, :coge, 1,
+                        '[TEST] top-up saldo conto 1 per FINANZIAMENTO', 'REGISTRATO', 'MANUALE',
+                        CAST('00000000-0000-0000-0000-000000000099' AS uuid), now()
+                    )
+                    """)
+                    .setParameter("importo", importo)
+                    .setParameter("coge", cogeRicavo)
+                    .setParameter("metodo", metodo)
+                    .executeUpdate();
+        }
     }
 }

@@ -105,12 +105,14 @@ public class ReportingService {
             BigDecimal oneriBu      = toBD(r[6]);
             BigDecimal imposteBu    = toBD(r[7]);
 
-            // Distribuisce D&A proporzionalmente all'EBITDA della BU
-            BigDecimal ammortBu = sumEbitda.compareTo(BigDecimal.ZERO) != 0
+            // Distribuisce D&A proporzionalmente all'EBITDA della BU; se sumEbitda ≤ 0 ripartisce in quote uguali
+            BigDecimal ammortBu = sumEbitda.compareTo(BigDecimal.ZERO) > 0
                     ? ammortamenti.multiply(ebitdaBu).divide(sumEbitda, 2, RoundingMode.HALF_UP)
-                    : BigDecimal.ZERO;
-            BigDecimal ebitBu      = ebitdaBu.subtract(ammortBu).subtract(oneriBu);
-            BigDecimal utileNettoBu = ebitBu.subtract(imposteBu);
+                    : rows.size() > 0
+                        ? ammortamenti.divide(BigDecimal.valueOf(rows.size()), 2, RoundingMode.HALF_UP)
+                        : BigDecimal.ZERO;
+            BigDecimal ebitBu       = ebitdaBu.subtract(ammortBu);
+            BigDecimal utileNettoBu = ebitBu.subtract(oneriBu).subtract(imposteBu);
             BigDecimal mPct        = ric.compareTo(BigDecimal.ZERO) > 0
                     ? ebitdaBu.divide(ric, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
                     : BigDecimal.ZERO;
@@ -125,8 +127,8 @@ public class ReportingService {
             totImposte         = totImposte.add(imposteBu);
         }
 
-        BigDecimal totEbit      = totEbitda.subtract(ammortamenti).subtract(totOneriFinanziari);
-        BigDecimal totUtileNetto = totEbit.subtract(totImposte);
+        BigDecimal totEbit       = totEbitda.subtract(ammortamenti);
+        BigDecimal totUtileNetto = totEbit.subtract(totOneriFinanziari).subtract(totImposte);
         BigDecimal totMargPct   = totRicavi.compareTo(BigDecimal.ZERO) > 0
                 ? totEbitda.divide(totRicavi, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
                 : BigDecimal.ZERO;

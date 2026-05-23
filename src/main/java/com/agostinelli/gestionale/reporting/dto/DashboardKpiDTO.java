@@ -19,7 +19,7 @@ public record DashboardKpiDTO(
 
     public record ContoSaldoDTO(
             BigDecimal saldo,
-            BigDecimal variazioneMese
+            BigDecimal variazioneNelPeriodo
     ) {}
 
     public record PeriodoDTO(

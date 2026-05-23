@@ -147,4 +147,27 @@ public class MovimentiRepository implements PanacheRepositoryBase<Movimento, UUI
     public List<Movimento> findNonRiconciliatiDaBanca() {
         return list("stato = 'REGISTRATO' AND fonte = 'IMPORT_BANCA'");
     }
+
+    /**
+     * Aggregazione per stato e tipo, stessi filtri opzionali del findWithFilters.
+     * Restituisce righe [stato, tipo, SUM(importo), COUNT(*)].
+     */
+    @SuppressWarnings("unchecked")
+    public List<Object[]> sommarioByStatoTipo(
+            String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
+            String stato, UUID fornitoreId, UUID eventoId,
+            LocalDate from, LocalDate to, String search) {
+
+        StringBuilder jpql = new StringBuilder(
+                "SELECT m.stato, m.tipo, SUM(m.importo), COUNT(m) FROM Movimento m WHERE 1=1");
+        Map<String, Object> params = new LinkedHashMap<>();
+
+        appendFilters(jpql, params, tipo, buId, categoriaId, metodoPagamentoId,
+                stato, fornitoreId, eventoId, from, to, search);
+        jpql.append(" GROUP BY m.stato, m.tipo ORDER BY m.stato, m.tipo");
+
+        jakarta.persistence.Query q = em.createQuery(jpql.toString());
+        params.forEach(q::setParameter);
+        return q.getResultList();
+    }
 }

@@ -35,7 +35,7 @@ public class DashboardResource {
 
         DateRangeFilter range = resolveRange(period, from, to);
         String userId = ctx.getUserPrincipal().getName();
-        return service.getKpi(range.from(), range.to(), userId);
+        return service.getKpi(range.from(), range.to(), range.period(), userId);
     }
 
     @GET

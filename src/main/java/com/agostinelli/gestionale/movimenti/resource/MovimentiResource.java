@@ -54,6 +54,25 @@ public class MovimentiResource {
     }
 
     @GET
+    @Path("/sommario")
+    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    public MovimentiSommarioDTO sommario(
+            @QueryParam("from")              LocalDate from,
+            @QueryParam("to")                LocalDate to,
+            @QueryParam("tipo")              String tipo,
+            @QueryParam("buId")              Short buId,
+            @QueryParam("categoriaId")       Long categoriaId,
+            @QueryParam("metodoPagamentoId") Integer metodoPagamentoId,
+            @QueryParam("stato")             String stato,
+            @QueryParam("fornitoreId")       UUID fornitoreId,
+            @QueryParam("eventoId")          UUID eventoId,
+            @QueryParam("search")            String search
+    ) {
+        return service.getSommario(tipo, buId, categoriaId, metodoPagamentoId,
+                stato, fornitoreId, eventoId, from, to, search);
+    }
+
+    @GET
     @Path("/{id}")
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
     public MovimentoDTO findById(@PathParam("id") UUID id) {

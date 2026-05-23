@@ -175,11 +175,17 @@ class MovimentiIntegrationTest {
             .when().post("/api/movimenti")
             .then().statusCode(201).extract().path("id");
 
+        // PUT con semantica full-overwrite: il client invia lo stato completo del
+        // movimento (come fa il form FE), non un patch parziale.
         given()
             .contentType(ContentType.JSON)
             .body("""
-                    {"descrizione":"Descrizione aggiornata","importo":200.00}
-                    """)
+                    {"tipo":"ENTRATA","importo":200.00,"dataMovimento":"2025-06-01",
+                     "dataFinanziaria":"2025-06-01",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "descrizione":"Descrizione aggiornata"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
             .when().put("/api/movimenti/" + id)
             .then()
                 .statusCode(200)
@@ -826,6 +832,56 @@ class MovimentiIntegrationTest {
             .then()
                 .statusCode(201)
                 .body("stato", equalTo("REGISTRATO"));
+    }
+
+    // ── Sommario ──────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(120)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testSommarioRestituisceRiepilogo() {
+        given()
+            .when().get("/api/movimenti/sommario")
+            .then()
+                .statusCode(200)
+                .body("perStato", notNullValue())
+                .body("totaleEntrate", greaterThanOrEqualTo(0f))
+                .body("totaleUscite", greaterThanOrEqualTo(0f))
+                .body("totaleCount", greaterThanOrEqualTo(0));
+    }
+
+    @Test
+    @Order(121)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testSommarioConFiltroData() {
+        given()
+            .queryParam("from", "2025-01-01")
+            .queryParam("to", "2025-12-31")
+            .when().get("/api/movimenti/sommario")
+            .then()
+                .statusCode(200)
+                .body("perStato", notNullValue());
+    }
+
+    @Test
+    @Order(122)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testSommarioConFiltroStato() {
+        given()
+            .queryParam("stato", "REGISTRATO")
+            .when().get("/api/movimenti/sommario")
+            .then()
+                .statusCode(200)
+                .body("perStato.stato", everyItem(equalTo("REGISTRATO")));
+    }
+
+    @Test
+    @Order(123)
+    void testSommarioSenzaToken() {
+        given()
+            .when().get("/api/movimenti/sommario")
+            .then()
+                .statusCode(401);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

@@ -25,11 +25,13 @@ public interface MovimentoMapper {
     MovimentoDTO toDTO(Movimento m);
 
     /**
-     * PATCH semantics: aggiorna solo i campi non-null.
-     * importoCommissione, importoIva e stato vengono ricalcolati dal service, non qui.
-     * dataFinanziaria viene mappata automaticamente per nome.
+     * Full-overwrite semantics: l'endpoint è PUT, il client invia sempre lo stato
+     * completo del form. Un campo null nel request azzera il campo sull'entity
+     * (così l'utente può rimuovere fornitore, evento, categoria, note, ecc.).
+     * I campi strutturali e quelli derivati restano protetti via ignore:
+     * importoCommissione/IVA/imponibile e stato sono ricalcolati dal service;
+     * allegatoPath non è gestito da questo form e non va azzerato a ogni modifica.
      */
-    @BeanMapping(nullValuePropertyMappingStrategy = NullValuePropertyMappingStrategy.IGNORE)
     @Mapping(target = "id", ignore = true)
     @Mapping(target = "createdAt", ignore = true)
     @Mapping(target = "createdBy", ignore = true)
@@ -39,5 +41,6 @@ public interface MovimentoMapper {
     @Mapping(target = "importoCommissione", ignore = true)
     @Mapping(target = "stato", ignore = true)
     @Mapping(target = "fonteImportazioneId", ignore = true)
+    @Mapping(target = "allegatoPath", ignore = true)
     void updateFromRequest(@MappingTarget Movimento m, MovimentoUpdateRequest req);
 }

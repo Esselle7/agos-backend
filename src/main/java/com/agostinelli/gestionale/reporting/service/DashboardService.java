@@ -3,6 +3,7 @@ package com.agostinelli.gestionale.reporting.service;
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.reporting.cache.DashboardCacheKeyGenerator;
 import com.agostinelli.gestionale.reporting.dto.*;
+import com.agostinelli.gestionale.shared.dto.DateRangeFilter;
 import com.agostinelli.gestionale.shared.dto.MovimentoDTO;
 import io.quarkus.cache.CacheResult;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -45,7 +46,7 @@ public class DashboardService {
 
     @CacheResult(cacheName = "dashboard-kpi", keyGenerator = DashboardCacheKeyGenerator.class)
     @Transactional
-    public DashboardKpiDTO getKpi(LocalDate from, LocalDate to, String userId) {
+    public DashboardKpiDTO getKpi(LocalDate from, LocalDate to, DateRangeFilter.Period period, String userId) {
         validateRange(from, to);
 
         // Query 1: aggregati KPI diretti su movimenti (real-time, no MV)
@@ -59,7 +60,7 @@ public class DashboardService {
                 ? margine.divide(totalEntrate, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
                 : null;
 
-        // Query 2: saldi conti — diretti su conti_bancari + movimenti liquidati (no MV)
+        // Query 2: saldi conti — cumulativi su tutti i movimenti liquidati (balance all-time, no date filter)
         @SuppressWarnings("unchecked")
         List<Object[]> saldiRows = em.createNativeQuery(
                 "SELECT cb.id, " +
@@ -81,8 +82,8 @@ public class DashboardService {
             saldiMap.put(toInt(row[0]), toBD(row[1]));
         }
 
-        // variazioneMese per conti bancari (1=BPM, 2=CA) — diretti su movimenti
-        Map<Integer, BigDecimal> variazioneMap = queryVariazioneMese(to.getYear(), to.getMonthValue());
+        // Variazione liquidazioni per BPM e CA nel PERIODO SELEZIONATO (non solo il mese corrente)
+        Map<Integer, BigDecimal> variazioneMap = queryVariazionePeriodo(from, to);
 
         BigDecimal saldoBpm    = saldiMap.getOrDefault(1, BigDecimal.ZERO);
         BigDecimal saldoCa     = saldiMap.getOrDefault(2, BigDecimal.ZERO);
@@ -100,7 +101,7 @@ public class DashboardService {
                 from, to, totalEntrate, totalUscite, margine, marginePct, nMovimenti);
 
         DashboardKpiDTO.DeltaMesePrecedenteDTO delta =
-                calcolaMesePrecedente(from, to, totalEntrate, totalUscite, margine);
+                calcolaPeriodoPrecedente(from, to, period, totalEntrate, totalUscite, margine);
 
         return new DashboardKpiDTO(saldi, periodo, delta, Instant.now());
     }
@@ -285,7 +286,7 @@ public class DashboardService {
                 .getSingleResult();
     }
 
-    private Map<Integer, BigDecimal> queryVariazioneMese(int anno, int mese) {
+    private Map<Integer, BigDecimal> queryVariazionePeriodo(LocalDate from, LocalDate to) {
         @SuppressWarnings("unchecked")
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT m.conto_bancario_id, " +
@@ -293,12 +294,12 @@ public class DashboardService {
                 "FROM movimenti m " +
                 "WHERE m.stato != 'ANNULLATO' " +
                 "AND m.data_finanziaria IS NOT NULL " +
-                "AND EXTRACT(YEAR  FROM m.data_finanziaria) = :anno " +
-                "AND EXTRACT(MONTH FROM m.data_finanziaria) = :mese " +
+                "AND m.data_finanziaria >= :from " +
+                "AND m.data_finanziaria <= :to " +
                 "AND m.conto_bancario_id IN (1, 2) " +
                 "GROUP BY m.conto_bancario_id")
-                .setParameter("anno", anno)
-                .setParameter("mese", mese)
+                .setParameter("from", from)
+                .setParameter("to", to)
                 .getResultList();
 
         Map<Integer, BigDecimal> map = new HashMap<>();
@@ -308,12 +309,32 @@ public class DashboardService {
         return map;
     }
 
-    private DashboardKpiDTO.DeltaMesePrecedenteDTO calcolaMesePrecedente(
-            LocalDate from, LocalDate to,
+    private DashboardKpiDTO.DeltaMesePrecedenteDTO calcolaPeriodoPrecedente(
+            LocalDate from, LocalDate to, DateRangeFilter.Period period,
             BigDecimal entrateCorrente, BigDecimal usciteCorrente, BigDecimal margineCorrente) {
 
-        LocalDate prevFrom = from.minusMonths(1);
-        LocalDate prevTo   = to.minusMonths(1);
+        LocalDate prevFrom;
+        LocalDate prevTo;
+        switch (period) {
+            case MTD -> {
+                prevFrom = from.minusMonths(1);
+                prevTo   = to.minusMonths(1);
+            }
+            case QTD -> {
+                prevFrom = from.minusMonths(3);
+                prevTo   = to.minusMonths(3);
+            }
+            case YTD -> {
+                prevFrom = from.minusYears(1);
+                prevTo   = to.minusYears(1);
+            }
+            default -> {
+                // CUSTOM: periodo precedente della stessa durata
+                long days = ChronoUnit.DAYS.between(from, to) + 1;
+                prevFrom = from.minusDays(days);
+                prevTo   = to.minusDays(days);
+            }
+        }
 
         Object[] prev = queryKpiDirect(prevFrom, prevTo);
         BigDecimal prevEntrate = toBD(prev[0]);

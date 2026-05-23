@@ -81,11 +81,28 @@ public class MovimentiService {
                     "Solo l'autore o un ADMIN può modificare questo movimento");
         }
 
+        // Stato di liquidazione PRIMA del mapping: serve per impedire la de-liquidazione.
+        boolean eraLiquidato = m.dataFinanziaria != null;
+
         mapper.updateFromRequest(m, req);
+
+        // Un movimento già liquidato non può tornare DA_LIQUIDARE tramite update.
+        if (eraLiquidato && m.dataFinanziaria == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "DELIQUIDAZIONE_NON_CONSENTITA",
+                    "Un movimento già liquidato non può essere riportato a DA_LIQUIDARE. Usa l'annullamento.");
+        }
+
+        // fonte è NOT NULL: con la semantica full-overwrite un client che la omette
+        // la azzererebbe. Default a MANUALE come in createMovimento.
+        if (m.fonte == null) {
+            m.fonte = "MANUALE";
+        }
 
         if (req.importoLordo() != null || req.aliquotaIva() != null) {
             applyDerivedAmounts(m, req.importoLordo(), req.aliquotaIva());
         }
+
+        validateConsistency(m);
 
         // Sincronizza stato e scadenzaFinanziaria in base alla presenza di dataFinanziaria
         if (m.dataFinanziaria != null && !"ANNULLATO".equals(m.stato) && !"RICONCILIATO".equals(m.stato)) {
@@ -188,6 +205,56 @@ public class MovimentiService {
         return new BulkImportResponse(importati, duplicati, errori, dettaglioErrori);
     }
 
+    public MovimentiSommarioDTO getSommario(
+            String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
+            String stato, UUID fornitoreId, UUID eventoId,
+            LocalDate from, LocalDate to, String search) {
+
+        List<Object[]> rows = repo.sommarioByStatoTipo(tipo, buId, categoriaId, metodoPagamentoId,
+                stato, fornitoreId, eventoId, from, to, search);
+
+        Map<String, BigDecimal[]> byStato = new LinkedHashMap<>();
+        Map<String, long[]> countByStato = new LinkedHashMap<>();
+        BigDecimal totEntrate = BigDecimal.ZERO;
+        BigDecimal totUscite  = BigDecimal.ZERO;
+        long totCount = 0;
+
+        for (Object[] row : rows) {
+            String statoVal = (String) row[0];
+            String tipoVal  = (String) row[1];
+            BigDecimal sum  = row[2] != null ? (BigDecimal) row[2] : BigDecimal.ZERO;
+            long cnt        = row[3] != null ? ((Number) row[3]).longValue() : 0L;
+
+            byStato.putIfAbsent(statoVal, new BigDecimal[]{BigDecimal.ZERO, BigDecimal.ZERO});
+            countByStato.putIfAbsent(statoVal, new long[]{0L, 0L});
+
+            if ("ENTRATA".equals(tipoVal)) {
+                byStato.get(statoVal)[0] = byStato.get(statoVal)[0].add(sum);
+                countByStato.get(statoVal)[0] += cnt;
+                totEntrate = totEntrate.add(sum);
+            } else {
+                byStato.get(statoVal)[1] = byStato.get(statoVal)[1].add(sum);
+                countByStato.get(statoVal)[1] += cnt;
+                totUscite = totUscite.add(sum);
+            }
+            totCount += cnt;
+        }
+
+        List<MovimentiSommarioDTO.StatoSomma> perStato = byStato.entrySet().stream()
+                .map(e -> new MovimentiSommarioDTO.StatoSomma(
+                        e.getKey(),
+                        e.getValue()[0],
+                        e.getValue()[1],
+                        e.getValue()[0].subtract(e.getValue()[1]),
+                        countByStato.get(e.getKey())[0],
+                        countByStato.get(e.getKey())[1]
+                ))
+                .toList();
+
+        return new MovimentiSommarioDTO(perStato, totEntrate, totUscite,
+                totEntrate.subtract(totUscite), totCount);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private Movimento findActiveOrThrow(UUID id) {
@@ -235,6 +302,40 @@ public class MovimentiService {
                         "La scadenza finanziaria (dataLiquidita) è obbligatoria per movimenti non ancora liquidati");
             }
             if (req.contoBancarioId() != null || req.metodoPagamentoId() != null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "LIQUIDITA_INCONSISTENTE",
+                        "Non puoi specificare conto bancario o metodo pagamento per movimenti non ancora liquidati (dataFinanziaria assente)");
+            }
+        }
+    }
+
+    /**
+     * Validazione di consistenza sullo stato finale dell'entity (usata in update,
+     * dove le regole vanno verificate dopo il mapping full-overwrite).
+     * Specchia le regole di validateCrossFields ma opera sul Movimento già mappato.
+     */
+    private void validateConsistency(Movimento m) {
+        if (m.tipoEventoMovimento != null && m.eventoId == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "EVENTO_MANCANTE",
+                    "tipoEventoMovimento richiede la presenza di eventoId");
+        }
+
+        boolean isLiquidato = m.dataFinanziaria != null;
+
+        if (isLiquidato) {
+            if (m.contoBancarioId == null || m.metodoPagamentoId == null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "LIQUIDATO_INCOMPLETO",
+                        "Conto bancario e metodo pagamento sono obbligatori per movimenti liquidati (dataFinanziaria valorizzata)");
+            }
+            if (m.dataFinanziaria.isAfter(LocalDate.now())) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "DATA_FINANZIARIA_FUTURA",
+                        "La data di liquidazione effettiva non può essere nel futuro");
+            }
+        } else {
+            if (m.dataLiquidita == null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "SCADENZA_FINANZIARIA_MANCANTE",
+                        "La scadenza finanziaria (dataLiquidita) è obbligatoria per movimenti non ancora liquidati");
+            }
+            if (m.contoBancarioId != null || m.metodoPagamentoId != null) {
                 throw new ApiException(Response.Status.BAD_REQUEST, "LIQUIDITA_INCONSISTENTE",
                         "Non puoi specificare conto bancario o metodo pagamento per movimenti non ancora liquidati (dataFinanziaria assente)");
             }

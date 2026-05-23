@@ -41,4 +41,8 @@ public class User {
 
     @Column(name = "updated_at")
     public Instant updatedAt;
+
+    /** Collegamento opzionale al record personale — presente solo per i DIPENDENTE. */
+    @Column(name = "personale_id")
+    public UUID personaleId;
 }

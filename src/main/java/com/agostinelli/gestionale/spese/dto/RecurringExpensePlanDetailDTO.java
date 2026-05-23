@@ -23,6 +23,13 @@ public record RecurringExpensePlanDetailDTO(
     BigDecimal  totalePagato,
     BigDecimal  totaleResiduo,
     BigDecimal  totalePiano,
+    BigDecimal  totaleInteressi,
+    BigDecimal  totaleCapitale,
+    String      tipoPiano,
+    BigDecimal  tassoInteresseAnnuo,
+    BigDecimal  importoDebitoIniziale,
+    Integer     contoCogeInteressiId,
+    String      contoCogeInteressiDescrizione,
     BigDecimal  saldoContoBancario,
     List<RecurringExpenseInstallmentDTO> rate
 ) {}

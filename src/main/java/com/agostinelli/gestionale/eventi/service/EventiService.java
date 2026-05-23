@@ -1,5 +1,7 @@
 package com.agostinelli.gestionale.eventi.service;
 
+import com.agostinelli.gestionale.auth.domain.User;
+import com.agostinelli.gestionale.auth.domain.UserRepository;
 import com.agostinelli.gestionale.eventi.domain.Evento;
 import com.agostinelli.gestionale.eventi.domain.EventoPartecipante;
 import com.agostinelli.gestionale.eventi.dto.*;
@@ -10,6 +12,7 @@ import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.infrastructure.exception.ForbiddenException;
 import com.agostinelli.gestionale.movimenti.domain.Movimento;
 import com.agostinelli.gestionale.movimenti.repository.MovimentiRepository;
+import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
 import com.agostinelli.gestionale.shared.dto.PagedResponse;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -20,6 +23,8 @@ import jakarta.ws.rs.core.Response;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 
@@ -28,17 +33,27 @@ public class EventiService {
 
     private static final BigDecimal SOGLIA_SALDO = new BigDecimal("0.01");
 
+    /**
+     * Timezone di riferimento per le validazioni di date che derivano da
+     * input umano (oggi/ieri). Usare la TZ del business (Italia) evita che
+     * un server UTC respinga eventi "domani Italia" creati dopo mezzanotte
+     * UTC ma prima di mezzanotte locale.
+     */
+    private static final ZoneId ITALY = ZoneId.of("Europe/Rome");
+
     @Inject EventiRepository repo;
     @Inject EventoPartecipantiRepository partecipantiRepo;
     @Inject MovimentiRepository movimentiRepo;
     @Inject EventoMapper mapper;
     @Inject EntityManager em;
+    @Inject UserRepository userRepository;
+    @Inject MvRefreshService mvRefresh;
 
     // ── CRUD EVENTI ────────────────────────────────────────────────────────────
 
     @Transactional
     public EventoDTO createEvento(EventoCreateRequest req, UUID userId) {
-        if (req.dataEvento() != null && req.dataEvento().isBefore(LocalDate.now())) {
+        if (req.dataEvento() != null && req.dataEvento().isBefore(LocalDate.now(ITALY))) {
             throw new ApiException(Response.Status.BAD_REQUEST, "DATA_NEL_PASSATO",
                     "La data evento non può essere nel passato");
         }
@@ -225,6 +240,7 @@ public class EventiService {
             }
         }
 
+        mvRefresh.requestRefreshAfterCommit();
         return new RegistraPagamentoResult(
                 new PagamentoEventoDTO(m.id, m.tipoEventoMovimento, m.importo,
                         m.dataFinanziaria, m.note, m.stato),
@@ -233,24 +249,47 @@ public class EventiService {
 
     // ── CALENDARIO ────────────────────────────────────────────────────────────
 
-    public List<EventoCalendarioDTO> getCalendario(LocalDate from, LocalDate to) {
-        LocalDate f = from != null ? from : LocalDate.now();
+    public List<EventoCalendarioDTO> getCalendario(LocalDate from, LocalDate to, boolean isAdmin) {
+        LocalDate f = from != null ? from : LocalDate.now(ITALY);
         LocalDate t = to   != null ? to   : f.plusDays(90);
 
         return repo.findCalendario(f, t).stream().map(e -> {
-            BigDecimal residuo = calcImportoResiduo(e);
+            BigDecimal residuo = isAdmin ? calcImportoResiduo(e) : null;
             return new EventoCalendarioDTO(
                     e.id, e.nome, e.dataEvento, e.stato,
-                    e.importoTotalePreviventivato,
+                    isAdmin ? e.importoTotalePreviventivato : null,
                     residuo,
                     EventoCalendarioDTO.colorePerStato(e.stato));
         }).toList();
     }
 
+    /**
+     * Lista degli eventi a cui l'utente DIPENDENTE è assegnato come partecipante.
+     * Restituisce lista vuota se l'utente non è collegato a un record personale
+     * (campo {@code users.personale_id} null).
+     *
+     * I dati restituiti seguono la visibility policy non-ADMIN: nessun dato
+     * finanziario, ma date di journey visibili.
+     */
+    public PagedResponse<EventoDTO> getMieiEventi(UUID userId, int page, int size) {
+        User user = userRepository.findById(userId);
+        if (user == null || user.personaleId == null) {
+            return PagedResponse.of(List.of(), page, size, 0L);
+        }
+        List<EventoDTO> content = repo.findByPersonaleId(user.personaleId, page, size)
+                .stream().map(e -> buildEventoDTO(e, false)).toList();
+        long total = repo.countByPersonaleId(user.personaleId);
+        return PagedResponse.of(content, page, size, total);
+    }
+
     // ── DASHBOARD ─────────────────────────────────────────────────────────────
 
-    public DashboardDTO getDashboard(LocalDate from, LocalDate to) {
-        LocalDate f = from != null ? from : LocalDate.now().withDayOfMonth(1);
+    /**
+     * KPI dashboard. {@code isAdmin=false} nasconde i campi finanziari
+     * (totaleIncassato, totaleCosti, profittoTotale).
+     */
+    public DashboardDTO getDashboard(LocalDate from, LocalDate to, boolean isAdmin) {
+        LocalDate f = from != null ? from : LocalDate.now(ITALY).withDayOfMonth(1);
         LocalDate t = to   != null ? to   : f.plusMonths(1).minusDays(1);
 
         Long totaleEventi = em.createQuery(
@@ -258,6 +297,12 @@ public class EventiService {
                 Long.class)
                 .setParameter("from", f).setParameter("to", t)
                 .getSingleResult();
+
+        if (!isAdmin) {
+            return new DashboardDTO(
+                    totaleEventi != null ? totaleEventi : 0L,
+                    null, null, null, f, t);
+        }
 
         Object incassatoRaw = em.createQuery(
                 "SELECT SUM(e.importoIncassato) FROM Evento e " +
@@ -306,7 +351,8 @@ public class EventiService {
         partecipantiRepo.persist(p);
         em.flush();
 
-        return toPartecipanteDTOEnriched(p.id);
+        // L'endpoint che chiama questo metodo è ADMIN-only, quindi costo è sempre visibile
+        return toPartecipanteDTOEnriched(p.id, true);
     }
 
     @Transactional
@@ -317,8 +363,13 @@ public class EventiService {
         partecipantiRepo.delete(p);
     }
 
+    /**
+     * Restituisce i partecipanti di un evento applicando la visibility policy
+     * sul campo {@code costo}: ADMIN vede il valore reale, DIPENDENTE riceve
+     * {@code null} per non esporre il costo di colleghi.
+     */
     @SuppressWarnings("unchecked")
-    public List<EventoPartecipanteDTO> getPartecipantiEvento(UUID eventoId) {
+    public List<EventoPartecipanteDTO> getPartecipantiEvento(UUID eventoId, boolean isAdmin) {
         findOrThrow(eventoId);
         List<Object[]> rows = em.createNativeQuery("""
                 SELECT ep.id, CAST(ep.evento_id AS text), CAST(ep.personale_id AS text),
@@ -341,7 +392,7 @@ public class EventiService {
                 (String) r[4],
                 (String) r[5],
                 (String) r[6],
-                (BigDecimal) r[7],
+                isAdmin ? (BigDecimal) r[7] : null,
                 (String) r[8]
         )).toList();
     }
@@ -391,11 +442,30 @@ public class EventiService {
         evento.costiDirettiImputati   = (BigDecimal) r[2];
     }
 
+    /**
+     * Costruisce l'{@link EventoDTO} applicando la visibility policy del ruolo.
+     *
+     * I campi ADMIN-only (importi, percentuali, profitto, costi reali, note di
+     * annullamento, dettaglio importo/note dei pagamenti) sono nascosti per i
+     * non-ADMIN. Le date di journey ({@code dataConferma}, {@code dataSaldo})
+     * e la lista pagamenti sanitizzata sono visibili anche ai DIPENDENTE per
+     * permettere al frontend di renderizzare lo stato di avanzamento.
+     */
     private EventoDTO buildEventoDTO(Evento e, boolean isAdmin) {
-        List<PagamentoEventoDTO> pagamenti = movimentiRepo.findByEventoId(e.id).stream()
+        List<Movimento> movimenti = movimentiRepo.findByEventoId(e.id);
+
+        List<PagamentoEventoDTO> pagamenti = movimenti.stream()
                 .map(m -> new PagamentoEventoDTO(
-                        m.id, m.tipoEventoMovimento, m.importo, m.dataFinanziaria, m.note, m.stato))
+                        m.id,
+                        m.tipoEventoMovimento,
+                        isAdmin ? m.importo : null,
+                        m.dataFinanziaria,
+                        isAdmin ? m.note : null,
+                        m.stato))
                 .toList();
+
+        LocalDate dataConferma = computeDataConferma(movimenti);
+        LocalDate dataSaldo    = computeDataSaldo(movimenti);
 
         @SuppressWarnings("unchecked")
         List<String> allergie = em.createNativeQuery(
@@ -403,32 +473,72 @@ public class EventiService {
                 .setParameter("eid", e.id)
                 .getResultList();
 
-        BigDecimal residuo     = calcImportoResiduo(e);
-        BigDecimal perc        = calcPercentualeIncassata(e);
-        BigDecimal costiReali  = calcolaCostiReali(e.id);
-        BigDecimal profitto    = e.importoIncassato.subtract(costiReali);
+        BigDecimal residuo    = isAdmin ? calcImportoResiduo(e) : null;
+        BigDecimal perc       = isAdmin ? calcPercentualeIncassata(e) : null;
+        BigDecimal costiReali = isAdmin ? calcolaCostiReali(e.id) : null;
+        BigDecimal profitto   = isAdmin ? safeProfitto(e, costiReali) : null;
 
         return new EventoDTO(
                 e.id, e.nome, e.tipo, e.dataEvento, e.dataPreventivo,
-                e.importoTotalePreviventivato, e.importoIncassato, e.caparreIncassate,
-                e.costiDirettiImputati, e.stato, e.businessUnitId,
+                isAdmin ? e.importoTotalePreviventivato : null,
+                isAdmin ? e.importoIncassato : null,
+                isAdmin ? e.caparreIncassate : null,
+                isAdmin ? e.costiDirettiImputati : null,
+                e.stato, e.businessUnitId,
                 e.contattoNome, e.contattoTelefono, e.contattoEmail,
                 e.numeroTotalePartecipanti, e.numeroBambini, allergie,
                 e.note,
                 isAdmin ? e.noteAnnullamento : null,
                 residuo, perc, costiReali, profitto,
-                pagamenti, e.createdAt, e.createdBy);
+                dataConferma, dataSaldo,
+                pagamenti,
+                e.createdAt, e.createdBy);
+    }
+
+    /**
+     * Data del primo movimento non annullato di tipo CAPARRA o ACCONTO
+     * (ENTRATA), o {@code null} se nessun pagamento di conferma è stato
+     * registrato.
+     */
+    private LocalDate computeDataConferma(List<Movimento> movimenti) {
+        return movimenti.stream()
+                .filter(m -> !"ANNULLATO".equals(m.stato))
+                .filter(m -> "CAPARRA".equals(m.tipoEventoMovimento)
+                          || "ACCONTO".equals(m.tipoEventoMovimento))
+                .map(m -> m.dataFinanziaria)
+                .filter(java.util.Objects::nonNull)
+                .min(Comparator.naturalOrder())
+                .orElse(null);
+    }
+
+    /** Data del SALDO non annullato, o {@code null} se non saldato. */
+    private LocalDate computeDataSaldo(List<Movimento> movimenti) {
+        return movimenti.stream()
+                .filter(m -> !"ANNULLATO".equals(m.stato))
+                .filter(m -> "SALDO".equals(m.tipoEventoMovimento))
+                .map(m -> m.dataFinanziaria)
+                .filter(java.util.Objects::nonNull)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private BigDecimal safeProfitto(Evento e, BigDecimal costiReali) {
+        BigDecimal incassato = e.importoIncassato != null ? e.importoIncassato : BigDecimal.ZERO;
+        BigDecimal costi     = costiReali        != null ? costiReali        : BigDecimal.ZERO;
+        return incassato.subtract(costi);
     }
 
     private BigDecimal calcImportoResiduo(Evento e) {
         if (e.importoTotalePreviventivato == null) return null;
-        return e.importoTotalePreviventivato.subtract(e.importoIncassato);
+        BigDecimal incassato = e.importoIncassato != null ? e.importoIncassato : BigDecimal.ZERO;
+        return e.importoTotalePreviventivato.subtract(incassato);
     }
 
     private BigDecimal calcPercentualeIncassata(Evento e) {
         if (e.importoTotalePreviventivato == null
                 || e.importoTotalePreviventivato.compareTo(BigDecimal.ZERO) == 0) return null;
-        return e.importoIncassato
+        BigDecimal incassato = e.importoIncassato != null ? e.importoIncassato : BigDecimal.ZERO;
+        return incassato
                 .divide(e.importoTotalePreviventivato, 4, RoundingMode.HALF_UP)
                 .multiply(new BigDecimal("100"))
                 .setScale(2, RoundingMode.HALF_UP);
@@ -444,7 +554,6 @@ public class EventiService {
     }
 
     /** Sostituisce integralmente le allergie dell'evento. */
-    @SuppressWarnings("unchecked")
     private void salvaAllergie(UUID eventoId, List<String> allergie) {
         em.createNativeQuery("DELETE FROM evento_allergie WHERE evento_id = :eid")
           .setParameter("eid", eventoId)
@@ -461,9 +570,12 @@ public class EventiService {
         }
     }
 
-    /** Restituisce un DTO arricchito per un EventoPartecipante appena persistito. */
+    /**
+     * Restituisce un DTO arricchito per un EventoPartecipante appena persistito.
+     * Il flag {@code isAdmin} controlla la visibilità del campo {@code costo}.
+     */
     @SuppressWarnings("unchecked")
-    private EventoPartecipanteDTO toPartecipanteDTOEnriched(Long partecipanteId) {
+    private EventoPartecipanteDTO toPartecipanteDTOEnriched(Long partecipanteId, boolean isAdmin) {
         List<Object[]> rows = em.createNativeQuery("""
                 SELECT ep.id, CAST(ep.evento_id AS text), CAST(ep.personale_id AS text),
                        per.nome, per.cognome, man.nome as mansione,
@@ -486,7 +598,7 @@ public class EventiService {
                 (String) r[4],
                 (String) r[5],
                 (String) r[6],
-                (BigDecimal) r[7],
+                isAdmin ? (BigDecimal) r[7] : null,
                 (String) r[8]
         );
     }
@@ -504,4 +616,5 @@ public class EventiService {
                 "SELECT id FROM piano_dei_conti_coge WHERE codice LIKE '30.%' ORDER BY codice LIMIT 1")
                 .getSingleResult()).intValue();
     }
+
 }

@@ -5,6 +5,7 @@ import com.agostinelli.gestionale.movimenti.domain.Movimento;
 import com.agostinelli.gestionale.movimenti.dto.*;
 import com.agostinelli.gestionale.movimenti.mapper.MovimentoMapper;
 import com.agostinelli.gestionale.movimenti.repository.MovimentiRepository;
+import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
 import com.agostinelli.gestionale.shared.dto.PagedResponse;
 import io.quarkus.cache.CacheInvalidateAll;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -24,6 +25,7 @@ public class MovimentiService {
     @Inject MovimentiRepository repo;
     @Inject MovimentoMapper mapper;
     @Inject Validator validator;
+    @Inject MvRefreshService mvRefresh;
 
     /**
      * Crea un movimento con validazione cross-field e calcolo dei campi derivati.
@@ -55,6 +57,8 @@ public class MovimentiService {
         applyDerivedAmounts(m, req.importoLordo(), req.aliquotaIva());
 
         repo.persist(m);
+
+        mvRefresh.requestRefreshAfterCommit();
         return mapper.toDTO(m);
     }
 
@@ -91,6 +95,7 @@ public class MovimentiService {
             m.stato = "DA_LIQUIDARE";
         }
 
+        mvRefresh.requestRefreshAfterCommit();
         return mapper.toDTO(m);
     }
 
@@ -98,6 +103,7 @@ public class MovimentiService {
     public void annullaMovimento(UUID id) {
         Movimento m = findActiveOrThrow(id);
         m.stato = "ANNULLATO";
+        mvRefresh.requestRefreshAfterCommit();
     }
 
     public MovimentoDTO findById(UUID id) {
@@ -249,4 +255,5 @@ public class MovimentiService {
             m.importoImponibile = m.importo.subtract(m.importoIva);
         }
     }
+
 }

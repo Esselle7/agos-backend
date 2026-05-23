@@ -2,6 +2,7 @@ package com.agostinelli.gestionale.spese.service;
 
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.movimenti.domain.Movimento;
+import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
 import com.agostinelli.gestionale.spese.domain.RecurringExpenseInstallment;
 import com.agostinelli.gestionale.spese.domain.RecurringExpensePlan;
 import com.agostinelli.gestionale.spese.dto.CancelPlanRequest;
@@ -37,6 +38,7 @@ public class RecurringExpenseService {
     @Inject RecurringExpensePlanRepository planRepo;
     @Inject RecurringExpenseInstallmentRepository installmentRepo;
     @Inject EntityManager em;
+    @Inject MvRefreshService mvRefresh;
 
     // ── CREATE ───────────────────────────────────────────────────────────────
 
@@ -44,19 +46,33 @@ public class RecurringExpenseService {
     public RecurringExpensePlanDetailDTO createPlan(RecurringExpensePlanCreateRequest req, UUID userId) {
         validateCogeIsPassivita(req.contoCoge());
 
+        String tipoPiano = req.tipoPiano() != null ? req.tipoPiano() : "FLAT";
+        if ("FINANZIAMENTO".equals(tipoPiano)) {
+            if (req.importoDebitoIniziale() == null || req.tassoInteresseAnnuo() == null
+                    || req.contoCogeInteressiId() == null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "FINANZIAMENTO_INCOMPLETO",
+                        "Per tipo_piano=FINANZIAMENTO sono obbligatori: importo_debito_iniziale, tasso_interesse_annuo, conto_coge_interessi_id");
+            }
+            validateCogeIsOnereFinanziario(req.contoCogeInteressiId());
+        }
+
         RecurringExpensePlan plan = new RecurringExpensePlan();
-        plan.descrizione     = req.descrizione();
-        plan.businessUnitId  = 5; // sempre OVERHEAD
-        plan.contoBancarioId = req.contoBancarioId();
-        plan.contoCoge       = req.contoCoge();
-        plan.importoRata     = req.importoRata();
-        plan.variazionePct   = req.variazionePct() != null ? req.variazionePct() : BigDecimal.ZERO;
-        plan.giornoDelMese   = req.giornoDelMese();
-        plan.frequenza       = req.frequenza();
-        plan.numeroRate      = req.numeroRate();
-        plan.dataPrimaRata   = req.dataInizio().withDayOfMonth(req.giornoDelMese());
-        plan.note            = req.note();
-        plan.createdBy       = userId;
+        plan.descrizione           = req.descrizione();
+        plan.businessUnitId        = 5; // sempre OVERHEAD
+        plan.contoBancarioId       = req.contoBancarioId();
+        plan.contoCoge             = req.contoCoge();
+        plan.importoRata           = req.importoRata();
+        plan.variazionePct         = req.variazionePct() != null ? req.variazionePct() : BigDecimal.ZERO;
+        plan.giornoDelMese         = req.giornoDelMese();
+        plan.frequenza             = req.frequenza();
+        plan.numeroRate            = req.numeroRate();
+        plan.dataPrimaRata         = req.dataInizio().withDayOfMonth(req.giornoDelMese());
+        plan.note                  = req.note();
+        plan.createdBy             = userId;
+        plan.tipoPiano             = tipoPiano;
+        plan.importoDebitoIniziale = req.importoDebitoIniziale();
+        plan.tassoInteresseAnnuo   = req.tassoInteresseAnnuo();
+        plan.contoCogeInteressiId  = req.contoCogeInteressiId();
 
         planRepo.persist(plan);
         em.flush(); // ensure plan row is committed before installment FK references it
@@ -93,14 +109,21 @@ public class RecurringExpenseService {
     @Transactional
     public RecurringExpenseInstallmentDTO updateInstallment(UUID planId, UUID installmentId,
                                                             UpdateInstallmentRequest req) {
-        findPlanOrThrow(planId);
+        RecurringExpensePlan plan = findPlanOrThrow(planId);
         RecurringExpenseInstallment rata = findInstallmentOrThrow(installmentId, planId);
 
         if (!"PENDING".equals(rata.stato)) {
             throw new ApiException(Response.Status.CONFLICT, "RATA_NON_MODIFICABILE",
                     "Solo le rate PENDING possono essere modificate");
         }
-        if (req.importo() != null) rata.importo = req.importo();
+        if (req.importo() != null) {
+            rata.importo = req.importo();
+            // BUG 4 fix: importo changes make the original split stale — clear it to force FLAT branch on pay
+            if ("FINANZIAMENTO".equals(plan.tipoPiano)) {
+                rata.quotaCapitale  = null;
+                rata.quotaInteressi = null;
+            }
+        }
         if (req.dataScadenza() != null) rata.dataScadenza = req.dataScadenza();
         if (req.note() != null) rata.note = req.note();
 
@@ -121,18 +144,36 @@ public class RecurringExpenseService {
 
         checkSaldo(plan.contoBancarioId, rata.importo);
 
-        Movimento m = buildMovimento(plan, rata.importo, LocalDate.now(), userId,
-                plan.descrizione + " – Rata " + rata.numeroRata);
-        em.persist(m);
-        em.flush();
+        boolean splitFinanziamento = "FINANZIAMENTO".equals(plan.tipoPiano) && rata.quotaCapitale != null;
+        if (splitFinanziamento) {
+            LocalDate oggi = LocalDate.now();
+            Movimento mCapitale = buildMovimento(plan, rata.quotaCapitale, oggi, userId,
+                    plan.descrizione + " – Rata " + rata.numeroRata + " (cap.)");
+            em.persist(mCapitale);
 
-        rata.stato = "PAID";
-        rata.movimentoId = m.id;
+            Movimento mInteressi = buildMovimentoInteressi(plan, rata.quotaInteressi, oggi, userId,
+                    plan.descrizione + " – Rata " + rata.numeroRata + " (int.)");
+            em.persist(mInteressi);
+            em.flush();
+
+            rata.stato                = "PAID";
+            rata.movimentoId          = mCapitale.id;
+            rata.movimentoInteressiId = mInteressi.id;
+        } else {
+            Movimento m = buildMovimento(plan, rata.importo, LocalDate.now(), userId,
+                    plan.descrizione + " – Rata " + rata.numeroRata);
+            em.persist(m);
+            em.flush();
+
+            rata.stato       = "PAID";
+            rata.movimentoId = m.id;
+        }
 
         if (installmentRepo.findPendingByPiano(planId).isEmpty()) {
             plan.stato = "COMPLETATO";
         }
 
+        mvRefresh.requestRefreshAfterCommit();
         return buildDetail(plan, installmentRepo.findByPianoOrdered(planId));
     }
 
@@ -153,19 +194,35 @@ public class RecurringExpenseService {
         if ("ACCORPA".equals(req.modalita())) {
             // somma importo alla prossima rata PENDING
             installmentRepo.findNextPendingAfter(planId, rata.numeroRata)
-                    .ifPresent(next -> next.importo = next.importo.add(rata.importo));
+                    .ifPresent(next -> {
+                        next.importo = next.importo.add(rata.importo);
+                        if ("FINANZIAMENTO".equals(plan.tipoPiano)) {
+                            if (rata.quotaCapitale != null && next.quotaCapitale != null) {
+                                next.quotaCapitale  = next.quotaCapitale.add(rata.quotaCapitale);
+                                next.quotaInteressi = (next.quotaInteressi != null ? next.quotaInteressi : BigDecimal.ZERO)
+                                        .add(rata.quotaInteressi != null ? rata.quotaInteressi : BigDecimal.ZERO);
+                            } else {
+                                next.quotaCapitale  = null;
+                                next.quotaInteressi = null;
+                            }
+                        }
+                    });
         } else {
             // RIMANDA: aggiunge nuova rata in fondo con la stessa scadenza offset di una frequenza
             int maxNumero = installmentRepo.maxNumeroRata(planId);
             RecurringExpenseInstallment extra = new RecurringExpenseInstallment();
-            extra.pianoId = planId;
-            extra.numeroRata = maxNumero + 1;
-            extra.dataScadenza = nextDate(plan.dataPrimaRata
+            extra.pianoId        = planId;
+            extra.numeroRata     = maxNumero + 1;
+            extra.dataScadenza   = nextDate(plan.dataPrimaRata
                     .plusMonths((long) (maxNumero - 1) * frequenzaMesi(plan.frequenza)),
                     plan.frequenza);
-            extra.importo = rata.importo;
+            extra.importo        = rata.importo;
+            extra.quotaCapitale  = rata.quotaCapitale;
+            extra.quotaInteressi = rata.quotaInteressi;
             installmentRepo.persist(extra);
         }
+
+        mvRefresh.requestRefreshAfterCommit();
     }
 
     // ── LIQUIDATE (maxi rata) ─────────────────────────────────────────────────
@@ -180,26 +237,57 @@ public class RecurringExpenseService {
                     "Non ci sono rate PENDING da liquidare");
         }
 
-        BigDecimal totaleResiduo = pending.stream()
-                .map(r -> r.importo)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal importoMaxi = req.importoTotale() != null ? req.importoTotale() : totaleResiduo;
+        if ("FINANZIAMENTO".equals(plan.tipoPiano) && pending.get(0).quotaCapitale != null) {
+            BigDecimal totCapitale  = pending.stream()
+                    .map(r -> r.quotaCapitale != null ? r.quotaCapitale : r.importo)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+            BigDecimal totInteressi = pending.stream()
+                    .map(r -> r.quotaInteressi != null ? r.quotaInteressi : BigDecimal.ZERO)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+            BigDecimal importoMaxi = req.importoTotale() != null ? req.importoTotale() : totCapitale.add(totInteressi);
 
-        checkSaldo(plan.contoBancarioId, importoMaxi);
+            checkSaldo(plan.contoBancarioId, importoMaxi);
 
-        Movimento maxi = buildMovimento(plan, importoMaxi, LocalDate.now(), userId,
-                plan.descrizione + " – Liquidazione totale");
-        if (req.note() != null) maxi.note = req.note();
-        em.persist(maxi);
-        em.flush(); // forza generazione id
+            LocalDate oggi = LocalDate.now();
+            Movimento mCapitale = buildMovimento(plan, totCapitale, oggi, userId,
+                    plan.descrizione + " – Liquidazione totale (cap.)");
+            if (req.note() != null) mCapitale.note = req.note();
+            em.persist(mCapitale);
 
-        pending.forEach(r -> {
-            r.stato = "PAID";
-            r.movimentoId = maxi.id;
-        });
+            Movimento mInteressi = buildMovimentoInteressi(plan, totInteressi, oggi, userId,
+                    plan.descrizione + " – Liquidazione totale (int.)");
+            if (req.note() != null) mInteressi.note = req.note();
+            em.persist(mInteressi);
+            em.flush();
+
+            pending.forEach(r -> {
+                r.stato                = "PAID";
+                r.movimentoId          = mCapitale.id;
+                r.movimentoInteressiId = mInteressi.id;
+            });
+        } else {
+            BigDecimal totaleResiduo = pending.stream()
+                    .map(r -> r.importo)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+            BigDecimal importoMaxi = req.importoTotale() != null ? req.importoTotale() : totaleResiduo;
+
+            checkSaldo(plan.contoBancarioId, importoMaxi);
+
+            Movimento maxi = buildMovimento(plan, importoMaxi, LocalDate.now(), userId,
+                    plan.descrizione + " – Liquidazione totale");
+            if (req.note() != null) maxi.note = req.note();
+            em.persist(maxi);
+            em.flush();
+
+            pending.forEach(r -> {
+                r.stato       = "PAID";
+                r.movimentoId = maxi.id;
+            });
+        }
 
         plan.stato = "COMPLETATO";
 
+        mvRefresh.requestRefreshAfterCommit();
         return buildDetail(plan, installmentRepo.findByPianoOrdered(planId));
     }
 
@@ -222,6 +310,7 @@ public class RecurringExpenseService {
         plan.stato = "ANNULLATO";
         plan.importoPenale = penale;
 
+        mvRefresh.requestRefreshAfterCommit();
         return buildDetail(plan, installmentRepo.findByPianoOrdered(planId));
     }
 
@@ -236,18 +325,31 @@ public class RecurringExpenseService {
                 RecurringExpensePlan plan = planRepo.findById(rata.pianoId);
                 if (plan == null || !"ATTIVO".equals(plan.stato)) continue;
 
-                Movimento m = buildMovimento(plan, rata.importo, rata.dataScadenza, plan.createdBy,
-                        plan.descrizione + " – Rata " + rata.numeroRata);
-                em.persist(m);
-                em.flush();
-
-                rata.stato = "PAID";
-                rata.movimentoId = m.id;
+                if ("FINANZIAMENTO".equals(plan.tipoPiano) && rata.quotaCapitale != null) {
+                    Movimento mCap = buildMovimento(plan, rata.quotaCapitale, rata.dataScadenza,
+                            plan.createdBy, plan.descrizione + " – Rata " + rata.numeroRata + " (cap.)");
+                    em.persist(mCap);
+                    Movimento mInt = buildMovimentoInteressi(plan, rata.quotaInteressi, rata.dataScadenza,
+                            plan.createdBy, plan.descrizione + " – Rata " + rata.numeroRata + " (int.)");
+                    em.persist(mInt);
+                    em.flush();
+                    rata.stato                = "PAID";
+                    rata.movimentoId          = mCap.id;
+                    rata.movimentoInteressiId = mInt.id;
+                } else {
+                    Movimento m = buildMovimento(plan, rata.importo, rata.dataScadenza, plan.createdBy,
+                            plan.descrizione + " – Rata " + rata.numeroRata);
+                    em.persist(m);
+                    em.flush();
+                    rata.stato       = "PAID";
+                    rata.movimentoId = m.id;
+                }
                 processed++;
             } catch (Exception e) {
                 log.warnf("Errore generazione movimento per rata %s: %s", rata.id, e.getMessage());
             }
         }
+        if (processed > 0) mvRefresh.requestRefreshAfterCommit();
         return processed;
     }
 
@@ -264,24 +366,89 @@ public class RecurringExpenseService {
         }
     }
 
+    private void validateCogeIsOnereFinanziario(Integer cogeId) {
+        String tipo = (String) em.createNativeQuery(
+                "SELECT tipo FROM piano_dei_conti_coge WHERE id = :id")
+                .setParameter("id", cogeId)
+                .getSingleResult();
+        if (!"ONERE_FINANZIARIO".equals(tipo)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "COGE_NON_ONERE_FINANZIARIO",
+                    "Il conto COGE interessi deve appartenere al ramo ONERI FINANZIARI (tipo ONERE_FINANZIARIO)");
+        }
+    }
+
     private List<RecurringExpenseInstallment> generateInstallments(RecurringExpensePlan plan) {
         List<RecurringExpenseInstallment> list = new ArrayList<>();
         LocalDate date = plan.dataPrimaRata;
         BigDecimal importo = plan.importoRata;
 
-        for (int i = 1; i <= plan.numeroRate; i++) {
-            RecurringExpenseInstallment r = new RecurringExpenseInstallment();
-            r.pianoId = plan.id;
-            r.numeroRata = i;
-            r.dataScadenza = date;
-            r.importo = importo.setScale(2, RoundingMode.HALF_UP);
-            list.add(r);
+        if ("FINANZIAMENTO".equals(plan.tipoPiano)) {
+            int periodoMesi = frequenzaMesi(plan.frequenza);
+            BigDecimal tassoAnnuo = plan.tassoInteresseAnnuo
+                    .divide(BigDecimal.valueOf(100), 10, RoundingMode.HALF_UP);
+            BigDecimal tassoPeriodo = tassoAnnuo
+                    .multiply(BigDecimal.valueOf(periodoMesi))
+                    .divide(BigDecimal.valueOf(12), 10, RoundingMode.HALF_UP);
 
-            date = nextDate(date, plan.frequenza);
-            if (plan.variazionePct.compareTo(BigDecimal.ZERO) != 0) {
-                importo = importo.multiply(
-                        BigDecimal.ONE.add(plan.variazionePct.divide(BigDecimal.valueOf(100), 6, RoundingMode.HALF_UP))
-                ).setScale(2, RoundingMode.HALF_UP);
+            BigDecimal debitoResiduo = plan.importoDebitoIniziale;
+
+            // BUG 3 fix: importo must exceed the very first interest slice, otherwise capitale < 0
+            BigDecimal primaInteresse = debitoResiduo.multiply(tassoPeriodo).setScale(2, RoundingMode.HALF_UP);
+            if (importo.compareTo(primaInteresse) <= 0) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "RATA_INSUFFICIENTE",
+                        "L'importo rata (€" + importo + ") è ≤ agli interessi del primo periodo (€" + primaInteresse +
+                        "). Aumentare l'importo rata o ridurre debito/tasso.");
+            }
+
+            for (int i = 1; i <= plan.numeroRate; i++) {
+                BigDecimal interessi = debitoResiduo.multiply(tassoPeriodo)
+                        .setScale(2, RoundingMode.HALF_UP);
+                BigDecimal capitale  = importo.subtract(interessi)
+                        .setScale(2, RoundingMode.HALF_UP);
+
+                if (i == plan.numeroRate) {
+                    capitale  = debitoResiduo;
+                    interessi = importo.subtract(capitale).max(BigDecimal.ZERO)
+                            .setScale(2, RoundingMode.HALF_UP);
+                    // L'ultima rata chiude il debito esattamente, quindi può differire
+                    // leggermente dalla PMT (accumulo di arrotondamenti su 60 rate è
+                    // tipicamente qualche €). Aggiorniamo importo per mantenere
+                    // l'invariante rata.importo = quotaCapitale + quotaInteressi.
+                    importo = capitale.add(interessi);
+                }
+                debitoResiduo = debitoResiduo.subtract(capitale);
+
+                RecurringExpenseInstallment r = new RecurringExpenseInstallment();
+                r.pianoId        = plan.id;
+                r.numeroRata     = i;
+                r.dataScadenza   = date;
+                r.importo        = importo.setScale(2, RoundingMode.HALF_UP);
+                r.quotaCapitale  = capitale;
+                r.quotaInteressi = interessi;
+                list.add(r);
+
+                date = nextDate(date, plan.frequenza);
+                if (plan.variazionePct.compareTo(BigDecimal.ZERO) != 0) {
+                    importo = importo.multiply(BigDecimal.ONE.add(
+                            plan.variazionePct.divide(BigDecimal.valueOf(100), 6, RoundingMode.HALF_UP)))
+                            .setScale(2, RoundingMode.HALF_UP);
+                }
+            }
+        } else {
+            for (int i = 1; i <= plan.numeroRate; i++) {
+                RecurringExpenseInstallment r = new RecurringExpenseInstallment();
+                r.pianoId      = plan.id;
+                r.numeroRata   = i;
+                r.dataScadenza = date;
+                r.importo      = importo.setScale(2, RoundingMode.HALF_UP);
+                list.add(r);
+
+                date = nextDate(date, plan.frequenza);
+                if (plan.variazionePct.compareTo(BigDecimal.ZERO) != 0) {
+                    importo = importo.multiply(BigDecimal.ONE.add(
+                            plan.variazionePct.divide(BigDecimal.valueOf(100), 6, RoundingMode.HALF_UP)))
+                            .setScale(2, RoundingMode.HALF_UP);
+                }
             }
         }
         return list;
@@ -304,20 +471,41 @@ public class RecurringExpenseService {
     private Movimento buildMovimento(RecurringExpensePlan plan, BigDecimal importo,
                                      LocalDate data, UUID createdBy, String descrizione) {
         Movimento m = new Movimento();
-        m.tipo              = "USCITA";
-        m.importo           = importo;
-        m.dataMovimento     = data;
-        m.dataCompetenza    = data;
-        m.dataFinanziaria   = data;
-        m.dataLiquidita     = data;
-        m.contoBancarioId   = plan.contoBancarioId;
-        m.contoCoge         = plan.contoCoge;
-        m.businessUnitId    = plan.businessUnitId;
-        m.descrizione       = descrizione;
-        m.stato             = "REGISTRATO";
-        m.fonte             = "RICORRENTE";
-        m.createdBy         = createdBy;
-        m.createdAt         = Instant.now();
+        m.tipo               = "USCITA";
+        m.importo            = importo;
+        m.dataMovimento      = data;
+        m.dataCompetenza     = data;
+        m.dataFinanziaria    = data;
+        m.dataLiquidita      = data;
+        m.contoBancarioId    = plan.contoBancarioId;
+        m.contoCoge          = plan.contoCoge;
+        m.businessUnitId     = plan.businessUnitId;
+        m.descrizione        = descrizione;
+        m.stato              = "REGISTRATO";
+        m.fonte              = "RICORRENTE";
+        m.createdBy          = createdBy;
+        m.createdAt          = Instant.now();
+        m.importoCommissione = BigDecimal.ZERO;
+        return m;
+    }
+
+    private Movimento buildMovimentoInteressi(RecurringExpensePlan plan, BigDecimal importo,
+                                              LocalDate data, UUID createdBy, String descrizione) {
+        Movimento m = new Movimento();
+        m.tipo               = "USCITA";
+        m.importo            = importo;
+        m.dataMovimento      = data;
+        m.dataCompetenza     = data;
+        m.dataFinanziaria    = data;
+        m.dataLiquidita      = data;
+        m.contoBancarioId    = plan.contoBancarioId;
+        m.contoCoge          = plan.contoCogeInteressiId;
+        m.businessUnitId     = plan.businessUnitId;
+        m.descrizione        = descrizione;
+        m.stato              = "REGISTRATO";
+        m.fonte              = "RICORRENTE";
+        m.createdBy          = createdBy;
+        m.createdAt          = Instant.now();
         m.importoCommissione = BigDecimal.ZERO;
         return m;
     }
@@ -418,9 +606,18 @@ public class RecurringExpenseService {
                 .map(r -> r.importo).reduce(BigDecimal.ZERO, BigDecimal::add);
         BigDecimal residuo = rate.stream().filter(r -> "PENDING".equals(r.stato))
                 .map(r -> r.importo).reduce(BigDecimal.ZERO, BigDecimal::add);
-        // Le rate SKIPPED sono "perse" e non contribuiscono al totale del piano
-        BigDecimal totale  = rate.stream().filter(r -> !"SKIPPED".equals(r.stato))
+        BigDecimal totale  = rate.stream().filter(r -> !"SKIPPED".equals(r.stato) && !"CANCELLED".equals(r.stato))
                 .map(r -> r.importo).reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal totaleInteressi = rate.stream()
+                .filter(r -> !"CANCELLED".equals(r.stato) && r.quotaInteressi != null)
+                .map(r -> r.quotaInteressi).reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal totaleCapitale = rate.stream()
+                .filter(r -> !"CANCELLED".equals(r.stato) && r.quotaCapitale != null)
+                .map(r -> r.quotaCapitale).reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        String cogeInteressiDesc = plan.contoCogeInteressiId != null
+                ? lookupContoCogeDescrizione(plan.contoCogeInteressiId) : null;
 
         return new RecurringExpensePlanDetailDTO(
                 plan.id, plan.descrizione,
@@ -428,13 +625,18 @@ public class RecurringExpenseService {
                 plan.contoCoge, lookupContoCogeDescrizione(plan.contoCoge),
                 plan.importoRata, plan.variazionePct, plan.giornoDelMese,
                 plan.frequenza, plan.numeroRate, plan.dataPrimaRata, plan.stato,
-                plan.note, pagato, residuo, totale, getContoBancarioSaldo(plan.contoBancarioId),
+                plan.note, pagato, residuo, totale,
+                totaleInteressi, totaleCapitale,
+                plan.tipoPiano, plan.tassoInteresseAnnuo, plan.importoDebitoIniziale,
+                plan.contoCogeInteressiId, cogeInteressiDesc,
+                getContoBancarioSaldo(plan.contoBancarioId),
                 rate.stream().map(this::toInstallmentDTO).toList()
         );
     }
 
     private RecurringExpenseInstallmentDTO toInstallmentDTO(RecurringExpenseInstallment r) {
         return new RecurringExpenseInstallmentDTO(
-                r.id, r.numeroRata, r.dataScadenza, r.importo, r.stato, r.movimentoId, r.note);
+                r.id, r.numeroRata, r.dataScadenza, r.importo, r.stato, r.movimentoId, r.note,
+                r.quotaCapitale, r.quotaInteressi);
     }
 }

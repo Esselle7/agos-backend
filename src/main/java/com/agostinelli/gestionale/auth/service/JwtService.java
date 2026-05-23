@@ -35,7 +35,10 @@ import java.util.concurrent.ConcurrentHashMap;
 public class JwtService {
 
     private static final String ISSUER         = "https://agostinelli.gestionale";
-    private static final long   ACCESS_TTL_S   = 3600L;
+
+    /** TTL dell'access token (1h). Esposto come API pubblica perché serve al
+     *  frontend per pianificare il refresh proattivo. */
+    public static final long    ACCESS_TTL_S   = 3600L;
     private static final long   REFRESH_TTL_S  = 7L * 24 * 3600;
 
     @ConfigProperty(name = "BASE64_PRIVATE_KEY", defaultValue = "")

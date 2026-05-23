@@ -9,11 +9,15 @@ import java.util.UUID;
 /**
  * Entità centrale del modulo BU2 – Cerimonie ed Eventi.
  *
- * I campi importoIncassato, caparreIncassate e costiDirettiImputati sono
- * aggiornati AUTOMATICAMENTE dal trigger DB trg_z_aggiorna_totali_evento
- * (fn_ricalcola_evento) ogni volta che un Movimento collegato viene
- * inserito, modificato o eliminato.
- * Non aggiornare questi campi da Java per evitare race condition e doppio-scrittura.
+ * I campi {@code importoIncassato}, {@code caparreIncassate} e
+ * {@code costiDirettiImputati} sono mantenuti coerenti da
+ * {@code EventiService#ricalcolaIncassi(Evento)} dopo ogni mutazione di un
+ * movimento collegato. Il trigger DB precedente è stato rimosso in V20:
+ * non riattivarlo e non bypassare il service quando si scrivono pagamenti.
+ *
+ * I default {@code BigDecimal.ZERO} in {@link #onCreate()} garantiscono che
+ * questi campi non siano mai {@code null} dopo {@code persist()}, anche
+ * prima del primo movimento.
  */
 @Entity
 @Table(name = "eventi")

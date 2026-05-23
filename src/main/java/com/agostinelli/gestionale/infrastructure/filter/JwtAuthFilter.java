@@ -56,9 +56,11 @@ public class JwtAuthFilter implements ContainerRequestFilter {
     }
 
     private boolean isPublicPath(String path) {
-        // /auth/google/* = flusso OAuth2 pubblico
-        // /auth/refresh  = rinnovo token tramite refresh token (nessun JWT)
-        // /auth/logout e /auth/me richiedono JWT
+        // /auth/google/login           redirect a Google
+        // /auth/google/callback        callback Google → emette code opaco
+        // /auth/google/exchange        scambia code opaco con JWT (no JWT richiesto)
+        // /auth/refresh                rinnovo token tramite refresh token (no JWT)
+        // /auth/logout e /auth/me      richiedono JWT
         return path.startsWith("/auth/google/")
             || path.equals("/auth/refresh")
             || path.startsWith("/q/");

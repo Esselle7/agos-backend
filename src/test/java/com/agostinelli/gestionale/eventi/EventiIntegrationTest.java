@@ -149,13 +149,14 @@ class EventiIntegrationTest {
     @Test
     @Order(12)
     @TestSecurity(user = TEST_USER_UUID, roles = {"DIPENDENTE"})
-    void creaEvento_dipendente_201() {
+    void creaEvento_dipendente_403() {
+        // POST /api/eventi è ADMIN-only: il DIPENDENTE non può creare eventi.
         given()
             .contentType(ContentType.JSON)
             .body(buildCreateRequest("Evento da Dipendente", "500"))
             .when().post("/api/eventi")
             .then()
-                .statusCode(201);
+                .statusCode(403);
     }
 
     @Test
@@ -340,18 +341,16 @@ class EventiIntegrationTest {
     @Test
     @Order(42)
     @TestSecurity(user = TEST_USER_UUID, roles = {"DIPENDENTE"})
-    void confermazione_dipendente_senzaStato_ok() {
-        // DIPENDENTE può modificare il nome senza cambiare stato
+    void update_dipendente_403() {
+        // PUT /api/eventi/{id} è ADMIN-only: il DIPENDENTE non può modificare gli eventi.
         String id = creaEventoTest_comeAdmin("Evento per DIPENDENTE update", "500");
 
         given()
             .contentType(ContentType.JSON)
-            .body("{\"nome\":\"Nome Modificato da Dipendente\"}")
+            .body("{\"nome\":\"Tentativo modifica DIPENDENTE\"}")
             .when().put("/api/eventi/" + id)
             .then()
-                .statusCode(200)
-                .body("nome",  equalTo("Nome Modificato da Dipendente"))
-                .body("stato", equalTo("PREVENTIVATO"));
+                .statusCode(403);
     }
 
     // ── 6. Macchina a stati – ANNULLAMENTO ────────────────────────────────────
@@ -738,19 +737,21 @@ class EventiIntegrationTest {
     @Order(112)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
     void calendario_coloriStato_corretti() {
+        // Data nel futuro lontano per evitare "DATA_NEL_PASSATO" quando la suite
+        // viene eseguita dopo la data che era originariamente hardcodata.
         given()
             .contentType(ContentType.JSON)
             .body("""
                     {"nome":"Evento Calendario Colore","tipo":"AZIENDALE",
-                     "dataEvento":"2026-05-20","contattoNome":"Test",
+                     "dataEvento":"2099-05-20","contattoNome":"Test",
                      "numeroTotalePartecipanti":1}
                     """)
             .when().post("/api/eventi")
             .then().statusCode(201);
 
         given()
-            .queryParam("from", "2026-05-01")
-            .queryParam("to",   "2026-05-31")
+            .queryParam("from", "2099-05-01")
+            .queryParam("to",   "2099-05-31")
             .when().get("/api/eventi/calendario")
             .then()
                 .statusCode(200)
@@ -966,9 +967,34 @@ class EventiIntegrationTest {
                 .extract().path("id");
     }
 
-    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
-    private String creaEventoTest_comeAdmin(String nome, String importo) {
-        return creaEventoTest(nome, importo);
+    /**
+     * Inserisce un evento direttamente via EntityManager, bypassando il controllo
+     * di ruolo. Necessario per i test che eseguono assertion da contesto
+     * DIPENDENTE (ad esempio: verifica che il DIPENDENTE riceva 403 su PUT)
+     * ma hanno bisogno di un evento già esistente come fixture: la creazione
+     * via REST sarebbe respinta dal nuovo regime di permessi ADMIN-only.
+     */
+    @Transactional
+    String creaEventoTest_comeAdmin(String nome, String importo) {
+        String id = java.util.UUID.randomUUID().toString();
+        java.math.BigDecimal importoBd = importo != null ? new java.math.BigDecimal(importo) : null;
+        em.createNativeQuery("""
+                INSERT INTO eventi (
+                    id, nome, tipo, data_evento, importo_totale_preventivato,
+                    importo_incassato, caparre_incassate, costi_diretti_imputati,
+                    stato, business_unit_id, contatto_nome,
+                    numero_totale_partecipanti, created_at)
+                VALUES (
+                    CAST(:id AS uuid), :nome, 'BANCHETTO_PRIVATO', DATE '2026-12-15', :importo,
+                    0, 0, 0,
+                    'PREVENTIVATO', 2, 'Test Contatto',
+                    50, now())
+                """)
+                .setParameter("id", id)
+                .setParameter("nome", nome)
+                .setParameter("importo", importoBd)
+                .executeUpdate();
+        return id;
     }
 
     private String creaEventoConfermato(String nome, String importo) {

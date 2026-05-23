@@ -42,6 +42,15 @@ public class RecurringExpenseInstallment {
     @Column(name = "updated_at")
     public Instant updatedAt;
 
+    @Column(name = "quota_capitale", precision = 12, scale = 2)
+    public BigDecimal quotaCapitale;
+
+    @Column(name = "quota_interessi", precision = 12, scale = 2)
+    public BigDecimal quotaInteressi;
+
+    @Column(name = "movimento_interessi_id", columnDefinition = "uuid")
+    public UUID movimentoInteressiId;
+
     @PrePersist
     void onCreate() {
         if (createdAt == null) createdAt = Instant.now();

@@ -107,4 +107,17 @@ public class RecurringExpenseResource {
                 "WHERE tipo = 'PASSIVITA' AND is_active = true ORDER BY codice")
                 .getResultList();
     }
+
+    // ── Lookup: conti COGE ONERE_FINANZIARIO per il form finanziamento ─────────
+
+    @GET
+    @Path("/conti-coge-interessi")
+    @Transactional
+    @SuppressWarnings("unchecked")
+    public List<Object[]> contiCogeInteressi() {
+        return em.createNativeQuery(
+                "SELECT id, codice, descrizione FROM piano_dei_conti_coge " +
+                "WHERE tipo = 'ONERE_FINANZIARIO' AND is_active = true ORDER BY codice")
+                .getResultList();
+    }
 }

@@ -11,5 +11,7 @@ public record RecurringExpenseInstallmentDTO(
     BigDecimal  importo,
     String      stato,
     UUID        movimentoId,
-    String      note
+    String      note,
+    BigDecimal  quotaCapitale,
+    BigDecimal  quotaInteressi
 ) {}

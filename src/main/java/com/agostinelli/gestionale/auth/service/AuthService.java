@@ -133,6 +133,6 @@ public class AuthService {
     }
 
     private UserInfo toUserInfo(User user) {
-        return new UserInfo(user.id, user.email, user.nome, user.ruolo.name());
+        return new UserInfo(user.id, user.email, user.nome, user.ruolo.name(), user.personaleId);
     }
 }

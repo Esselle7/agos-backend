@@ -12,6 +12,7 @@ import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.infrastructure.exception.ForbiddenException;
 import com.agostinelli.gestionale.movimenti.domain.Movimento;
 import com.agostinelli.gestionale.movimenti.repository.MovimentiRepository;
+import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
 import com.agostinelli.gestionale.shared.dto.PagedResponse;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -46,6 +47,7 @@ public class EventiService {
     @Inject EventoMapper mapper;
     @Inject EntityManager em;
     @Inject UserRepository userRepository;
+    @Inject MvRefreshService mvRefresh;
 
     // ── CRUD EVENTI ────────────────────────────────────────────────────────────
 
@@ -238,6 +240,7 @@ public class EventiService {
             }
         }
 
+        mvRefresh.requestRefreshAfterCommit();
         return new RegistraPagamentoResult(
                 new PagamentoEventoDTO(m.id, m.tipoEventoMovimento, m.importo,
                         m.dataFinanziaria, m.note, m.stato),
@@ -613,4 +616,5 @@ public class EventiService {
                 "SELECT id FROM piano_dei_conti_coge WHERE codice LIKE '30.%' ORDER BY codice LIMIT 1")
                 .getSingleResult()).intValue();
     }
+
 }

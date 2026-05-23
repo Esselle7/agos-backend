@@ -119,8 +119,14 @@ public class ForecastingService {
     private ForecastingEconomicoDTO buildEconomico(LocalDate start, LocalDate end) {
         List<ForecastingDettaglioDTO> dettaglio = new ArrayList<>();
 
-        // 1. Movimenti con data economica futura (escludendo quelli legati a eventi)
+        // 1a. Movimenti con data economica futura (impatto P&L previsto)
         dettaglio.addAll(buildMovimentiEconomici(start, end));
+
+        // 1b. Movimenti DA_LIQUIDARE con competenza passata ma cassa futura.
+        //     Sono già nel P&L storico (YTD), ma vanno mostrati nella tabella
+        //     dettaglio perché l'utente vede solo questa lista. Le aggregazioni
+        //     P&L sotto filtrano vista="FINANZIARIA" per non doppiocontarli.
+        dettaglio.addAll(buildMovimentiDaLiquidare(start, end));
 
         // 2. Residuo atteso da eventi CONFERMATI
         dettaglio.addAll(buildEventiForecasting(start, end));
@@ -133,12 +139,15 @@ public class ForecastingService {
 
         dettaglio.sort(Comparator.comparing(ForecastingDettaglioDTO::data));
 
+        // Aggregati P&L: escludono FINANZIARIA-only (impatto solo cassa, P&L già storico)
         BigDecimal ricavi = dettaglio.stream()
+                .filter(d -> !"FINANZIARIA".equals(d.vista()))
                 .map(ForecastingDettaglioDTO::importoEntrata)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        // costiPrevisti: solo costi operativi (esclude quota capitale e interessi FINANZIAMENTO)
+        // costiPrevisti: solo costi operativi (esclude quota capitale, interessi FINANZIAMENTO e movimenti finanziari-only)
         BigDecimal costiOperativi = dettaglio.stream()
+                .filter(d -> !"FINANZIARIA".equals(d.vista()))
                 .filter(d -> !"RATA_RICORRENTE_CAPITALE".equals(d.categoria())
                           && !"RATA_RICORRENTE_INTERESSI".equals(d.categoria()))
                 .map(ForecastingDettaglioDTO::importoUscita)
@@ -206,6 +215,9 @@ public class ForecastingService {
 
     @SuppressWarnings("unchecked")
     private List<ForecastingDettaglioDTO> buildMovimentiEconomici(LocalDate start, LocalDate end) {
+        // Le ENTRATE con evento_id sono escluse perché il residuo entrate dell'evento le rappresenta.
+        // Le USCITE con evento_id (costi diretti: F&B, personale extra, ...) NON sono catturate dal residuo
+        // e devono essere mostrate per non sottostimare i costi previsti.
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT data_competenza, tipo, " +
                 "COALESCE(importo_imponibile, importo_lordo) AS importo, " +
@@ -213,7 +225,7 @@ public class ForecastingService {
                 "FROM movimenti " +
                 "WHERE stato != 'ANNULLATO' " +
                 "AND data_competenza BETWEEN :start AND :end " +
-                "AND (evento_id IS NULL) " +  // esclusi eventi: catturati da buildEventiForecasting
+                "AND NOT (evento_id IS NOT NULL AND tipo = 'ENTRATA') " +
                 "ORDER BY data_competenza ASC")
                 .setParameter("start", start)
                 .setParameter("end", end)
@@ -236,16 +248,22 @@ public class ForecastingService {
 
     @SuppressWarnings("unchecked")
     private List<ForecastingDettaglioDTO> buildMovimentiDaLiquidare(LocalDate start, LocalDate end) {
+        // Filtri:
+        //  - data_liquidita <= end (includiamo anche le scadenze in arretrato data < start:
+        //    una rata/fattura non onorata è cassa che deve ancora uscire/entrare).
+        //  - ENTRATE con evento_id ESCLUSE: il residuo entrate dell'evento viene già
+        //    catturato da buildEventiForecasting (preventivato - incassato), evita doppio conteggio.
+        //  - USCITE con evento_id INCLUSE: i costi diretti dell'evento (fornitori F&B, personale extra…)
+        //    NON sono rappresentati dal residuo evento, vanno mostrati esplicitamente.
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT data_liquidita, tipo, importo_lordo, " +
                 "COALESCE(descrizione, 'Pagamento atteso') AS desc " +
                 "FROM movimenti " +
                 "WHERE stato != 'ANNULLATO' " +
                 "AND data_finanziaria IS NULL " +
-                "AND data_liquidita BETWEEN :start AND :end " +
-                "AND (evento_id IS NULL) " +  // esclusi eventi: catturati da buildEventiForecasting
+                "AND data_liquidita <= :end " +
+                "AND NOT (evento_id IS NOT NULL AND tipo = 'ENTRATA') " +
                 "ORDER BY data_liquidita ASC")
-                .setParameter("start", start)
                 .setParameter("end", end)
                 .getResultList();
 
@@ -298,15 +316,19 @@ public class ForecastingService {
 
     @SuppressWarnings("unchecked")
     private List<ForecastingDettaglioDTO> buildRatePending(LocalDate start, LocalDate end) {
+        // data_scadenza <= end (includiamo anche le rate scadute non onorate: sono cassa
+        // ancora attesa, lo scheduler tenta di pagarle al prossimo tick utile).
+        // Filtriamo p.stato = 'ATTIVO' per evitare rate dimenticate su piani ANNULLATO/COMPLETATO
+        // (caso teorico: cancelPlan e completePlan dovrebbero già spostarle, ma è una safeguard).
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT i.data_scadenza, COALESCE(p.descrizione, 'Spesa ricorrente'), i.importo, " +
                 "p.tipo_piano, i.quota_capitale, i.quota_interessi " +
                 "FROM recurring_expense_installment i " +
                 "JOIN recurring_expense_plan p ON p.id = i.piano_id " +
                 "WHERE i.stato = 'PENDING' " +
-                "AND i.data_scadenza BETWEEN :start AND :end " +
+                "AND p.stato = 'ATTIVO' " +
+                "AND i.data_scadenza <= :end " +
                 "ORDER BY i.data_scadenza ASC")
-                .setParameter("start", start)
                 .setParameter("end", end)
                 .getResultList();
 
@@ -411,14 +433,27 @@ public class ForecastingService {
             }
         }
 
+        // Primo bucket: usato come fallback per gli item in arretrato (data < start) così che
+        // i loro flussi entrino comunque nella proiezione (sono cassa ancora attesa) e non
+        // diventino "invisibili" nella timeline pur essendo conteggiati nei totali.
+        String firstBucketKey = bucketMap.keySet().iterator().next();
+
         // Accumula flussi
         for (ForecastingDettaglioDTO item : items) {
             // Gli item ECONOMICA-only non entrano nella timeline finanziaria
             if ("ECONOMICA".equals(item.vista())) continue;
+            if (item.data() == null) continue;
 
-            String key = settimanale ? bucketKeyWeek(item.data()) : bucketKeyMonth(item.data());
+            String key;
+            if (item.data().isBefore(start)) {
+                key = firstBucketKey;
+            } else if (item.data().isAfter(end)) {
+                continue;
+            } else {
+                key = settimanale ? bucketKeyWeek(item.data()) : bucketKeyMonth(item.data());
+            }
             BigDecimal[] vals = bucketMap.get(key);
-            if (vals == null) continue; // fuori dal periodo (non dovrebbe accadere)
+            if (vals == null) continue;
             vals[0] = vals[0].add(item.importoEntrata());
             vals[1] = vals[1].add(item.importoUscita());
         }

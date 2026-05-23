@@ -2,6 +2,7 @@ package com.agostinelli.gestionale.spese.service;
 
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.movimenti.domain.Movimento;
+import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
 import com.agostinelli.gestionale.spese.domain.RecurringExpenseInstallment;
 import com.agostinelli.gestionale.spese.domain.RecurringExpensePlan;
 import com.agostinelli.gestionale.spese.dto.CancelPlanRequest;
@@ -37,6 +38,7 @@ public class RecurringExpenseService {
     @Inject RecurringExpensePlanRepository planRepo;
     @Inject RecurringExpenseInstallmentRepository installmentRepo;
     @Inject EntityManager em;
+    @Inject MvRefreshService mvRefresh;
 
     // ── CREATE ───────────────────────────────────────────────────────────────
 
@@ -142,7 +144,8 @@ public class RecurringExpenseService {
 
         checkSaldo(plan.contoBancarioId, rata.importo);
 
-        if ("FINANZIAMENTO".equals(plan.tipoPiano) && rata.quotaCapitale != null) {
+        boolean splitFinanziamento = "FINANZIAMENTO".equals(plan.tipoPiano) && rata.quotaCapitale != null;
+        if (splitFinanziamento) {
             LocalDate oggi = LocalDate.now();
             Movimento mCapitale = buildMovimento(plan, rata.quotaCapitale, oggi, userId,
                     plan.descrizione + " – Rata " + rata.numeroRata + " (cap.)");
@@ -170,6 +173,7 @@ public class RecurringExpenseService {
             plan.stato = "COMPLETATO";
         }
 
+        mvRefresh.requestRefreshAfterCommit();
         return buildDetail(plan, installmentRepo.findByPianoOrdered(planId));
     }
 
@@ -194,12 +198,10 @@ public class RecurringExpenseService {
                         next.importo = next.importo.add(rata.importo);
                         if ("FINANZIAMENTO".equals(plan.tipoPiano)) {
                             if (rata.quotaCapitale != null && next.quotaCapitale != null) {
-                                // Fonde le quote delle due rate: la prossima assorbe capitale e interessi della saltata
                                 next.quotaCapitale  = next.quotaCapitale.add(rata.quotaCapitale);
                                 next.quotaInteressi = (next.quotaInteressi != null ? next.quotaInteressi : BigDecimal.ZERO)
                                         .add(rata.quotaInteressi != null ? rata.quotaInteressi : BigDecimal.ZERO);
                             } else {
-                                // Split già perso in precedenza: forza ramo FLAT al pagamento
                                 next.quotaCapitale  = null;
                                 next.quotaInteressi = null;
                             }
@@ -215,11 +217,12 @@ public class RecurringExpenseService {
                     .plusMonths((long) (maxNumero - 1) * frequenzaMesi(plan.frequenza)),
                     plan.frequenza);
             extra.importo        = rata.importo;
-            // BUG 1 fix: propagate split so payInstallment uses the FINANZIAMENTO branch correctly
             extra.quotaCapitale  = rata.quotaCapitale;
             extra.quotaInteressi = rata.quotaInteressi;
             installmentRepo.persist(extra);
         }
+
+        mvRefresh.requestRefreshAfterCommit();
     }
 
     // ── LIQUIDATE (maxi rata) ─────────────────────────────────────────────────
@@ -284,6 +287,7 @@ public class RecurringExpenseService {
 
         plan.stato = "COMPLETATO";
 
+        mvRefresh.requestRefreshAfterCommit();
         return buildDetail(plan, installmentRepo.findByPianoOrdered(planId));
     }
 
@@ -306,6 +310,7 @@ public class RecurringExpenseService {
         plan.stato = "ANNULLATO";
         plan.importoPenale = penale;
 
+        mvRefresh.requestRefreshAfterCommit();
         return buildDetail(plan, installmentRepo.findByPianoOrdered(planId));
     }
 
@@ -344,6 +349,7 @@ public class RecurringExpenseService {
                 log.warnf("Errore generazione movimento per rata %s: %s", rata.id, e.getMessage());
             }
         }
+        if (processed > 0) mvRefresh.requestRefreshAfterCommit();
         return processed;
     }
 

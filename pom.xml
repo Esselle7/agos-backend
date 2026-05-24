@@ -22,6 +22,7 @@
         <lombok.version>1.18.32</lombok.version>
         <commons-csv.version>1.10.0</commons-csv.version>
         <poi.version>5.2.5</poi.version>
+        <aws-sdk.version>2.25.70</aws-sdk.version>
     </properties>
 
     <dependencyManagement>
@@ -134,7 +135,35 @@
             <version>${poi.version}</version>
         </dependency>
 
+        <!-- Cloudflare R2 (S3-compatible) — usa UrlConnectionHttpClient per
+             evitare conflitti Netty con Quarkus: escludiamo i client di default. -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <version>${aws-sdk.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>netty-nio-client</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache-client</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>url-connection-client</artifactId>
+            <version>${aws-sdk.version}</version>
+        </dependency>
+
         <!-- Test -->
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-junit5-mockito</artifactId>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-junit5</artifactId>

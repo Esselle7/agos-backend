@@ -11,6 +11,9 @@ generate-keys.sh
 src/main/resources/privateKey.pem
 src/main/resources/publicKey.pem
 
+# Config locale con secret (R2, ecc.) — mai in git
+src/main/resources/application-local.properties
+
 # Maven wrapper: ignora tutto tranne maven-wrapper.properties
 .mvn/**
 !.mvn/wrapper/maven-wrapper.properties

@@ -10,6 +10,7 @@ import com.agostinelli.gestionale.eventi.repository.EventiRepository;
 import com.agostinelli.gestionale.eventi.repository.EventoPartecipantiRepository;
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.infrastructure.exception.ForbiddenException;
+import com.agostinelli.gestionale.infrastructure.storage.R2StorageService;
 import com.agostinelli.gestionale.movimenti.domain.Movimento;
 import com.agostinelli.gestionale.movimenti.repository.MovimentiRepository;
 import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
@@ -20,6 +21,7 @@ import jakarta.persistence.EntityManager;
 import jakarta.transaction.Transactional;
 import jakarta.ws.rs.core.Response;
 
+import java.io.InputStream;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
@@ -48,6 +50,7 @@ public class EventiService {
     @Inject EntityManager em;
     @Inject UserRepository userRepository;
     @Inject MvRefreshService mvRefresh;
+    @Inject R2StorageService r2Storage;
 
     // ── CRUD EVENTI ────────────────────────────────────────────────────────────
 
@@ -144,6 +147,43 @@ public class EventiService {
         }
 
         repo.delete(e);
+    }
+
+    // ── MENU PDF ──────────────────────────────────────────────────────────────
+
+    /**
+     * Carica il menu PDF su R2 e salva l'URL pubblica sull'evento.
+     * Lancia 404 se l'evento non esiste, 400 (da {@link R2StorageService})
+     * se il file non è un PDF valido o supera 10 MB.
+     */
+    @Transactional
+    public String uploadMenuPdf(UUID eventoId, java.io.InputStream content, long size, String mimeType) {
+        Evento e = findOrThrow(eventoId);
+        String url = r2Storage.uploadMenuPdf(eventoId, content, size, mimeType);
+        e.menuPdfUrl = url;
+        return url;
+    }
+
+    /**
+     * Apre un InputStream sul menu PDF dell'evento letto direttamente da R2.
+     * Lancia 404 se l'evento non esiste o non ha un PDF caricato.
+     */
+    @Transactional(Transactional.TxType.REQUIRED)
+    public InputStream getMenuPdfStream(UUID eventoId) {
+        Evento e = findOrThrow(eventoId);
+        if (e.menuPdfUrl == null) {
+            throw new ApiException(Response.Status.NOT_FOUND, "MENU_PDF_NON_TROVATO",
+                    "Nessun menu PDF per questo evento");
+        }
+        return r2Storage.getMenuPdf(eventoId);
+    }
+
+    /** Rimuove il menu PDF da R2 e azzera l'URL sull'evento (404 se non esiste). */
+    @Transactional
+    public void deleteMenuPdf(UUID eventoId) {
+        Evento e = findOrThrow(eventoId);
+        r2Storage.deleteMenuPdf(eventoId);
+        e.menuPdfUrl = null;
     }
 
     // ── PAGAMENTI ─────────────────────────────────────────────────────────────
@@ -488,6 +528,7 @@ public class EventiService {
                 e.contattoNome, e.contattoTelefono, e.contattoEmail,
                 e.numeroTotalePartecipanti, e.numeroBambini, allergie,
                 e.note,
+                e.menuPdfUrl,
                 isAdmin ? e.noteAnnullamento : null,
                 residuo, perc, costiReali, profitto,
                 dataConferma, dataSaldo,

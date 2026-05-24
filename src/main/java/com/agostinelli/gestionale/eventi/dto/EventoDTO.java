@@ -43,6 +43,9 @@ public record EventoDTO(
         List<String> allergie,
         String note,
 
+        /** URL pubblica del menu PDF su R2, o {@code null}. Visibile a tutti i ruoli. */
+        String menuPdfUrl,
+
         /** ADMIN-only. */
         String noteAnnullamento,
 

@@ -2,6 +2,7 @@ package com.agostinelli.gestionale.eventi.resource;
 
 import com.agostinelli.gestionale.eventi.dto.*;
 import com.agostinelli.gestionale.eventi.service.EventiService;
+import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.shared.dto.PagedResponse;
 import jakarta.annotation.security.RolesAllowed;
 import jakarta.inject.Inject;
@@ -11,7 +12,12 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.SecurityContext;
+import org.jboss.resteasy.reactive.RestForm;
+import org.jboss.resteasy.reactive.multipart.FileUpload;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
@@ -145,6 +151,48 @@ public class EventiResource {
             rb.header("X-Suggest-Completamento", "true");
         }
         return rb.build();
+    }
+
+    // ── MENU PDF ──────────────────────────────────────────────────────────────
+
+    @POST
+    @Path("/{id}/menu-pdf")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    @RolesAllowed(ROLE_ADMIN)
+    public Response uploadMenuPdf(
+            @PathParam("id") UUID id,
+            @RestForm("file") FileUpload file) {
+
+        if (file == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "FILE_MANCANTE",
+                    "Nessun file caricato nel campo 'file'");
+        }
+        try (InputStream in = Files.newInputStream(file.uploadedFile())) {
+            String url = service.uploadMenuPdf(id, in, file.size(), file.contentType());
+            return Response.ok(Map.of("menuPdfUrl", url)).build();
+        } catch (IOException ex) {
+            throw new ApiException(Response.Status.INTERNAL_SERVER_ERROR, "UPLOAD_ERROR",
+                    "Errore durante la lettura del file caricato");
+        }
+    }
+
+    @GET
+    @Path("/{id}/menu-pdf")
+    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    @Produces("application/pdf")
+    public Response getMenuPdf(@PathParam("id") UUID id) {
+        InputStream stream = service.getMenuPdfStream(id);
+        return Response.ok(stream, "application/pdf")
+                .header("Content-Disposition", "inline; filename=\"menu.pdf\"")
+                .build();
+    }
+
+    @DELETE
+    @Path("/{id}/menu-pdf")
+    @RolesAllowed(ROLE_ADMIN)
+    public Response deleteMenuPdf(@PathParam("id") UUID id) {
+        service.deleteMenuPdf(id);
+        return Response.noContent().build();
     }
 
     // ── PDF PREVENTIVO ────────────────────────────────────────────────────────

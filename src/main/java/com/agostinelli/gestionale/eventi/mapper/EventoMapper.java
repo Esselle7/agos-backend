@@ -18,6 +18,7 @@ public interface EventoMapper {
     @Mapping(target = "costiDirettiImputati",       ignore = true)
     @Mapping(target = "noteAnnullamento",           ignore = true)
     @Mapping(target = "nOspiti",                    ignore = true)
+    @Mapping(target = "menuPdfUrl",                 ignore = true)
     // personaleIds è gestito direttamente dal service — non mappato sull'entità
     @BeanMapping(ignoreUnmappedSourceProperties = {"personaleIds"})
     Evento fromRequest(EventoCreateRequest req);
@@ -41,5 +42,6 @@ public interface EventoMapper {
     @Mapping(target = "stato",               ignore = true)
     @Mapping(target = "noteAnnullamento",    ignore = true)
     @Mapping(target = "nOspiti",             ignore = true)
+    @Mapping(target = "menuPdfUrl",          ignore = true)
     void updateFromRequest(@MappingTarget Evento e, EventoUpdateRequest req);
 }

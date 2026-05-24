@@ -95,6 +95,10 @@ public class Evento {
     @Column(name = "note", columnDefinition = "text")
     public String note;
 
+    /** URL pubblica del menu PDF su R2, o {@code null} se non caricato. */
+    @Column(name = "menu_pdf_url", length = 500)
+    public String menuPdfUrl;
+
     /**
      * Obbligatoria in business logic quando stato=ANNULLATO.
      * Il vincolo di presenza è gestito a livello applicativo (non nel DB).

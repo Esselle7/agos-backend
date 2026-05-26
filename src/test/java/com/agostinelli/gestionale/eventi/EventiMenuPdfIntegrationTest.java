@@ -38,7 +38,7 @@ class EventiMenuPdfIntegrationTest {
                         Mockito.any(UUID.class), Mockito.any(),
                         Mockito.anyLong(), Mockito.anyString()))
                 .thenReturn(FAKE_URL);
-        Mockito.when(r2Storage.getMenuPdf(Mockito.any(UUID.class)))
+        Mockito.when(r2Storage.getMenuPdf(Mockito.anyString()))
                 .thenAnswer(inv -> new ByteArrayInputStream(PDF_BYTES));
     }
 

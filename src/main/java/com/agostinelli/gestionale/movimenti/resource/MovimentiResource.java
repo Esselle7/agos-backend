@@ -1,6 +1,7 @@
 package com.agostinelli.gestionale.movimenti.resource;
 
 import com.agostinelli.gestionale.movimenti.dto.*;
+import com.agostinelli.gestionale.movimenti.importlayer.ImportLogService;
 import com.agostinelli.gestionale.movimenti.importlayer.MovimentoImportService;
 import com.agostinelli.gestionale.movimenti.service.MovimentiService;
 import com.agostinelli.gestionale.movimenti.service.ReconciliazioneService;
@@ -30,6 +31,7 @@ public class MovimentiResource {
     @Inject MovimentiService service;
     @Inject ReconciliazioneService reconciliazioneService;
     @Inject MovimentoImportService importService;
+    @Inject ImportLogService importLogService;
 
     @GET
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
@@ -147,23 +149,76 @@ public class MovimentiResource {
         return Response.ok().entity("{\"matched\":" + matched + "}").build();
     }
 
-    // ── Import (DEPRECATED – FUTURE RELEASE) ──────────────────────────────────
+    // ── Import ETL (Billy / BPM / CA) ─────────────────────────────────────────
 
-    /**
-     * @deprecated FUTURE IMPLEMENTATION – DO NOT USE IN CURRENT RELEASE.
-     * Accetta il file, registra i metadati import e risponde con un dummy response.
-     * Il parsing reale sarà implementato nella fase ETL dedicata.
-     */
     @POST
     @Path("/import/billy")
     @Consumes(MediaType.MULTIPART_FORM_DATA)
     @RolesAllowed("ADMIN")
-    @Deprecated
-    public BulkImportResponse importBilly(
+    public EtlImportResponse importBilly(
             @RestForm("file") java.io.InputStream fileStream,
             @RestForm("filename") String filename,
             @Context SecurityContext ctx) {
         UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
-        return importService.importBilly(fileStream, filename, userId);
+        return importService.importFile(fileStream, filename, "IMPORT_BILLY", userId);
+    }
+
+    @POST
+    @Path("/import/bpm")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    @RolesAllowed("ADMIN")
+    public EtlImportResponse importBpm(
+            @RestForm("file") java.io.InputStream fileStream,
+            @RestForm("filename") String filename,
+            @Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        return importService.importFile(fileStream, filename, "IMPORT_BANCA_BPM", userId);
+    }
+
+    @POST
+    @Path("/import/ca")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    @RolesAllowed("ADMIN")
+    public EtlImportResponse importCa(
+            @RestForm("file") java.io.InputStream fileStream,
+            @RestForm("filename") String filename,
+            @Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        return importService.importFile(fileStream, filename, "IMPORT_BANCA_CA", userId);
+    }
+
+    @GET
+    @Path("/import/history")
+    @RolesAllowed("ADMIN")
+    public PagedResponse<ImportLogDTO> importHistory(
+            @QueryParam("fonte") String fonte,
+            @QueryParam("page") @DefaultValue("0") int page,
+            @QueryParam("size") @DefaultValue("20") int size) {
+        int safeSize = Math.min(Math.max(size, 1), MAX_SIZE);
+        return importLogService.findHistory(fonte, page, safeSize);
+    }
+
+    @GET
+    @Path("/import/{importLogId}/ambiguita")
+    @RolesAllowed("ADMIN")
+    public PagedResponse<AmbiguitaDTO> getAmbiguita(
+            @PathParam("importLogId") UUID importLogId,
+            @QueryParam("stato") String stato,
+            @QueryParam("page") @DefaultValue("0") int page,
+            @QueryParam("size") @DefaultValue("20") int size) {
+        int safeSize = Math.min(Math.max(size, 1), MAX_SIZE);
+        return importLogService.getAmbiguita(importLogId, stato, page, safeSize);
+    }
+
+    @PUT
+    @Path("/import/ambiguita/{id}/classifica")
+    @RolesAllowed("ADMIN")
+    public Response classificaAmbiguita(
+            @PathParam("id") UUID id,
+            @Valid ClassificaAmbiguitaRequest req,
+            @Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        importLogService.classificaAmbiguita(id, req, userId);
+        return Response.noContent().build();
     }
 }

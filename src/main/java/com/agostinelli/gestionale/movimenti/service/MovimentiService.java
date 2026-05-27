@@ -116,6 +116,32 @@ public class MovimentiService {
         return mapper.toDTO(m);
     }
 
+    /**
+     * Liquidazione rapida: imposta dataFinanziaria = oggi, contoBancarioId e (opzionalmente)
+     * metodoPagamentoId, portando il movimento in stato REGISTRATO.
+     * Non esegue la validazione completa di validateConsistency (metodoPagamentoId opzionale
+     * per permettere una liquidazione veloce; il campo può essere completato tramite update).
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @Transactional
+    public MovimentoDTO liquidaMovimento(UUID id, LiquidaRequest req) {
+        Movimento m = findActiveOrThrow(id);
+        if (!"DA_LIQUIDARE".equals(m.stato)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "GIA_LIQUIDATO",
+                    "Il movimento non è in stato DA_LIQUIDARE");
+        }
+        LocalDate oggi = LocalDate.now();
+        m.dataFinanziaria   = oggi;
+        m.dataLiquidita     = oggi;
+        m.stato             = "REGISTRATO";
+        m.contoBancarioId   = req.contoBancarioId();
+        m.metodoPagamentoId = req.metodoPagamentoId(); // può essere null
+        mvRefresh.requestRefreshAfterCommit();
+        return mapper.toDTO(m);
+    }
+
     @Transactional
     public void annullaMovimento(UUID id) {
         Movimento m = findActiveOrThrow(id);

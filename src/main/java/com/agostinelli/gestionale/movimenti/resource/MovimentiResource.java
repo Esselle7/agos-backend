@@ -99,6 +99,13 @@ public class MovimentiResource {
         return service.updateMovimento(id, req, userId, isAdmin);
     }
 
+    @PATCH
+    @Path("/{id}/liquida")
+    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    public MovimentoDTO liquida(@PathParam("id") UUID id, @Valid LiquidaRequest req) {
+        return service.liquidaMovimento(id, req);
+    }
+
     @DELETE
     @Path("/{id}")
     @RolesAllowed("ADMIN")

@@ -16,6 +16,11 @@ public record CreatePersonaleRequest(
          * client già integrati.
          */
         Integer centroDiCostoId,
+        /** Stipendio mensile lordo (tipoRetribuzione = MENSILE). */
         BigDecimal costoAziendaleMensile,
+        /** MENSILE | ORARIA. Default MENSILE se null. */
+        String tipoRetribuzione,
+        /** Paga oraria lorda (tipoRetribuzione = ORARIA). */
+        BigDecimal pagaOraria,
         Boolean isActive
 ) {}

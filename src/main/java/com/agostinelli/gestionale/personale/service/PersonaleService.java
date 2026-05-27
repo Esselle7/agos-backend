@@ -114,7 +114,19 @@ public class PersonaleService {
         // Centro di costo: derivato automaticamente dalla BU
         p.centroDiCostoId = resolveCentroDiCosto(req.businessUnitId());
 
-        p.costoAziendaleMensile = req.costoAziendaleMensile();
+        String tipo = req.tipoRetribuzione() != null ? req.tipoRetribuzione() : "MENSILE";
+        if (!"MENSILE".equals(tipo) && !"ORARIA".equals(tipo)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "TIPO_RETRIBUZIONE_NON_VALIDO",
+                    "Tipo retribuzione non valido: " + tipo);
+        }
+        p.tipoRetribuzione = tipo;
+        if ("ORARIA".equals(tipo)) {
+            p.pagaOraria = req.pagaOraria();
+            p.costoAziendaleMensile = null;
+        } else {
+            p.costoAziendaleMensile = req.costoAziendaleMensile();
+            p.pagaOraria = null;
+        }
         if (req.isActive() != null) p.isActive = req.isActive();
     }
 
@@ -179,6 +191,6 @@ public class PersonaleService {
                 p.mansioneId, mansioneNome,
                 p.businessUnitId, buNome,
                 p.centroDiCostoId, cdcCodice, cdcDescrizione,
-                p.costoAziendaleMensile, p.isActive);
+                p.costoAziendaleMensile, p.tipoRetribuzione, p.pagaOraria, p.isActive);
     }
 }

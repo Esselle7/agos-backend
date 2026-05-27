@@ -1,13 +1,23 @@
 package com.agostinelli.gestionale.eventi.service;
 
+import com.agostinelli.gestionale.anagrafica.domain.AliquotaIva;
+import com.agostinelli.gestionale.anagrafica.domain.PianoContiCoge;
+import com.agostinelli.gestionale.anagrafica.repository.AliquotaIvaRepository;
+import com.agostinelli.gestionale.anagrafica.repository.PianoContiCogeRepository;
 import com.agostinelli.gestionale.auth.domain.User;
 import com.agostinelli.gestionale.auth.domain.UserRepository;
 import com.agostinelli.gestionale.eventi.domain.Evento;
+import com.agostinelli.gestionale.eventi.domain.EventoCostoDiretto;
 import com.agostinelli.gestionale.eventi.domain.EventoPartecipante;
+import com.agostinelli.gestionale.eventi.domain.EventoPreventivoTracking;
 import com.agostinelli.gestionale.eventi.dto.*;
 import com.agostinelli.gestionale.eventi.mapper.EventoMapper;
 import com.agostinelli.gestionale.eventi.repository.EventiRepository;
+import com.agostinelli.gestionale.eventi.repository.EventoCostiDirettiRepository;
 import com.agostinelli.gestionale.eventi.repository.EventoPartecipantiRepository;
+import com.agostinelli.gestionale.eventi.repository.EventoPreventivoTrackingRepository;
+import com.agostinelli.gestionale.personale.domain.Personale;
+import com.agostinelli.gestionale.personale.repository.PersonaleRepository;
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.infrastructure.exception.ForbiddenException;
 import com.agostinelli.gestionale.infrastructure.storage.R2StorageService;
@@ -45,7 +55,12 @@ public class EventiService {
 
     @Inject EventiRepository repo;
     @Inject EventoPartecipantiRepository partecipantiRepo;
+    @Inject EventoCostiDirettiRepository costiRepo;
+    @Inject EventoPreventivoTrackingRepository trackingRepo;
+    @Inject PersonaleRepository personaleRepo;
     @Inject MovimentiRepository movimentiRepo;
+    @Inject PianoContiCogeRepository pianoContiRepo;
+    @Inject AliquotaIvaRepository aliquotaRepo;
     @Inject EventoMapper mapper;
     @Inject EntityManager em;
     @Inject UserRepository userRepository;
@@ -139,12 +154,16 @@ public class EventiService {
             throw new ForbiddenException("Eliminazione consentita solo per eventi in stato PREVENTIVATO");
         }
 
-        long movCollegati = movimentiRepo.count(
+        long movAttivi = movimentiRepo.count(
                 "eventoId = ?1 AND stato != ?2", id, "ANNULLATO");
-        if (movCollegati > 0) {
+        if (movAttivi > 0) {
             throw new ForbiddenException(
-                    "Impossibile eliminare: l'evento ha " + movCollegati + " movimento/i collegato/i");
+                    "Impossibile eliminare: l'evento ha " + movAttivi + " movimento/i attivo/i collegato/i");
         }
+
+        // La FK movimenti.evento_id è RESTRICT: anche i movimenti ANNULLATO bloccano il delete.
+        // Li scolleghiamo prima di eliminare l'evento (il record del movimento resta per audit).
+        movimentiRepo.update("eventoId = null WHERE eventoId = ?1 AND stato = ?2", id, "ANNULLATO");
 
         repo.delete(e);
     }
@@ -400,7 +419,116 @@ public class EventiService {
         EventoPartecipante p = partecipantiRepo.findByIdOptional(id)
                 .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
                         "Partecipante non trovato: " + id));
+
+        // Se c'è un costo orario collegato, annulla il movimento e ricalcola i costi
+        if (p.movimentoId != null) {
+            movimentiRepo.findByIdOptional(p.movimentoId).ifPresent(m -> m.stato = "ANNULLATO");
+            em.flush();
+            repo.findByIdOptional(p.eventoId).ifPresent(e -> {
+                ricalcolaIncassi(e);
+                mvRefresh.requestRefreshAfterCommit();
+            });
+        }
+
         partecipantiRepo.delete(p);
+    }
+
+    /**
+     * Alloca ore a un partecipante con retribuzione ORARIA: calcola
+     * ore * pagaOraria, genera un movimento USCITA DA_LIQUIDARE collegato
+     * all'evento (impatta i costi diretti) e salva il riferimento sul
+     * partecipante. Se esiste già un'allocazione, il movimento precedente
+     * viene annullato (ri-allocazione).
+     */
+    @Transactional
+    public EventoPartecipanteDTO allocaOre(Long partecipanteId, BigDecimal ore, UUID userId) {
+        EventoPartecipante p = partecipantiRepo.findByIdOptional(partecipanteId)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
+                        "Partecipante non trovato: " + partecipanteId));
+        Evento e = findOrThrow(p.eventoId);
+        if ("ANNULLATO".equals(e.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "EVENTO_ANNULLATO",
+                    "Impossibile allocare ore su un evento annullato");
+        }
+        if (ore == null || ore.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "ORE_NON_VALIDE",
+                    "Le ore devono essere maggiori di zero");
+        }
+
+        Personale per = personaleRepo.findByIdOptional(p.personaleId)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
+                        "Dipendente non trovato: " + p.personaleId));
+        if (!"ORARIA".equals(per.tipoRetribuzione)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "NON_ORARIA",
+                    "Il dipendente non è retribuito a ore");
+        }
+        if (per.pagaOraria == null || per.pagaOraria.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "PAGA_ORARIA_MANCANTE",
+                    "Paga oraria non impostata per il dipendente");
+        }
+
+        BigDecimal totale = per.pagaOraria.multiply(ore).setScale(2, RoundingMode.HALF_UP);
+
+        // Ri-allocazione: annulla il movimento precedente
+        if (p.movimentoId != null) {
+            movimentiRepo.findByIdOptional(p.movimentoId).ifPresent(m -> m.stato = "ANNULLATO");
+            em.flush();
+        }
+
+        PianoContiCoge conto = pianoContiRepo.find("codice", "40.13.006").firstResult();
+        if (conto == null) {
+            throw new ApiException(Response.Status.INTERNAL_SERVER_ERROR, "CONTO_NON_TROVATO",
+                    "Conto CoGe non trovato: 40.13.006");
+        }
+
+        Movimento m = new Movimento();
+        m.tipo                = "USCITA";
+        m.importo             = totale;
+        m.importoCommissione  = BigDecimal.ZERO;
+        m.dataMovimento       = e.dataEvento;
+        m.dataFinanziaria     = null;
+        m.dataLiquidita       = null;
+        m.stato               = "DA_LIQUIDARE";
+        m.fonte               = "MANUALE";
+        m.eventoId            = e.id;
+        m.tipoEventoMovimento = null;
+        m.contoCoge           = conto.id;
+        m.businessUnitId      = e.businessUnitId != null ? e.businessUnitId : 2;
+        m.descrizione         = "[COSTO EVENTO] Personale a ore – " + per.nome + " " + per.cognome + " – " + e.nome;
+        m.createdBy           = userId;
+        movimentiRepo.persist(m);
+        em.flush();
+
+        p.ore           = ore;
+        p.costo         = totale;
+        p.movimentoId   = m.id;
+        p.movimentoData = m.dataMovimento;
+
+        ricalcolaIncassi(e);
+        mvRefresh.requestRefreshAfterCommit();
+        return toPartecipanteDTOEnriched(p.id, true);
+    }
+
+    /** Rimuove l'allocazione ore: annulla il movimento e azzera ore/costo del partecipante. */
+    @Transactional
+    public EventoPartecipanteDTO rimuoviOre(Long partecipanteId) {
+        EventoPartecipante p = partecipantiRepo.findByIdOptional(partecipanteId)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
+                        "Partecipante non trovato: " + partecipanteId));
+        Evento e = findOrThrow(p.eventoId);
+
+        if (p.movimentoId != null) {
+            movimentiRepo.findByIdOptional(p.movimentoId).ifPresent(m -> m.stato = "ANNULLATO");
+            em.flush();
+        }
+        p.ore           = null;
+        p.costo         = null;
+        p.movimentoId   = null;
+        p.movimentoData = null;
+
+        ricalcolaIncassi(e);
+        mvRefresh.requestRefreshAfterCommit();
+        return toPartecipanteDTOEnriched(p.id, true);
     }
 
     /**
@@ -414,7 +542,9 @@ public class EventiService {
         List<Object[]> rows = em.createNativeQuery("""
                 SELECT ep.id, CAST(ep.evento_id AS text), CAST(ep.personale_id AS text),
                        per.nome, per.cognome, man.nome as mansione,
-                       ep.ruolo, ep.costo, ep.note
+                       ep.ruolo, ep.costo,
+                       per.tipo_retribuzione, per.paga_oraria, ep.ore, ep.movimento_id,
+                       ep.note
                 FROM evento_partecipanti ep
                 JOIN personale per ON per.id = ep.personale_id
                 LEFT JOIN mansioni man ON man.id = per.mansione_id
@@ -433,8 +563,241 @@ public class EventiService {
                 (String) r[5],
                 (String) r[6],
                 isAdmin ? (BigDecimal) r[7] : null,
-                (String) r[8]
+                (String) r[8],
+                isAdmin ? (BigDecimal) r[9] : null,
+                isAdmin ? (BigDecimal) r[10] : null,
+                r[11] != null,
+                (String) r[12]
         )).toList();
+    }
+
+    // ── COSTI DIRETTI EVENTO ────────────────────────────────────────────────────
+
+    private static final BigDecimal IVA_ORDINARIA = new BigDecimal("22.0");
+
+    /**
+     * Registra un costo diretto sull'evento. Genera un movimento USCITA
+     * DA_LIQUIDARE (competenza = data evento, nessuna data di liquidazione)
+     * collegato all'evento, esattamente come {@link #registraPagamento} ma sul
+     * lato uscite. Aggiorna {@code costiDirettiImputati} via ricalcolaIncassi.
+     */
+    @Transactional
+    public EventoCostoDirettoDTO aggiungiCostoDiretto(UUID eventoId, EventoCostoDirettoRequest req, UUID userId) {
+        Evento e = findOrThrow(eventoId);
+        if ("ANNULLATO".equals(e.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "EVENTO_ANNULLATO",
+                    "Impossibile aggiungere costi a un evento annullato");
+        }
+
+        String etichetta = etichettaPerVoce(req.voce(), req.etichetta());
+        String codiceConto = codiceContoPerVoce(req.voce());
+
+        BigDecimal importoEffettivo = req.importo();
+        if (importoEffettivo == null || importoEffettivo.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "IMPORTO_NON_VALIDO",
+                    "L'importo del costo deve essere maggiore di zero");
+        }
+
+        PianoContiCoge conto = pianoContiRepo.find("codice", codiceConto).firstResult();
+        if (conto == null) {
+            throw new ApiException(Response.Status.INTERNAL_SERVER_ERROR, "CONTO_NON_TROVATO",
+                    "Conto CoGe non trovato: " + codiceConto);
+        }
+
+        // Movimento USCITA, DA_LIQUIDARE: competenza = data evento, nessuna liquidazione
+        Movimento m = new Movimento();
+        m.tipo                = "USCITA";
+        m.importo             = importoEffettivo;
+        m.importoCommissione  = BigDecimal.ZERO;
+        m.dataMovimento       = e.dataEvento;
+        m.dataFinanziaria     = null;
+        m.dataLiquidita       = null;
+        m.stato               = "DA_LIQUIDARE";
+        m.fonte               = "MANUALE";
+        m.eventoId            = e.id;
+        m.tipoEventoMovimento = null;
+        m.contoCoge           = conto.id;
+        m.businessUnitId      = e.businessUnitId != null ? e.businessUnitId : 2;
+        m.descrizione         = "[COSTO EVENTO] " + etichetta + " – " + e.nome;
+        m.note                = req.note();
+        m.createdBy           = userId;
+        AliquotaIva iva = aliquotaRepo.find("aliquota", IVA_ORDINARIA).firstResult();
+        if (iva != null) {
+            m.aliquotaIvaId = iva.id;
+        }
+        movimentiRepo.persist(m);
+        em.flush();
+
+        EventoCostoDiretto costo = new EventoCostoDiretto();
+        costo.eventoId        = e.id;
+        costo.tipoCosto       = req.tipoCosto();
+        costo.voce            = req.voce();
+        costo.etichetta       = etichetta;
+        costo.importo         = importoEffettivo;
+        costo.movimentoId     = m.id;
+        costo.movimentoData   = m.dataMovimento;
+        costo.contoCogeId     = conto.id;
+        costo.note            = req.note();
+        costo.createdBy       = userId;
+        costiRepo.persist(costo);
+        em.flush();
+
+        ricalcolaIncassi(e);
+        mvRefresh.requestRefreshAfterCommit();
+        return toCostoDTO(costo, conto.codice);
+    }
+
+    /**
+     * Rimuove un costo diretto: annulla il movimento collegato (stato=ANNULLATO,
+     * preservando l'audit trail) ed elimina il record del costo, poi ricalcola
+     * i costi imputati dell'evento.
+     */
+    @Transactional
+    public void rimuoviCostoDiretto(Long costoId, UUID userId) {
+        EventoCostoDiretto costo = costiRepo.findByIdOptional(costoId)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
+                        "Costo diretto non trovato: " + costoId));
+        Evento e = findOrThrow(costo.eventoId);
+        if ("ANNULLATO".equals(e.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "EVENTO_ANNULLATO",
+                    "Impossibile rimuovere costi da un evento annullato");
+        }
+
+        if (costo.movimentoId != null) {
+            movimentiRepo.findByIdOptional(costo.movimentoId)
+                    .ifPresent(m -> m.stato = "ANNULLATO");
+            em.flush();
+        }
+
+        costiRepo.delete(costo);
+        em.flush();
+
+        ricalcolaIncassi(e);
+        mvRefresh.requestRefreshAfterCommit();
+    }
+
+    /** Lista dei costi diretti di un evento con i campi derivati del catering. */
+    public List<EventoCostoDirettoDTO> getCostiDiretti(UUID eventoId) {
+        findOrThrow(eventoId);
+        return costiRepo.findByEventoId(eventoId).stream()
+                .map(c -> {
+                    String codice = c.contoCogeId != null
+                            ? pianoContiRepo.findById(c.contoCogeId).codice
+                            : null;
+                    return toCostoDTO(c, codice);
+                })
+                .toList();
+    }
+
+    private String etichettaPerVoce(String voce, String etichettaCustom) {
+        return switch (voce) {
+            case "DJ"    -> "DJ e Intrattenimento";
+            case "TORTA" -> "Torta";
+            case "CUSTOM" -> {
+                if (etichettaCustom == null || etichettaCustom.isBlank()) {
+                    throw new ApiException(Response.Status.BAD_REQUEST, "ETICHETTA_MANCANTE",
+                            "L'etichetta è obbligatoria per un costo personalizzato");
+                }
+                yield etichettaCustom.trim();
+            }
+            default -> throw new ApiException(Response.Status.BAD_REQUEST, "VOCE_NON_VALIDA",
+                    "Voce di costo non valida: " + voce);
+        };
+    }
+
+    private String codiceContoPerVoce(String voce) {
+        return switch (voce) {
+            case "DJ"     -> "40.13.002";
+            case "TORTA"  -> "40.13.004";
+            case "CUSTOM" -> "40.13.005";
+            default -> throw new ApiException(Response.Status.BAD_REQUEST, "VOCE_NON_VALIDA",
+                    "Voce di costo non valida: " + voce);
+        };
+    }
+
+    private EventoCostoDirettoDTO toCostoDTO(EventoCostoDiretto c, String contoCodice) {
+        return new EventoCostoDirettoDTO(
+                c.id, c.tipoCosto, c.voce, c.etichetta, c.importo,
+                c.movimentoId, c.movimentoData, contoCodice, c.note, c.createdAt);
+    }
+
+    // ── MONITORING PREVENTIVATO (no contabilità) ────────────────────────────────
+
+    /** Lista delle voci di tracciamento (AFFITTO/CATERING) del preventivato. */
+    public List<EventoPreventivoTrackingDTO> getPreventivoTracking(UUID eventoId) {
+        findOrThrow(eventoId);
+        return trackingRepo.findByEventoId(eventoId).stream().map(this::toTrackingDTO).toList();
+    }
+
+    /**
+     * Upsert di una voce di tracciamento (una sola AFFITTO e una CATERING per evento).
+     * NON genera movimenti e NON tocca i KPI contabili dell'evento.
+     */
+    @Transactional
+    public EventoPreventivoTrackingDTO salvaPreventivoTracking(UUID eventoId, EventoPreventivoTrackingRequest req, UUID userId) {
+        Evento e = findOrThrow(eventoId);
+        if (!"AFFITTO".equals(req.tipo()) && !"CATERING".equals(req.tipo())) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "TIPO_NON_VALIDO",
+                    "Tipo tracciamento non valido: " + req.tipo());
+        }
+
+        EventoPreventivoTracking t = trackingRepo.findByEventoIdAndTipo(eventoId, req.tipo()).orElse(null);
+        boolean nuovo = t == null;
+        if (nuovo) {
+            t = new EventoPreventivoTracking();
+            t.eventoId  = e.id;
+            t.tipo      = req.tipo();
+            t.createdBy = userId;
+        }
+
+        if ("AFFITTO".equals(req.tipo())) {
+            t.importoIncasso    = req.importoIncasso();
+            t.costoPerPersona   = null;
+            t.prezzoPerPersona  = null;
+            t.numPersone        = null;
+        } else {
+            t.importoIncasso    = null;
+            t.costoPerPersona   = req.costoPerPersona();
+            t.prezzoPerPersona  = req.prezzoPerPersona();
+            t.numPersone        = req.numPersone() != null ? req.numPersone() : e.numeroTotalePartecipanti;
+        }
+        t.note = req.note();
+
+        if (nuovo) {
+            trackingRepo.persist(t);
+        }
+        em.flush();
+        return toTrackingDTO(t);
+    }
+
+    @Transactional
+    public void rimuoviPreventivoTracking(Long trackingId) {
+        EventoPreventivoTracking t = trackingRepo.findByIdOptional(trackingId)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
+                        "Voce di tracciamento non trovata: " + trackingId));
+        trackingRepo.delete(t);
+    }
+
+    private EventoPreventivoTrackingDTO toTrackingDTO(EventoPreventivoTracking t) {
+        BigDecimal costoTotale = null, ricavo = null, margine = null, marginePerc = null;
+        if ("CATERING".equals(t.tipo) && t.numPersone != null) {
+            BigDecimal n = BigDecimal.valueOf(t.numPersone);
+            if (t.costoPerPersona != null)  costoTotale = t.costoPerPersona.multiply(n);
+            if (t.prezzoPerPersona != null) ricavo      = t.prezzoPerPersona.multiply(n);
+            if (costoTotale != null && ricavo != null) {
+                margine = ricavo.subtract(costoTotale);
+                if (ricavo.compareTo(BigDecimal.ZERO) > 0) {
+                    marginePerc = margine
+                            .divide(ricavo, 4, RoundingMode.HALF_UP)
+                            .multiply(new BigDecimal("100"))
+                            .setScale(2, RoundingMode.HALF_UP);
+                }
+            }
+        }
+        return new EventoPreventivoTrackingDTO(
+                t.id, t.tipo, t.importoIncasso,
+                t.costoPerPersona, t.prezzoPerPersona, t.numPersone,
+                costoTotale, ricavo, margine, marginePerc, t.note);
     }
 
     // ── HELPERS PRIVATI ───────────────────────────────────────────────────────
@@ -620,7 +983,9 @@ public class EventiService {
         List<Object[]> rows = em.createNativeQuery("""
                 SELECT ep.id, CAST(ep.evento_id AS text), CAST(ep.personale_id AS text),
                        per.nome, per.cognome, man.nome as mansione,
-                       ep.ruolo, ep.costo, ep.note
+                       ep.ruolo, ep.costo,
+                       per.tipo_retribuzione, per.paga_oraria, ep.ore, ep.movimento_id,
+                       ep.note
                 FROM evento_partecipanti ep
                 JOIN personale per ON per.id = ep.personale_id
                 LEFT JOIN mansioni man ON man.id = per.mansione_id
@@ -640,7 +1005,11 @@ public class EventiService {
                 (String) r[5],
                 (String) r[6],
                 isAdmin ? (BigDecimal) r[7] : null,
-                (String) r[8]
+                (String) r[8],
+                isAdmin ? (BigDecimal) r[9] : null,
+                isAdmin ? (BigDecimal) r[10] : null,
+                r[11] != null,
+                (String) r[12]
         );
     }
 

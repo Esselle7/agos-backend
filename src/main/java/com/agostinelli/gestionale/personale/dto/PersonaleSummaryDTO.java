@@ -12,5 +12,7 @@ public record PersonaleSummaryDTO(
         Short businessUnitId,
         String businessUnitNome,
         BigDecimal costoAziendaleMensile,
+        String tipoRetribuzione,
+        BigDecimal pagaOraria,
         boolean isActive
 ) {}

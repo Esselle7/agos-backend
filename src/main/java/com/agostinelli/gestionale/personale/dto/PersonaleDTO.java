@@ -15,5 +15,7 @@ public record PersonaleDTO(
         String centroDiCostoCodice,
         String centroDiCostoDescrizione,
         BigDecimal costoAziendaleMensile,
+        String tipoRetribuzione,
+        BigDecimal pagaOraria,
         boolean isActive
 ) {}

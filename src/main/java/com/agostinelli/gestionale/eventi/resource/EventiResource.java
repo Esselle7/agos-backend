@@ -153,6 +153,73 @@ public class EventiResource {
         return rb.build();
     }
 
+    // ── COSTI DIRETTI ─────────────────────────────────────────────────────────
+
+    @GET
+    @Path("/{id}/costi-diretti")
+    @RolesAllowed(ROLE_ADMIN)
+    public List<EventoCostoDirettoDTO> getCostiDiretti(@PathParam("id") UUID id) {
+        return service.getCostiDiretti(id);
+    }
+
+    @POST
+    @Path("/{id}/costi-diretti")
+    @RolesAllowed(ROLE_ADMIN)
+    public Response aggiungiCostoDiretto(
+            @PathParam("id") UUID id,
+            @Valid EventoCostoDirettoRequest req,
+            @Context SecurityContext ctx) {
+
+        UUID userId = currentUserId(ctx);
+        EventoCostoDirettoDTO dto = service.aggiungiCostoDiretto(id, req, userId);
+        return Response.status(Response.Status.CREATED).entity(dto).build();
+    }
+
+    @DELETE
+    @Path("/{id}/costi-diretti/{costoId}")
+    @RolesAllowed(ROLE_ADMIN)
+    public Response rimuoviCostoDiretto(
+            @PathParam("id") UUID id,
+            @PathParam("costoId") Long costoId,
+            @Context SecurityContext ctx) {
+
+        UUID userId = currentUserId(ctx);
+        service.rimuoviCostoDiretto(costoId, userId);
+        return Response.noContent().build();
+    }
+
+    // ── MONITORING PREVENTIVATO ─────────────────────────────────────────────────
+
+    @GET
+    @Path("/{id}/preventivo-tracking")
+    @RolesAllowed(ROLE_ADMIN)
+    public List<EventoPreventivoTrackingDTO> getPreventivoTracking(@PathParam("id") UUID id) {
+        return service.getPreventivoTracking(id);
+    }
+
+    @POST
+    @Path("/{id}/preventivo-tracking")
+    @RolesAllowed(ROLE_ADMIN)
+    public Response salvaPreventivoTracking(
+            @PathParam("id") UUID id,
+            @Valid EventoPreventivoTrackingRequest req,
+            @Context SecurityContext ctx) {
+
+        UUID userId = currentUserId(ctx);
+        EventoPreventivoTrackingDTO dto = service.salvaPreventivoTracking(id, req, userId);
+        return Response.ok(dto).build();
+    }
+
+    @DELETE
+    @Path("/{id}/preventivo-tracking/{trackingId}")
+    @RolesAllowed(ROLE_ADMIN)
+    public Response rimuoviPreventivoTracking(
+            @PathParam("id") UUID id,
+            @PathParam("trackingId") Long trackingId) {
+        service.rimuoviPreventivoTracking(trackingId);
+        return Response.noContent().build();
+    }
+
     // ── MENU PDF ──────────────────────────────────────────────────────────────
 
     @POST
@@ -248,6 +315,25 @@ public class EventiResource {
     public Response rimuoviPartecipante(@PathParam("id") Long id) {
         service.rimuoviPartecipante(id);
         return Response.noContent().build();
+    }
+
+    /** Alloca/aggiorna le ore di un partecipante ORARIA → genera il movimento di costo. */
+    @POST
+    @Path("/partecipanti/{partecipanteId}/ore")
+    @RolesAllowed(ROLE_ADMIN)
+    public EventoPartecipanteDTO allocaOre(
+            @PathParam("partecipanteId") Long partecipanteId,
+            @Valid AllocaOreRequest req,
+            @Context SecurityContext ctx) {
+        return service.allocaOre(partecipanteId, req.ore(), currentUserId(ctx));
+    }
+
+    /** Rimuove l'allocazione ore → annulla il movimento di costo. */
+    @DELETE
+    @Path("/partecipanti/{partecipanteId}/ore")
+    @RolesAllowed(ROLE_ADMIN)
+    public EventoPartecipanteDTO rimuoviOre(@PathParam("partecipanteId") Long partecipanteId) {
+        return service.rimuoviOre(partecipanteId);
     }
 
     // ── helpers privati ───────────────────────────────────────────────────────

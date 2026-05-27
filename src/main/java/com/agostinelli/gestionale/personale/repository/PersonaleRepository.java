@@ -23,7 +23,7 @@ public class PersonaleRepository implements PanacheRepositoryBase<Personale, UUI
                 SELECT CAST(p.id AS text), p.nome, p.cognome,
                        CAST(p.mansione_id AS text), m.nome as mansione_nome,
                        p.business_unit_id, b.nome as bu_nome,
-                       p.costo_aziendale_mensile, p.is_active
+                       p.costo_aziendale_mensile, p.tipo_retribuzione, p.paga_oraria, p.is_active
                 FROM personale p
                 LEFT JOIN business_units b ON b.id = p.business_unit_id
                 LEFT JOIN mansioni m ON m.id = p.mansione_id
@@ -60,7 +60,9 @@ public class PersonaleRepository implements PanacheRepositoryBase<Personale, UUI
                 r[5] != null ? ((Number) r[5]).shortValue() : null,
                 (String) r[6],
                 (BigDecimal) r[7],
-                (Boolean) r[8]
+                (String) r[8],
+                (BigDecimal) r[9],
+                (Boolean) r[10]
         )).toList();
     }
 

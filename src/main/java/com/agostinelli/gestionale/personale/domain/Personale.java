@@ -32,6 +32,15 @@ public class Personale {
     @Column(name = "costo_aziendale_mensile", precision = 10, scale = 2)
     public BigDecimal costoAziendaleMensile;
 
+    /** MENSILE = stipendio mensile lordo (non impatta i costi diretti evento);
+     *  ORARIA  = pagato a ore (genera costo diretto quando allocato a un evento). */
+    @Column(name = "tipo_retribuzione", nullable = false, length = 20)
+    public String tipoRetribuzione = "MENSILE";
+
+    /** Paga oraria lorda (€/ora). Valorizzata quando tipoRetribuzione = ORARIA. */
+    @Column(name = "paga_oraria", precision = 10, scale = 2)
+    public BigDecimal pagaOraria;
+
     @Column(name = "is_active", nullable = false)
     public boolean isActive = true;
 }

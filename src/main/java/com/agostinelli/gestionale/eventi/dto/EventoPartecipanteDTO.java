@@ -30,5 +30,17 @@ public record EventoPartecipanteDTO(
         /** ADMIN-only. Costo previsto per la partecipazione a questo evento. */
         BigDecimal costo,
 
+        /** Tipo retribuzione del dipendente: MENSILE | ORARIA. */
+        String tipoRetribuzione,
+
+        /** ADMIN-only. Paga oraria lorda (solo ORARIA). */
+        BigDecimal pagaOraria,
+
+        /** ADMIN-only. Ore allocate per questo evento (solo ORARIA). */
+        BigDecimal ore,
+
+        /** True se esiste un movimento di costo attivo collegato a questa allocazione. */
+        boolean hasMovimento,
+
         String note
 ) {}

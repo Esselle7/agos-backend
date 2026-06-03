@@ -13,5 +13,7 @@ public record EtlImportResponse(
         int importati,
         int duplicati,
         int ambigui,
+        int scartati,
+        int parcheggiati,
         List<EtlRowError> errori
 ) {}

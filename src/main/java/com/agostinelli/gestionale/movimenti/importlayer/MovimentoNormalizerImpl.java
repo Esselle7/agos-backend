@@ -71,6 +71,8 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
                 canonicalAmount(c.get("ALTRO")),
                 canonicalAmount(c.get("CARNE_10")),
                 canonicalAmount(c.get("ORTOFRUTTA_4")),
+                DescNormalizer.compact(descrizione), chiave,
+                DescNormalizer.extract(descrizione, Sorgente.BILLY),
                 row);
     }
 
@@ -124,7 +126,7 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
         LocalDate dataCompetenza = extractStripeDate(descrizione);
 
         String chiave = trimToEmpty(c.get("CHIAVE"));
-        String rif = chiave + "-" + safeSub(descrizione, 20);
+        String rif = rifBanca(chiave, importo, descrizione);
 
         return new RawMovimento(
                 row.riga(), "IMPORT_BANCA",
@@ -132,6 +134,8 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
                 (short) 1, metodo, BigDecimal.ZERO, null,
                 rif, girosalto,
                 null, null, null, null,
+                DescNormalizer.compact(descrizione), chiave,
+                DescNormalizer.extract(descrizione, Sorgente.BPM),
                 row);
     }
 
@@ -157,15 +161,28 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
 
         String metodo = metodoCa(causale);
 
+        // Giroconto interno CA→BPM lato USCITA (simmetrico al lato BPM in entrata):
+        // disposizione di pagamento il cui BENEFICIARIO è la stessa società (…AGOSTINELLI SRL).
+        // Il prefisso ordinante è sempre "AGRICOLA AGO<cifre>", mai "AGRICOLA AGOSTINELLI"
+        // contiguo: così un pagamento a "PIETRO AGOSTINELLI" (persona) NON viene scartato.
+        String girosalto = null;
+        if ("USCITA".equals(tipo) && "DISPOSIZIONE DI PAGAMENTO".equals(causale)
+                && descrizione != null
+                && stripApostrophe(descrizione).contains("AGRICOLA AGOSTINELLI")) {
+            girosalto = GIROCONTO_SKIP;
+        }
+
         String chiave = trimToEmpty(c.get("CHIAVE"));
-        String rif = chiave + "-" + safeSub(descrizione, 30);
+        String rif = rifBanca(chiave, importo, descrizione);
 
         return new RawMovimento(
                 row.riga(), "IMPORT_BANCA",
                 data, null, importo, tipo, descrizione,
                 (short) 2, metodo, BigDecimal.ZERO, null,
-                rif, null,
+                rif, girosalto,
                 null, null, null, null,
+                DescNormalizer.compact(descrizione), chiave,
+                DescNormalizer.extract(descrizione, Sorgente.CA),
                 row);
     }
 
@@ -268,5 +285,18 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
     private String safeSub(String s, int n) {
         if (s == null) return "";
         return s.length() > n ? s.substring(0, n) : s;
+    }
+
+    /**
+     * Riferimento esterno per la dedup delle righe banca.
+     * Il vecchio formato {@code chiave + descr[:30]} (CA) / {@code descr[:20]} (BPM)
+     * collassava righe diverse con stessa chiave/giorno (es. più "COMMISSIONI …"
+     * con primi 30 char identici). Si usa {@code chiave|importo|hash(descr)}:
+     * discriminante e deterministico tra reimport dello stesso file.
+     */
+    private String rifBanca(String chiave, BigDecimal importo, String descrizione) {
+        String imp = importo == null ? "" : importo.toPlainString();
+        String d = descrizione == null ? "" : descrizione;
+        return chiave + "|" + imp + "|" + Integer.toHexString(d.hashCode());
     }
 }

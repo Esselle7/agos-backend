@@ -35,5 +35,10 @@ public record RawMovimento(
         BigDecimal billyCarne10,      // null per BPM/CA
         BigDecimal billyOrtofrutta4,  // null per BPM/CA
 
+        // Normalizzazione testo + entità (ETL_CLASSIFICAZIONE_v2 §3)
+        String descCompact,           // descrizione senza spazi (keyword spezzate dal word-wrap)
+        String chiaveAggancio,        // colonna CHIAVE grezza (numeroMovBanca/importo): dedup cross-sorgente
+        EntitaEstratte entita,        // IBAN / ordinante / beneficiario / codice Stripe (best-effort)
+
         RawRow rawOriginale           // conservare per errori_dettaglio / raw_data ambiguità
 ) {}

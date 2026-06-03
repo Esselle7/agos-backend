@@ -5,29 +5,48 @@ import com.agostinelli.gestionale.movimenti.dto.MovimentoCreateRequest;
 /**
  * Risultato del mapping da RawMovimento a MovimentoCreateRequest.
  * outcome:
- *   SUCCESS        -> request valorizzato, pronto per la persistenza
- *   AMBIGUOUS      -> riga non classificabile, va in import_ambiguita
- *   GIROCONTO_SKIP -> trasferimento interno, tracciato come ambiguità ma non è un errore
- *   ERROR          -> errore di mapping non recuperabile
+ *   SUCCESS          -> request valorizzato, pronto per la persistenza
+ *   AMBIGUOUS        -> riga non classificabile, va in import_ambiguita
+ *   SKIP_POS         -> incasso POS/Satispay duplicato di Billy → import_scartati
+ *   SKIP_GIROCONTO   -> trasferimento interno tra conti propri → import_scartati
+ *   SKIP_RICORRENTE  -> spesa ricorrente/finanziamento (modulo dedicato) → import_scartati (traccia leggera)
+ *   PARK_EVENTO      -> voce evento separata → eventi_da_riconciliare (non è un movimento, per ora)
+ *   ERROR            -> errore di mapping non recuperabile
+ *
+ * Gli esiti SKIP_* sostituiscono il vecchio GIROCONTO_SKIP (Gate A, ETL v2 §4):
+ * non sono ambiguità né errori, sono esclusioni deterministiche tracciate.
  */
 public record MappingResult(
         MappingOutcome outcome,
         MovimentoCreateRequest request,  // valorizzato solo se SUCCESS
-        String motivoAmbiguita,          // valorizzato se AMBIGUOUS / GIROCONTO_SKIP / ERROR
+        String motivoAmbiguita,          // valorizzato se AMBIGUOUS / SKIP_* / ERROR
+        ParkEvento park,                 // valorizzato solo se PARK_EVENTO
         RawMovimento rawNormalizzato     // sempre: per logging
 ) {
 
-    public enum MappingOutcome { SUCCESS, AMBIGUOUS, GIROCONTO_SKIP, ERROR }
+    public enum MappingOutcome {
+        SUCCESS, AMBIGUOUS, ERROR,
+        SKIP_POS, SKIP_GIROCONTO, SKIP_RICORRENTE,
+        PARK_EVENTO;
+
+        public boolean isSkip() {
+            return this == SKIP_POS || this == SKIP_GIROCONTO || this == SKIP_RICORRENTE;
+        }
+    }
 
     public static MappingResult success(MovimentoCreateRequest request, RawMovimento raw) {
-        return new MappingResult(MappingOutcome.SUCCESS, request, null, raw);
+        return new MappingResult(MappingOutcome.SUCCESS, request, null, null, raw);
     }
 
     public static MappingResult ambiguous(String motivo, RawMovimento raw) {
-        return new MappingResult(MappingOutcome.AMBIGUOUS, null, motivo, raw);
+        return new MappingResult(MappingOutcome.AMBIGUOUS, null, motivo, null, raw);
     }
 
-    public static MappingResult giroconto(RawMovimento raw) {
-        return new MappingResult(MappingOutcome.GIROCONTO_SKIP, null, "GIROCONTO_SKIP", raw);
+    public static MappingResult skip(MappingOutcome outcome, RawMovimento raw) {
+        return new MappingResult(outcome, null, outcome.name(), null, raw);
+    }
+
+    public static MappingResult parkEvento(ParkEvento park, RawMovimento raw) {
+        return new MappingResult(MappingOutcome.PARK_EVENTO, null, "PARK_EVENTO", park, raw);
     }
 }

@@ -199,7 +199,37 @@ public class ImportLogService {
                     .executeUpdate();
         }
 
+        // Auto-apprendimento rubrica (§7.3): se la riga ha un IBAN, la classificazione manuale
+        // crea/aggiorna la controparte così il prossimo import la riconosce per IBAN (match forte).
+        apprendiControparte(norm, req);
+
         mvRefresh.requestRefreshAfterCommit();
+    }
+
+    /** Upsert della controparte dall'IBAN estratto + COGE/BU/fornitore assegnati a mano (§7.3). */
+    private void apprendiControparte(RawMovimento norm, ClassificaAmbiguitaRequest req) {
+        var ent = norm.entita();
+        String iban = ent != null ? ent.ibanControparte() : null;
+        if (iban == null || iban.isBlank()) return;
+
+        String nome = ent.beneficiario() != null ? ent.beneficiario()
+                : (ent.ordinante() != null ? ent.ordinante() : norm.descrizione());
+        if (nome != null && nome.length() > 255) nome = nome.substring(0, 255);
+        String tipo = "ENTRATA".equals(norm.tipo()) ? "CLIENTE" : "FORNITORE";
+
+        em.createNativeQuery(
+                        "INSERT INTO controparti (tipo, nome_normalizzato, iban, fornitore_id, coge_default_id, bu_default_id) " +
+                        "VALUES (:tipo, :nome, :iban, :fid, :coge, :bu) " +
+                        "ON CONFLICT (iban) WHERE iban IS NOT NULL DO UPDATE SET " +
+                        "fornitore_id = EXCLUDED.fornitore_id, coge_default_id = EXCLUDED.coge_default_id, " +
+                        "bu_default_id = EXCLUDED.bu_default_id, updated_at = now()")
+                .setParameter("tipo", tipo)
+                .setParameter("nome", nome != null ? nome : iban)
+                .setParameter("iban", iban)
+                .setParameter("fid", req.fornitoreId())
+                .setParameter("coge", req.cogeId())
+                .setParameter("bu", req.businessUnitId())
+                .executeUpdate();
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

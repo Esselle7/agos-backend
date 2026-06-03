@@ -32,6 +32,7 @@ public class MovimentiResource {
     @Inject ReconciliazioneService reconciliazioneService;
     @Inject MovimentoImportService importService;
     @Inject ImportLogService importLogService;
+    @Inject com.agostinelli.gestionale.movimenti.importlayer.ImportTriageService triageService;
 
     @GET
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
@@ -219,6 +220,54 @@ public class MovimentiResource {
             @Context SecurityContext ctx) {
         UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
         importLogService.classificaAmbiguita(id, req, userId);
+        return Response.noContent().build();
+    }
+
+    // ── Triage assistito / KPI / regole data-driven (ETL v2 §8/§9/§13) ──────────
+
+    @GET
+    @Path("/import/kpi")
+    @RolesAllowed("ADMIN")
+    public com.agostinelli.gestionale.movimenti.dto.ImportKpiDTO importKpi() {
+        return triageService.getKpi();
+    }
+
+    @GET
+    @Path("/import/ambiguita/{id}/suggerimenti")
+    @RolesAllowed("ADMIN")
+    public List<com.agostinelli.gestionale.movimenti.dto.SuggerimentoControparteDTO> suggerimenti(
+            @PathParam("id") UUID id) {
+        return triageService.suggerimenti(id);
+    }
+
+    @GET
+    @Path("/import/regole")
+    @RolesAllowed("ADMIN")
+    public List<com.agostinelli.gestionale.movimenti.dto.RegolaClassificazioneDTO> listRegole() {
+        return triageService.listRegole();
+    }
+
+    @POST
+    @Path("/import/regole")
+    @RolesAllowed("ADMIN")
+    public Response createRegola(com.agostinelli.gestionale.movimenti.dto.RegolaClassificazioneDTO regola) {
+        Integer id = triageService.createRegola(regola);
+        return Response.status(Response.Status.CREATED).entity(java.util.Map.of("id", id)).build();
+    }
+
+    @PUT
+    @Path("/import/regole/{id}/attiva")
+    @RolesAllowed("ADMIN")
+    public Response setRegolaAttiva(@PathParam("id") int id, @QueryParam("attiva") @DefaultValue("true") boolean attiva) {
+        triageService.setRegolaAttiva(id, attiva);
+        return Response.noContent().build();
+    }
+
+    @DELETE
+    @Path("/import/regole/{id}")
+    @RolesAllowed("ADMIN")
+    public Response deleteRegola(@PathParam("id") int id) {
+        triageService.deleteRegola(id);
         return Response.noContent().build();
     }
 }

@@ -60,7 +60,7 @@ public class MovimentoImportService {
 
         List<RawRow> rows = strategy.parserFor(fonteStr).parse(file);
 
-        int importati = 0, duplicati = 0, ambigui = 0;
+        int importati = 0, duplicati = 0, ambigui = 0, scartati = 0, parcheggiati = 0;
         List<EtlRowError> errori = new ArrayList<>();
         Set<String> rifEsistenti = repo.findRifimentiEsterniByFonte(dbFonte);
 
@@ -70,10 +70,26 @@ public class MovimentoImportService {
 
                 MappingResult mapped = mappingEngine.map(norm);
 
-                if (mapped.outcome() == MappingResult.MappingOutcome.GIROCONTO_SKIP
-                        || mapped.outcome() == MappingResult.MappingOutcome.AMBIGUOUS
+                // Gate A: esclusioni deterministiche tracciate in import_scartati (non sono ambiguità)
+                if (mapped.outcome().isSkip()) {
+                    salvaScartato(importLogId, raw, norm, mapped.motivoAmbiguita(), dbFonte);
+                    scartati++;
+                    continue;
+                }
+
+                // Gate B: voci evento parcheggiate (dedup cross-sorgente su chiave_aggancio)
+                if (mapped.outcome() == MappingResult.MappingOutcome.PARK_EVENTO) {
+                    if (salvaEventoParcheggiato(importLogId, raw, norm, mapped.park(), dbFonte)) {
+                        parcheggiati++;
+                    } else {
+                        duplicati++; // già parcheggiato da un'altra sorgente (stessa chiave aggancio)
+                    }
+                    continue;
+                }
+
+                if (mapped.outcome() == MappingResult.MappingOutcome.AMBIGUOUS
                         || mapped.outcome() == MappingResult.MappingOutcome.ERROR) {
-                    salvaAmbiguita(importLogId, raw, mapped.motivoAmbiguita(), dbFonte);
+                    salvaAmbiguita(importLogId, raw, norm, mapped.motivoAmbiguita(), dbFonte);
                     ambigui++;
                     continue;
                 }
@@ -96,11 +112,12 @@ public class MovimentoImportService {
         }
 
         String statoFinale = statoFinale(errori.size(), ambigui, rows.size());
-        chiudiImportLog(importLogId, rows.size(), importati, errori.size(), duplicati, ambigui, statoFinale, errori);
+        chiudiImportLog(importLogId, rows.size(), importati, errori.size(), duplicati, ambigui,
+                scartati, parcheggiati, statoFinale, errori);
 
         if (importati > 0) mvRefresh.requestRefreshAfterCommit();
 
-        return new EtlImportResponse(importLogId, importati, duplicati, ambigui, errori);
+        return new EtlImportResponse(importLogId, importati, duplicati, ambigui, scartati, parcheggiati, errori);
     }
 
     private String statoFinale(int errori, int ambigui, int totali) {
@@ -125,32 +142,104 @@ public class MovimentoImportService {
     }
 
     private void chiudiImportLog(UUID id, int totali, int importate, int errore, int duplicate,
-                                 int ambigue, String stato, List<EtlRowError> errori) {
+                                 int ambigue, int scartate, int parcheggiate, String stato, List<EtlRowError> errori) {
         em.createNativeQuery(
                         "UPDATE import_log SET righe_totali = :tot, righe_importate = :imp, " +
                         "righe_errore = :err, righe_duplicate = :dup, righe_ambigue = :amb, " +
+                        "righe_scartate = :sca, righe_parcheggiate = :par, " +
                         "stato = :stato, errori_dettaglio = CAST(:json AS jsonb) WHERE id = :id")
                 .setParameter("tot", totali)
                 .setParameter("imp", importate)
                 .setParameter("err", errore)
                 .setParameter("dup", duplicate)
                 .setParameter("amb", ambigue)
+                .setParameter("sca", scartate)
+                .setParameter("par", parcheggiate)
                 .setParameter("stato", stato)
                 .setParameter("json", toJson(errori))
                 .setParameter("id", id)
                 .executeUpdate();
     }
 
-    private void salvaAmbiguita(UUID importLogId, RawRow raw, String motivo, String fonte) {
+    /**
+     * Persiste una voce-evento nella coda eventi_da_riconciliare (ETL v2 §5).
+     * Dedup cross-sorgente: a parità di chiave_aggancio (Billy↔CA↔BPM) la seconda
+     * occorrenza viene scartata (ON CONFLICT DO NOTHING). Ritorna true se inserita.
+     */
+    private boolean salvaEventoParcheggiato(UUID importLogId, RawRow raw, RawMovimento norm,
+                                            com.agostinelli.gestionale.movimenti.importlayer.model.ParkEvento park,
+                                            String fonte) {
+        // chiave usabile per il dedup solo se valorizzata e con la parte importo (non "<num>/")
+        String chiaveRaw = norm.chiaveAggancio();
+        String chiaveDedup = (chiaveRaw == null || chiaveRaw.isBlank() || chiaveRaw.endsWith("/"))
+                ? null : chiaveRaw;
+
+        var entita = norm.entita();
+        int inserted = em.createNativeQuery(
+                        "INSERT INTO eventi_da_riconciliare (id, import_log_id, fonte, chiave_aggancio, " +
+                        "data_movimento, importo, tipo, conto_bancario_id, descrizione_norm, " +
+                        "tipo_evento_presunto, keyword_match, controparte_nome, controparte_iban, " +
+                        "data_evento_estratta, raw_data) " +
+                        "VALUES (:id, :logId, :fonte, :chiave, :data, :importo, :tipo, :conto, :descr, " +
+                        ":tipoEv, :kw, :nome, :iban, :dataEv, CAST(:raw AS jsonb)) " +
+                        "ON CONFLICT (chiave_aggancio) WHERE chiave_aggancio IS NOT NULL DO NOTHING")
+                .setParameter("id", UUID.randomUUID())
+                .setParameter("logId", importLogId)
+                .setParameter("fonte", fonte)
+                .setParameter("chiave", chiaveDedup)
+                .setParameter("data", norm.dataMovimento())
+                .setParameter("importo", norm.importo())
+                .setParameter("tipo", norm.tipo())
+                .setParameter("conto", norm.contoBancarioId())
+                .setParameter("descr", norm.descrizione())
+                .setParameter("tipoEv", park != null ? park.tipoEventoPresunto() : null)
+                .setParameter("kw", park != null ? park.keywordMatch() : null)
+                .setParameter("nome", entita != null ? entita.ordinante() : null)
+                .setParameter("iban", entita != null ? entita.ibanControparte() : null)
+                .setParameter("dataEv", park != null ? park.dataEventoEstratta() : null)
+                .setParameter("raw", toJson(raw.campi()))
+                .executeUpdate();
+        return inserted > 0;
+    }
+
+    /**
+     * Persiste una riga esclusa dal Gate A in import_scartati (ETL v2 §4/§9.4):
+     * tracciata e reversibile, conteggiata in import_log, mai un movimento.
+     */
+    private void salvaScartato(UUID importLogId, RawRow raw, RawMovimento norm, String motivo, String fonte) {
         em.createNativeQuery(
-                        "INSERT INTO import_ambiguita (id, import_log_id, riga_numero, fonte, raw_data, motivo, stato) " +
-                        "VALUES (:id, :logId, :riga, :fonte, CAST(:raw AS jsonb), :motivo, 'DA_CLASSIFICARE')")
+                        "INSERT INTO import_scartati (id, import_log_id, riga_numero, fonte, motivo, " +
+                        "chiave_aggancio, data_movimento, importo, causale, raw_data) " +
+                        "VALUES (:id, :logId, :riga, :fonte, :motivo, :chiave, :data, :importo, :causale, CAST(:raw AS jsonb))")
+                .setParameter("id", UUID.randomUUID())
+                .setParameter("logId", importLogId)
+                .setParameter("riga", raw.riga())
+                .setParameter("fonte", fonte)
+                .setParameter("motivo", motivo)
+                .setParameter("chiave", norm.chiaveAggancio())
+                .setParameter("data", norm.dataMovimento())
+                .setParameter("importo", norm.importo())
+                .setParameter("causale", raw.campi().get("CAUSALE"))
+                .setParameter("raw", toJson(raw.campi()))
+                .executeUpdate();
+    }
+
+    private void salvaAmbiguita(UUID importLogId, RawRow raw, RawMovimento norm, String motivo, String fonte) {
+        var entita = norm.entita();
+        String nome = entita == null ? null
+                : (entita.beneficiario() != null ? entita.beneficiario() : entita.ordinante());
+        em.createNativeQuery(
+                        "INSERT INTO import_ambiguita (id, import_log_id, riga_numero, fonte, raw_data, motivo, stato, " +
+                        "controparte_nome, controparte_iban) " +
+                        "VALUES (:id, :logId, :riga, :fonte, CAST(:raw AS jsonb), :motivo, 'DA_CLASSIFICARE', :nome, :iban)")
                 .setParameter("id", UUID.randomUUID())
                 .setParameter("logId", importLogId)
                 .setParameter("riga", raw.riga())
                 .setParameter("fonte", fonte)
                 .setParameter("raw", toJson(raw.campi()))
                 .setParameter("motivo", motivo != null ? motivo : "COGE_NON_DETERMINABILE")
+                .setParameter("nome", nome)
+                .setParameter("iban", entita == null ? null : entita.ibanControparte())
                 .executeUpdate();
     }
 

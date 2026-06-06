@@ -133,10 +133,10 @@ public class MovimentiService {
         validateConsistency(m);
 
         // Sincronizza stato e scadenzaFinanziaria in base alla presenza di dataFinanziaria
-        if (m.dataFinanziaria != null && !"ANNULLATO".equals(m.stato) && !"RICONCILIATO".equals(m.stato)) {
+        if (m.dataFinanziaria != null && !"ANNULLATO".equals(m.stato)) {
             m.stato = "REGISTRATO";
             m.dataLiquidita = m.dataFinanziaria;
-        } else if (m.dataFinanziaria == null && !"ANNULLATO".equals(m.stato) && !"RICONCILIATO".equals(m.stato)) {
+        } else if (m.dataFinanziaria == null && !"ANNULLATO".equals(m.stato)) {
             m.stato = "DA_LIQUIDARE";
         }
 

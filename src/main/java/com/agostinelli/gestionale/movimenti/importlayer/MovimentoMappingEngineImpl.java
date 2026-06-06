@@ -59,6 +59,7 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
 
     private volatile boolean loaded = false;
     private final Map<String, Integer> cogeByCode = new HashMap<>();
+    private final Map<Integer, String> cogeCodeById = new HashMap<>(); // reverse, per log leggibili
     private final Map<String, Integer> metodiByCode = new HashMap<>();
     private final List<AliasRule> aliasRules = new ArrayList<>();
     // Rubrica controparti (§7): IBAN forte + lista per match a token sul nome normalizzato.
@@ -94,14 +95,20 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
         // ── REGOLE DATA-DRIVEN (priorità) — ETL v2 §9: valutate PRIMA dei gate ──
         RegoleClassificazioneEngine.Match rule = regoleEngine.evaluate(n, sorgente);
         Classify cl;
+        String via; // traccia del percorso decisionale (per il log per-import)
         if (rule != null && !"MAP".equals(rule.azione())) {
             return switch (rule.azione()) {
-                case "SKIP_POS" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_POS, n);
-                case "SKIP_GIROCONTO" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_GIROCONTO, n);
-                case "SKIP_RICORRENTE" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_RICORRENTE, n);
+                case "SKIP_POS" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_POS, n)
+                        .withTrace("REGOLA DATA-DRIVEN → SKIP_POS");
+                case "SKIP_GIROCONTO" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_GIROCONTO, n)
+                        .withTrace("REGOLA DATA-DRIVEN → SKIP_GIROCONTO");
+                case "SKIP_RICORRENTE" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_RICORRENTE, n)
+                        .withTrace("REGOLA DATA-DRIVEN → SKIP_RICORRENTE");
                 case "PARK_EVENTO" -> MappingResult.parkEvento(
-                        buildPark(safe(n.descrizione()), safe(n.descCompact())), n);
-                default -> MappingResult.ambiguous("AZIONE_REGOLA_SCONOSCIUTA", n);
+                        buildPark(safe(n.descrizione()), safe(n.descCompact())), n)
+                        .withTrace("REGOLA DATA-DRIVEN → PARK_EVENTO");
+                default -> MappingResult.ambiguous("AZIONE_REGOLA_SCONOSCIUTA", n)
+                        .withTrace("REGOLA DATA-DRIVEN → azione sconosciuta: " + rule.azione());
             };
         }
         if (rule != null) { // azione MAP
@@ -109,24 +116,27 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
             cl.cogeId = coge(rule.cogeCodice());
             cl.bu = rule.buId();
             cl.metodoCodiceOverride = rule.metodoCodice();
+            via = "REGOLA DATA-DRIVEN MAP (coge=" + rule.cogeCodice() + ", bu=" + rule.buId() + ")";
         } else {
             // ── GATE A — esclusioni deterministiche (ETL v2 §4) ──
             MappingResult.MappingOutcome skip = gateA(n, sorgente);
             if (skip != null) {
-                return MappingResult.skip(skip, n);
+                return MappingResult.skip(skip, n).withTrace("GATE A → " + skip);
             }
             // ── GATE B — parcheggio eventi (ETL v2 §5) ──
             ParkEvento park = gateB(n, sorgente);
             if (park != null) {
-                return MappingResult.parkEvento(park, n);
+                return MappingResult.parkEvento(park, n).withTrace(
+                        "GATE B → PARK_EVENTO (kw=" + park.keywordMatch()
+                        + ", tipo=" + park.tipoEventoPresunto() + ")");
             }
-            cl = "ENTRATA".equals(n.tipo())
-                    ? classifyEntrata(n, sorgente)
-                    : classifyUscita(n, sorgente);
+            boolean entrata = "ENTRATA".equals(n.tipo());
+            cl = entrata ? classifyEntrata(n, sorgente) : classifyUscita(n, sorgente);
+            via = "GATE C → " + (entrata ? "classifyEntrata" : "classifyUscita");
         }
 
         if (cl.motivo != null) {
-            return MappingResult.ambiguous(cl.motivo, n);
+            return MappingResult.ambiguous(cl.motivo, n).withTrace(via + " → AMBIGUOUS: " + cl.motivo);
         }
 
         // Metodo di pagamento: override (es. Stripe) o codice dal normalizzatore
@@ -136,7 +146,7 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
         // ── Validazione invarianti (§6.1) ──
         String motivo = validate(n, metodoCodice, metodoId, cl);
         if (motivo != null) {
-            return MappingResult.ambiguous(motivo, n);
+            return MappingResult.ambiguous(motivo, n).withTrace(via + " → AMBIGUOUS (validazione): " + motivo);
         }
 
         MovimentoCreateRequest req = new MovimentoCreateRequest(
@@ -162,7 +172,16 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
                 n.fonte(),
                 null                       // allegatoPath
         );
-        return MappingResult.success(req, n);
+        return MappingResult.success(req, n).withTrace(
+                via + " → BOOK (coge=" + codeOf(cl.cogeId) + ", bu=" + cl.bu
+                + (cl.fornitoreId != null ? ", fornitore" : "")
+                + (cl.descrizioneOverride != null ? ", tag ALVEARE" : "") + ")");
+    }
+
+    /** Codice COGE da id (per i log leggibili). */
+    private String codeOf(Integer id) {
+        if (id == null) return null;
+        return cogeCodeById.get(id);
     }
 
     // ── GATE A — esclusioni deterministiche (SKIP, ETL v2 §4) ──────────────────
@@ -482,6 +501,7 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
     /** Ricarica le lookup (chiamato a inizio import: recepisce alias/controparti dalle classificazioni). */
     public synchronized void refreshLookups() {
         cogeByCode.clear();
+        cogeCodeById.clear();
         metodiByCode.clear();
         aliasRules.clear();
         contropartiByIban.clear();
@@ -495,7 +515,10 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
     private void loadLookups() {
         for (Object[] r : (List<Object[]>) em.createNativeQuery(
                 "SELECT codice, id FROM piano_dei_conti_coge").getResultList()) {
-            cogeByCode.put((String) r[0], ((Number) r[1]).intValue());
+            String codice = (String) r[0];
+            int id = ((Number) r[1]).intValue();
+            cogeByCode.put(codice, id);
+            cogeCodeById.put(id, codice);
         }
         for (Object[] r : (List<Object[]>) em.createNativeQuery(
                 "SELECT codice, id FROM metodi_pagamento").getResultList()) {

@@ -1,10 +1,15 @@
 package com.agostinelli.gestionale.movimenti;
 
+import com.agostinelli.gestionale.movimenti.dto.ClassificaTransitorioRequest;
 import com.agostinelli.gestionale.movimenti.dto.EtlImportResponse;
+import com.agostinelli.gestionale.movimenti.dto.EventoParcheggiatoDTO;
 import com.agostinelli.gestionale.movimenti.dto.ImportKpiDTO;
 import com.agostinelli.gestionale.movimenti.dto.RegolaClassificazioneDTO;
+import com.agostinelli.gestionale.movimenti.dto.RisolviEventoRequest;
+import com.agostinelli.gestionale.movimenti.dto.TransitorioDTO;
 import com.agostinelli.gestionale.movimenti.importlayer.ImportTriageService;
 import com.agostinelli.gestionale.movimenti.importlayer.MovimentoImportService;
+import com.agostinelli.gestionale.shared.dto.PagedResponse;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
@@ -52,6 +57,8 @@ class EtlStep3IntegrationTest {
             em.createNativeQuery("DELETE FROM movimenti WHERE fonte_importazione_id IS NOT NULL").executeUpdate();
             em.createNativeQuery("DELETE FROM import_log WHERE fonte IN ('IMPORT_BILLY','IMPORT_BANCA')").executeUpdate();
             em.createNativeQuery("DELETE FROM regole_classificazione WHERE note = 'STEP3-TEST'").executeUpdate();
+            // Le controparti seedate dai fornitori hanno iban NULL: qui rimuovo solo quelle apprese nel test.
+            em.createNativeQuery("DELETE FROM controparti WHERE iban IS NOT NULL").executeUpdate();
         });
     }
 
@@ -87,7 +94,91 @@ class EtlStep3IntegrationTest {
         assertTrue(triageService.listRegole().stream().noneMatch(r -> r.id().equals(regolaId)));
     }
 
+    @Test
+    void testRollbackImport_reversibile() throws Exception {
+        EtlImportResponse ca = importFixture(CA, "IMPORT_BANCA_CA");
+        UUID logId = ca.importLogId();
+
+        // L'import ha prodotto movimenti + scartati prima del rollback.
+        assertTrue(countMovimenti(logId) > 0, "L'import deve aver creato movimenti");
+        assertTrue(countTable("import_scartati", logId) > 0, "L'import deve aver scartato righe");
+        assertEquals(1, importLogExists(logId));
+
+        java.util.Map<String, Object> res = importService.rollbackImport(logId);
+        assertTrue(((Number) res.get("movimentiEliminati")).longValue() > 0);
+
+        // Reversibilità completa: nessuna traccia residua dell'import.
+        assertEquals(0, countMovimenti(logId), "I movimenti devono essere eliminati");
+        assertEquals(0, countTable("import_scartati", logId), "import_scartati svuotato (cascade)");
+        assertEquals(0, countTable("eventi_da_riconciliare", logId), "eventi svuotati (cascade)");
+        assertEquals(0, countTable("import_ambiguita", logId), "ambiguità svuotate (cascade)");
+        assertEquals(0, importLogExists(logId), "import_log eliminato");
+    }
+
+    @Test
+    void testTriageTransitorio_classifica_e_apprendimento() throws Exception {
+        importFixture(CA, "IMPORT_BANCA_CA");
+
+        PagedResponse<TransitorioDTO> before = triageService.listTransitori(null, 0, 200);
+        assertTrue(before.totalElements() > 0, "Devono esserci movimenti su conti transitori");
+        TransitorioDTO t = before.content().get(0);
+        assertTrue(t.cogeCodiceAttuale().equals("39.99.999") || t.cogeCodiceAttuale().equals("49.99.999"));
+
+        Integer cogeTarget = ((Number) em.createNativeQuery(
+                "SELECT id FROM piano_dei_conti_coge WHERE codice = '40.11.001'").getSingleResult()).intValue();
+        triageService.classificaTransitorio(t.id(),
+                new ClassificaTransitorioRequest(cogeTarget, (short) 5, null, true, "classificato in test"));
+
+        // Il movimento è stato spostato fuori dai transitori.
+        String nuovoCoge = (String) em.createNativeQuery(
+                "SELECT p.codice FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id WHERE m.id = :id")
+                .setParameter("id", t.id()).getSingleResult();
+        assertEquals("40.11.001", nuovoCoge);
+
+        PagedResponse<TransitorioDTO> after = triageService.listTransitori(null, 0, 200);
+        assertEquals(before.totalElements() - 1, after.totalElements(),
+                "Il movimento classificato non deve più comparire tra i transitori");
+    }
+
+    @Test
+    void testRisolviEvento_scarta() throws Exception {
+        importFixture(CA, "IMPORT_BANCA_CA");
+
+        PagedResponse<EventoParcheggiatoDTO> before = triageService.listEventi("DA_RICONCILIARE", 0, 200);
+        assertTrue(before.totalElements() > 0, "Devono esserci eventi parcheggiati");
+        EventoParcheggiatoDTO ev = before.content().get(0);
+
+        triageService.risolviEvento(ev.id(),
+                new RisolviEventoRequest("SCARTA", null, null, null, "non è un evento"), TEST_USER);
+
+        long scartato = ((Number) em.createNativeQuery(
+                "SELECT count(*) FROM eventi_da_riconciliare WHERE id = :id AND stato = 'SCARTATO'")
+                .setParameter("id", ev.id()).getSingleResult()).longValue();
+        assertEquals(1, scartato, "L'evento deve risultare SCARTATO");
+
+        PagedResponse<EventoParcheggiatoDTO> after = triageService.listEventi("DA_RICONCILIARE", 0, 200);
+        assertEquals(before.totalElements() - 1, after.totalElements());
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────
+
+    long countMovimenti(UUID logId) {
+        return ((Number) em.createNativeQuery(
+                "SELECT count(*) FROM movimenti WHERE fonte_importazione_id = :id")
+                .setParameter("id", logId).getSingleResult()).longValue();
+    }
+
+    long countTable(String tabella, UUID logId) {
+        return ((Number) em.createNativeQuery(
+                "SELECT count(*) FROM " + tabella + " WHERE import_log_id = :id")
+                .setParameter("id", logId).getSingleResult()).longValue();
+    }
+
+    long importLogExists(UUID logId) {
+        return ((Number) em.createNativeQuery(
+                "SELECT count(*) FROM import_log WHERE id = :id")
+                .setParameter("id", logId).getSingleResult()).longValue();
+    }
 
     EtlImportResponse importFixture(String filename, String fonteStr) throws Exception {
         Path p = ESEMPI.resolve(filename);

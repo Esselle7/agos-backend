@@ -9,12 +9,14 @@ import com.agostinelli.gestionale.movimenti.importlayer.model.RawRow;
 import com.agostinelli.gestionale.movimenti.repository.MovimentiRepository;
 import com.agostinelli.gestionale.movimenti.service.MovimentiService;
 import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
+import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.cache.CacheInvalidateAll;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
 import jakarta.transaction.Transactional;
+import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.io.InputStream;
@@ -67,10 +69,9 @@ public class MovimentoImportService {
         for (RawRow raw : rows) {
             try {
                 RawMovimento norm = strategy.getNormalizer().normalize(raw);
-
                 MappingResult mapped = mappingEngine.map(norm);
 
-                // Gate A: esclusioni deterministiche tracciate in import_scartati (non sono ambiguità)
+                // Gate A: esclusioni deterministiche tracciate in import_scartati
                 if (mapped.outcome().isSkip()) {
                     salvaScartato(importLogId, raw, norm, mapped.motivoAmbiguita(), dbFonte);
                     scartati++;
@@ -82,7 +83,7 @@ public class MovimentoImportService {
                     if (salvaEventoParcheggiato(importLogId, raw, norm, mapped.park(), dbFonte)) {
                         parcheggiati++;
                     } else {
-                        duplicati++; // già parcheggiato da un'altra sorgente (stessa chiave aggancio)
+                        duplicati++;
                     }
                     continue;
                 }
@@ -124,6 +125,58 @@ public class MovimentoImportService {
         if (totali > 0 && errori > totali * 0.5) return "ERRORE";
         if (ambigui > 0 || errori > 0) return "COMPLETATO_CON_AMBIGUITA";
         return "COMPLETATO";
+    }
+
+    /**
+     * ROLLBACK reversibile di un import: elimina tutto ciò che l'import ha prodotto,
+     * identificato dal suo {@code importLogId}. I movimenti hanno
+     * {@code fonte_importazione_id = importLogId} (vanno eliminati esplicitamente);
+     * import_scartati / eventi_da_riconciliare / import_ambiguita sono in ON DELETE
+     * CASCADE su import_log, quindi spariscono eliminando la riga di import_log.
+     *
+     * NB: non tocca controparti/alias creati da classificazioni manuali (apprendimento).
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @Transactional
+    public Map<String, Object> rollbackImport(UUID importLogId) {
+        long esiste = ((Number) em.createNativeQuery(
+                "SELECT count(*) FROM import_log WHERE id = :id")
+                .setParameter("id", importLogId).getSingleResult()).longValue();
+        if (esiste == 0) {
+            throw new ApiException(Response.Status.NOT_FOUND, "IMPORT_NON_TROVATO",
+                    "Import log non trovato: " + importLogId);
+        }
+
+        long scartati = contaPerImport("import_scartati", importLogId);
+        long eventi = contaPerImport("eventi_da_riconciliare", importLogId);
+        long ambiguita = contaPerImport("import_ambiguita", importLogId);
+
+        int movimenti = em.createNativeQuery(
+                "DELETE FROM movimenti WHERE fonte_importazione_id = :id")
+                .setParameter("id", importLogId).executeUpdate();
+
+        // Cascade: import_scartati / eventi_da_riconciliare / import_ambiguita.
+        em.createNativeQuery("DELETE FROM import_log WHERE id = :id")
+                .setParameter("id", importLogId).executeUpdate();
+
+        mvRefresh.requestRefreshAfterCommit();
+        log.infof("Rollback import %s: rimossi %d movimenti, %d scartati, %d eventi, %d ambiguità",
+                importLogId, movimenti, scartati, eventi, ambiguita);
+
+        return Map.of(
+                "importLogId", importLogId.toString(),
+                "movimentiEliminati", (long) movimenti,
+                "scartatiEliminati", scartati,
+                "eventiEliminati", eventi,
+                "ambiguitaEliminate", ambiguita);
+    }
+
+    private long contaPerImport(String tabella, UUID importLogId) {
+        return ((Number) em.createNativeQuery(
+                "SELECT count(*) FROM " + tabella + " WHERE import_log_id = :id")
+                .setParameter("id", importLogId).getSingleResult()).longValue();
     }
 
     // ── import_log ──────────────────────────────────────────────────────────────

@@ -21,6 +21,7 @@ public record MappingResult(
         MovimentoCreateRequest request,  // valorizzato solo se SUCCESS
         String motivoAmbiguita,          // valorizzato se AMBIGUOUS / SKIP_* / ERROR
         ParkEvento park,                 // valorizzato solo se PARK_EVENTO
+        String trace,                    // spiegazione del percorso decisionale (per il log per-import)
         RawMovimento rawNormalizzato     // sempre: per logging
 ) {
 
@@ -34,19 +35,24 @@ public record MappingResult(
         }
     }
 
+    /** Copia con la traccia decisionale valorizzata (per il logging passo-passo). */
+    public MappingResult withTrace(String t) {
+        return new MappingResult(outcome, request, motivoAmbiguita, park, t, rawNormalizzato);
+    }
+
     public static MappingResult success(MovimentoCreateRequest request, RawMovimento raw) {
-        return new MappingResult(MappingOutcome.SUCCESS, request, null, null, raw);
+        return new MappingResult(MappingOutcome.SUCCESS, request, null, null, null, raw);
     }
 
     public static MappingResult ambiguous(String motivo, RawMovimento raw) {
-        return new MappingResult(MappingOutcome.AMBIGUOUS, null, motivo, null, raw);
+        return new MappingResult(MappingOutcome.AMBIGUOUS, null, motivo, null, null, raw);
     }
 
     public static MappingResult skip(MappingOutcome outcome, RawMovimento raw) {
-        return new MappingResult(outcome, null, outcome.name(), null, raw);
+        return new MappingResult(outcome, null, outcome.name(), null, null, raw);
     }
 
     public static MappingResult parkEvento(ParkEvento park, RawMovimento raw) {
-        return new MappingResult(MappingOutcome.PARK_EVENTO, null, "PARK_EVENTO", park, raw);
+        return new MappingResult(MappingOutcome.PARK_EVENTO, null, "PARK_EVENTO", park, null, raw);
     }
 }

@@ -1,9 +1,21 @@
 package com.agostinelli.gestionale.movimenti.importlayer;
 
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
+import com.agostinelli.gestionale.movimenti.domain.Movimento;
+import com.agostinelli.gestionale.movimenti.dto.ClassificaTransitorioRequest;
+import com.agostinelli.gestionale.movimenti.dto.EventoParcheggiatoDTO;
 import com.agostinelli.gestionale.movimenti.dto.ImportKpiDTO;
+import com.agostinelli.gestionale.movimenti.dto.MovimentoCreateRequest;
 import com.agostinelli.gestionale.movimenti.dto.RegolaClassificazioneDTO;
+import com.agostinelli.gestionale.movimenti.dto.RisolviEventoRequest;
 import com.agostinelli.gestionale.movimenti.dto.SuggerimentoControparteDTO;
+import com.agostinelli.gestionale.movimenti.dto.TransitorioDTO;
+import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
+import com.agostinelli.gestionale.movimenti.importlayer.parser.Sorgente;
+import com.agostinelli.gestionale.movimenti.service.MovimentiService;
+import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
+import com.agostinelli.gestionale.shared.dto.PagedResponse;
+import io.quarkus.cache.CacheInvalidateAll;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
@@ -11,20 +23,28 @@ import jakarta.transaction.Transactional;
 import jakarta.ws.rs.core.Response;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
 /**
  * Backend del triage assistito (ETL v2 §8/§13): KPI di qualità dell'import,
- * suggerimenti di controparte (fuzzy pg_trgm) e CRUD delle regole data-driven.
- * La UI vive nel frontend; qui si espongono solo i servizi.
+ * suggerimenti di controparte (fuzzy pg_trgm), CRUD regole data-driven, e il
+ * "centro di smistamento" dei movimenti su conti transitori e degli eventi
+ * parcheggiati. La UI vive nel frontend; qui si espongono solo i servizi.
  */
 @ApplicationScoped
 public class ImportTriageService {
 
+    private static final String COGE_RICAVI_DACLASS = "39.99.999";
+    private static final String COGE_COSTI_DACLASS = "49.99.999";
+
     @Inject EntityManager em;
     @Inject RegoleClassificazioneEngine regoleEngine;
+    @Inject MovimentiService movimentiService;
+    @Inject MvRefreshService mvRefresh;
+    @Inject MovimentoMappingEngineImpl mappingEngine;
 
     // ── KPI (§13) ────────────────────────────────────────────────────────────────
     public ImportKpiDTO getKpi() {
@@ -67,11 +87,13 @@ public class ImportTriageService {
             throw new ApiException(Response.Status.NOT_FOUND, "AMBIGUITA_NON_TROVATA",
                     "Ambiguità non trovata: " + ambiguitaId);
         }
-        String nome = (String) amb.get(0)[0];
-        String iban = (String) amb.get(0)[1];
-        List<SuggerimentoControparteDTO> out = new ArrayList<>();
+        return suggerisciControparti((String) amb.get(0)[0], (String) amb.get(0)[1]);
+    }
 
-        // Match forte per IBAN (similarità 1.0).
+    /** Core dei suggerimenti: IBAN esatto (sim 1.0), poi fuzzy sul nome (trigrammi). */
+    @SuppressWarnings("unchecked")
+    public List<SuggerimentoControparteDTO> suggerisciControparti(String nome, String iban) {
+        List<SuggerimentoControparteDTO> out = new ArrayList<>();
         if (iban != null && !iban.isBlank()) {
             for (Object[] r : (List<Object[]>) em.createNativeQuery(
                     suggerimentoSelect() + " WHERE c.iban = :iban LIMIT 1")
@@ -79,7 +101,6 @@ public class ImportTriageService {
                 out.add(mapSuggerimento(r, 1.0));
             }
         }
-        // Fuzzy per nome (trigrammi) se c'è un nome estratto.
         if (out.isEmpty() && nome != null && !nome.isBlank()) {
             for (Object[] r : (List<Object[]>) em.createNativeQuery(
                     suggerimentoSelect() +
@@ -168,6 +189,214 @@ public class ImportTriageService {
                 .setParameter("id", id).executeUpdate();
         if (del == 0) throw new ApiException(Response.Status.NOT_FOUND, "REGOLA_NON_TROVATA", "Regola " + id);
         regoleEngine.refresh();
+    }
+
+    // ── Centro smistamento: movimenti su conti transitori (39/49.99.999) ──────────
+
+    /** Lista paginata dei movimenti ancora su conto transitorio (da catalogare). */
+    @SuppressWarnings("unchecked")
+    public PagedResponse<TransitorioDTO> listTransitori(String tipo, int page, int size) {
+        String where =
+                "FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id " +
+                "WHERE p.codice IN ('" + COGE_RICAVI_DACLASS + "','" + COGE_COSTI_DACLASS + "') " +
+                "AND m.stato <> 'ANNULLATO' AND (CAST(:tipo AS VARCHAR) IS NULL OR m.tipo = :tipo)";
+
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT m.id, m.tipo, m.importo_lordo, m.data_movimento, m.descrizione, p.codice, " +
+                "m.fornitore_id, m.conto_bancario_id " + where +
+                " ORDER BY m.data_movimento, m.id LIMIT :size OFFSET :offset")
+                .setParameter("tipo", tipo)
+                .setParameter("size", size)
+                .setParameter("offset", (long) page * size)
+                .getResultList();
+
+        List<TransitorioDTO> content = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            String descr = (String) r[4];
+            Short conto = r[7] == null ? null : ((Number) r[7]).shortValue();
+            EntitaEstratte ent = estraiEntita(descr, conto);
+            content.add(new TransitorioDTO(
+                    toUuid(r[0]), (String) r[1], (BigDecimal) r[2],
+                    ((java.sql.Date) r[3]).toLocalDate(), descr, (String) r[5],
+                    r[6] == null ? null : toUuid(r[6]), conto,
+                    ent.ibanControparte(),
+                    ent.beneficiario() != null ? ent.beneficiario() : ent.ordinante()));
+        }
+
+        long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where)
+                .setParameter("tipo", tipo).getSingleResult()).longValue();
+        return PagedResponse.of(content, page, size, total);
+    }
+
+    /** Suggerimenti controparte per un movimento transitorio (ri-estrae nome/IBAN dalla descrizione). */
+    public List<SuggerimentoControparteDTO> suggerimentiTransitorio(UUID movimentoId) {
+        Movimento m = em.find(Movimento.class, movimentoId);
+        if (m == null) throw new ApiException(Response.Status.NOT_FOUND, "MOVIMENTO_NON_TROVATO", "Movimento " + movimentoId);
+        EntitaEstratte ent = estraiEntita(m.descrizione, m.contoBancarioId);
+        String nome = ent.beneficiario() != null ? ent.beneficiario() : ent.ordinante();
+        return suggerisciControparti(nome, ent.ibanControparte());
+    }
+
+    /**
+     * Classifica un movimento transitorio: lo sposta sul conto COGE/BU corretto (e
+     * fornitore), opzionalmente apprende la controparte per IBAN (auto-riconoscimento
+     * ai prossimi import). Monitorabile: dopo la chiamata il movimento esce dai transitori.
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @Transactional
+    public void classificaTransitorio(UUID movimentoId, ClassificaTransitorioRequest req) {
+        Movimento m = em.find(Movimento.class, movimentoId);
+        if (m == null) throw new ApiException(Response.Status.NOT_FOUND, "MOVIMENTO_NON_TROVATO", "Movimento " + movimentoId);
+
+        String cogeCorrente = (String) em.createNativeQuery(
+                "SELECT codice FROM piano_dei_conti_coge WHERE id = :id")
+                .setParameter("id", m.contoCoge).getSingleResult();
+        if (!COGE_RICAVI_DACLASS.equals(cogeCorrente) && !COGE_COSTI_DACLASS.equals(cogeCorrente)) {
+            throw new ApiException(Response.Status.CONFLICT, "NON_TRANSITORIO",
+                    "Il movimento non è su un conto transitorio (è su " + cogeCorrente + ")");
+        }
+
+        m.contoCoge = req.cogeId();
+        m.businessUnitId = req.businessUnitId();
+        m.fornitoreId = req.fornitoreId();
+        if (req.nota() != null && !req.nota().isBlank()) {
+            m.note = (m.note == null ? "" : m.note + " | ") + req.nota();
+        }
+        em.merge(m);
+
+        if (req.apprendiControparte()) {
+            EntitaEstratte ent = estraiEntita(m.descrizione, m.contoBancarioId);
+            apprendiControparte(ent, m.tipo, req.fornitoreId(), req.cogeId(), req.businessUnitId());
+        }
+
+        mvRefresh.requestRefreshAfterCommit();
+    }
+
+    /** Upsert controparte per IBAN (apprendimento §7.3). No-op se manca l'IBAN. */
+    private void apprendiControparte(EntitaEstratte ent, String tipoMov, UUID fornitoreId, Integer cogeId, Short buId) {
+        String iban = ent == null ? null : ent.ibanControparte();
+        if (iban == null || iban.isBlank()) return;
+        String nome = ent.beneficiario() != null ? ent.beneficiario()
+                : (ent.ordinante() != null ? ent.ordinante() : iban);
+        if (nome.length() > 255) nome = nome.substring(0, 255);
+        String tipo = "ENTRATA".equals(tipoMov) ? "CLIENTE" : "FORNITORE";
+        em.createNativeQuery(
+                "INSERT INTO controparti (tipo, nome_normalizzato, iban, fornitore_id, coge_default_id, bu_default_id) " +
+                "VALUES (:tipo, :nome, :iban, :fid, :coge, :bu) " +
+                "ON CONFLICT (iban) WHERE iban IS NOT NULL DO UPDATE SET " +
+                "fornitore_id = EXCLUDED.fornitore_id, coge_default_id = EXCLUDED.coge_default_id, " +
+                "bu_default_id = EXCLUDED.bu_default_id, updated_at = now()")
+                .setParameter("tipo", tipo).setParameter("nome", nome).setParameter("iban", iban)
+                .setParameter("fid", fornitoreId).setParameter("coge", cogeId).setParameter("bu", buId)
+                .executeUpdate();
+        mappingEngine.refreshLookups();
+    }
+
+    /** Ri-estrae IBAN/nome dalla descrizione del movimento (sorgente dedotta dal conto). */
+    private EntitaEstratte estraiEntita(String descrizione, Short contoBancarioId) {
+        String sorgente = contoBancarioId == null ? Sorgente.CA
+                : (contoBancarioId == 1 ? Sorgente.BPM : (contoBancarioId == 2 ? Sorgente.CA : Sorgente.BILLY));
+        return DescNormalizer.extract(descrizione, sorgente);
+    }
+
+    // ── Centro smistamento: eventi parcheggiati (eventi_da_riconciliare) ──────────
+
+    @SuppressWarnings("unchecked")
+    public PagedResponse<EventoParcheggiatoDTO> listEventi(String stato, int page, int size) {
+        String where = "FROM eventi_da_riconciliare WHERE (CAST(:stato AS VARCHAR) IS NULL OR stato = :stato)";
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT id, fonte, chiave_aggancio, data_movimento, importo, tipo, conto_bancario_id, " +
+                "descrizione_norm, tipo_evento_presunto, keyword_match, controparte_nome, controparte_iban, " +
+                "data_evento_estratta, stato " + where +
+                " ORDER BY data_movimento, id LIMIT :size OFFSET :offset")
+                .setParameter("stato", stato)
+                .setParameter("size", size)
+                .setParameter("offset", (long) page * size)
+                .getResultList();
+
+        List<EventoParcheggiatoDTO> content = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            content.add(new EventoParcheggiatoDTO(
+                    toUuid(r[0]), (String) r[1], (String) r[2],
+                    r[3] == null ? null : ((java.sql.Date) r[3]).toLocalDate(),
+                    (BigDecimal) r[4], (String) r[5],
+                    r[6] == null ? null : ((Number) r[6]).shortValue(),
+                    (String) r[7], (String) r[8], (String) r[9], (String) r[10], (String) r[11],
+                    r[12] == null ? null : ((java.sql.Date) r[12]).toLocalDate(), (String) r[13]));
+        }
+
+        long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where)
+                .setParameter("stato", stato).getSingleResult()).longValue();
+        return PagedResponse.of(content, page, size, total);
+    }
+
+    /**
+     * Risolve una voce-evento: SCARTA (non è un evento), CLASSIFICA (crea un movimento
+     * sul COGE/BU scelto) o RICONCILIA (collega a un evento dell'anagrafica). In tutti i
+     * casi la riga esce dalla coda DA_RICONCILIARE.
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @Transactional
+    public void risolviEvento(UUID eventoParkId, RisolviEventoRequest req, UUID userId) {
+        List<Object[]> found = em.createNativeQuery(
+                "SELECT import_log_id, fonte, data_movimento, importo, tipo, conto_bancario_id, " +
+                "descrizione_norm, stato FROM eventi_da_riconciliare WHERE id = :id")
+                .setParameter("id", eventoParkId).getResultList();
+        if (found.isEmpty()) {
+            throw new ApiException(Response.Status.NOT_FOUND, "EVENTO_NON_TROVATO", "Evento parcheggiato " + eventoParkId);
+        }
+        Object[] e = found.get(0);
+        if (!"DA_RICONCILIARE".equals((String) e[7])) {
+            throw new ApiException(Response.Status.CONFLICT, "EVENTO_GIA_RISOLTO", "La voce è già stata risolta");
+        }
+
+        String azione = req.azione() == null ? "" : req.azione().toUpperCase();
+        switch (azione) {
+            case "SCARTA" -> aggiornaStatoEvento(eventoParkId, "SCARTATO", null, req.nota());
+
+            case "CLASSIFICA" -> {
+                if (req.cogeId() == null || req.businessUnitId() == null) {
+                    throw new ApiException(Response.Status.BAD_REQUEST, "CLASSIFICA_INCOMPLETA",
+                            "cogeId e businessUnitId sono obbligatori per classificare l'evento come movimento");
+                }
+                UUID importLogId = toUuid(e[0]);
+                LocalDate data = ((java.sql.Date) e[2]).toLocalDate();
+                Short conto = e[5] == null ? null : ((Number) e[5]).shortValue();
+                MovimentoCreateRequest createReq = new MovimentoCreateRequest(
+                        (String) e[4], (BigDecimal) e[3], null, null, data, data, data, null,
+                        conto, metodoBonificoId(), req.businessUnitId(), req.cogeId(), null,
+                        null, null, null, (String) e[6], req.nota(), null, (String) e[1], null);
+                movimentiService.createMovimentoImport(createReq, userId, importLogId);
+                aggiornaStatoEvento(eventoParkId, "RICONCILIATO", null, req.nota());
+                mvRefresh.requestRefreshAfterCommit();
+            }
+
+            case "RICONCILIA" -> aggiornaStatoEvento(eventoParkId, "RICONCILIATO", req.eventoId(), req.nota());
+
+            default -> throw new ApiException(Response.Status.BAD_REQUEST, "AZIONE_NON_VALIDA",
+                    "Azione non valida: " + req.azione() + " (SCARTA | CLASSIFICA | RICONCILIA)");
+        }
+    }
+
+    private void aggiornaStatoEvento(UUID id, String stato, UUID eventoId, String nota) {
+        em.createNativeQuery(
+                "UPDATE eventi_da_riconciliare SET stato = :stato, evento_id = :ev, " +
+                "raw_data = jsonb_set(raw_data, '{_nota_triage}', to_jsonb(CAST(:nota AS TEXT)), true) " +
+                "WHERE id = :id")
+                .setParameter("stato", stato)
+                .setParameter("ev", eventoId)
+                .setParameter("nota", nota == null ? "" : nota)
+                .setParameter("id", id)
+                .executeUpdate();
+    }
+
+    private Integer metodoBonificoId() {
+        List<?> r = em.createNativeQuery("SELECT id FROM metodi_pagamento WHERE codice = 'BONIFICO'").getResultList();
+        return r.isEmpty() ? null : ((Number) r.get(0)).intValue();
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────

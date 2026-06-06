@@ -100,6 +100,7 @@ public class ImportLogService {
     @CacheInvalidateAll(cacheName = "dashboard-kpi")
     @CacheInvalidateAll(cacheName = "dashboard-andamento")
     @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
     @Transactional
     public void classificaAmbiguita(UUID id, ClassificaAmbiguitaRequest req, UUID userId) {
         @SuppressWarnings("unchecked")

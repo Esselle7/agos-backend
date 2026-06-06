@@ -16,6 +16,7 @@ import com.agostinelli.gestionale.movimenti.service.MovimentiService;
 import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
 import com.agostinelli.gestionale.shared.dto.PagedResponse;
 import io.quarkus.cache.CacheInvalidateAll;
+import io.quarkus.cache.CacheResult;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
@@ -47,6 +48,8 @@ public class ImportTriageService {
     @Inject MovimentoMappingEngineImpl mappingEngine;
 
     // ── KPI (§13) ────────────────────────────────────────────────────────────────
+    // 4 aggregazioni full-table: cache (TTL 2m) invalidata dai mutator di import.
+    @CacheResult(cacheName = "import-kpi")
     public ImportKpiDTO getKpi() {
         Object[] s = (Object[]) em.createNativeQuery(
                 "SELECT COALESCE(SUM(righe_totali),0), COALESCE(SUM(righe_importate),0), " +
@@ -245,6 +248,7 @@ public class ImportTriageService {
     @CacheInvalidateAll(cacheName = "dashboard-kpi")
     @CacheInvalidateAll(cacheName = "dashboard-andamento")
     @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
     @Transactional
     public void classificaTransitorio(UUID movimentoId, ClassificaTransitorioRequest req) {
         Movimento m = em.find(Movimento.class, movimentoId);
@@ -340,6 +344,7 @@ public class ImportTriageService {
     @CacheInvalidateAll(cacheName = "dashboard-kpi")
     @CacheInvalidateAll(cacheName = "dashboard-andamento")
     @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
     @Transactional
     public void risolviEvento(UUID eventoParkId, RisolviEventoRequest req, UUID userId) {
         List<Object[]> found = em.createNativeQuery(

@@ -50,6 +50,7 @@ public class MovimentoImportService {
     @CacheInvalidateAll(cacheName = "dashboard-kpi")
     @CacheInvalidateAll(cacheName = "dashboard-andamento")
     @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
     @Transactional
     public EtlImportResponse importFile(InputStream file, String filename, String fonteStr, UUID userId) {
         ImportStrategy strategy = strategyFactory.get(fonteStr);
@@ -139,6 +140,7 @@ public class MovimentoImportService {
     @CacheInvalidateAll(cacheName = "dashboard-kpi")
     @CacheInvalidateAll(cacheName = "dashboard-andamento")
     @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
     @Transactional
     public Map<String, Object> rollbackImport(UUID importLogId) {
         long esiste = ((Number) em.createNativeQuery(

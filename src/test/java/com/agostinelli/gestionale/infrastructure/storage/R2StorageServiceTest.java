@@ -21,13 +21,12 @@ class R2StorageServiceTest {
     private final UUID eventoId = UUID.randomUUID();
 
     @Test
-    void uploadMenuPdf_mimeNonPdf_lancia400() {
+    void uploadMenu_tipoNonValido_lancia400() {
         InputStream in = new ByteArrayInputStream(new byte[]{1, 2, 3});
         ApiException ex = assertThrows(ApiException.class, () ->
-                service.uploadMenuPdf(eventoId, in, 3,
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"));
+                service.uploadMenuPdf(eventoId, in, 3, "text/plain"));
         assertEquals(Response.Status.BAD_REQUEST, ex.getHttpStatus());
-        assertEquals("FILE_NON_PDF", ex.getCode());
+        assertEquals("TIPO_FILE_NON_VALIDO", ex.getCode());
     }
 
     @Test

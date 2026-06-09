@@ -63,6 +63,34 @@ public class MovimentiService {
     }
 
     /**
+     * Crea un movimento proveniente dall'ETL (Billy / BPM / CA). I movimenti import
+     * sono SEMPRE liquidati (dataFinanziaria valorizzata = dataMovimento, stato REGISTRATO).
+     *
+     * Differenze rispetto a {@link #createMovimento}:
+     *  - NESSUN @CacheInvalidateAll: l'invalidazione cache e il refresh MV vengono fatti
+     *    una sola volta dal MovimentoImportService al termine del loop (non per riga);
+     *  - collega il movimento all'import_log tramite fonteImportazioneId.
+     *
+     * Riusa la stessa validateCrossFields e il mapper di createMovimento.
+     */
+    @Transactional
+    public MovimentoDTO createMovimentoImport(MovimentoCreateRequest req, UUID userId, UUID importLogId) {
+        validateCrossFields(req);
+
+        Movimento m = mapper.fromRequest(req);
+        m.createdBy = userId;
+        m.fonte = req.fonte() != null ? req.fonte() : "MANUALE";
+        m.fonteImportazioneId = importLogId;
+        m.stato = "REGISTRATO";
+        m.dataLiquidita = req.dataFinanziaria();
+
+        applyDerivedAmounts(m, req.importoLordo(), req.aliquotaIva());
+
+        repo.persist(m);
+        return mapper.toDTO(m);
+    }
+
+    /**
      * Aggiorna parzialmente un movimento (PATCH semantics).
      * Solo l'autore originale o un ADMIN possono modificare.
      *
@@ -105,10 +133,10 @@ public class MovimentiService {
         validateConsistency(m);
 
         // Sincronizza stato e scadenzaFinanziaria in base alla presenza di dataFinanziaria
-        if (m.dataFinanziaria != null && !"ANNULLATO".equals(m.stato) && !"RICONCILIATO".equals(m.stato)) {
+        if (m.dataFinanziaria != null && !"ANNULLATO".equals(m.stato)) {
             m.stato = "REGISTRATO";
             m.dataLiquidita = m.dataFinanziaria;
-        } else if (m.dataFinanziaria == null && !"ANNULLATO".equals(m.stato) && !"RICONCILIATO".equals(m.stato)) {
+        } else if (m.dataFinanziaria == null && !"ANNULLATO".equals(m.stato)) {
             m.stato = "DA_LIQUIDARE";
         }
 

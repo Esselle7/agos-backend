@@ -1029,21 +1029,27 @@ class ReportingIntegrationTest {
     @Test
     @Order(119)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportMovimentiXLSX_conDatiV27_fileNonVuoto() {
-        // Verifica che con dati reali l'XLSX abbia almeno intestazione + 1 riga dati.
-        // Periodo aggiornato a maggio 2026: V26 ha cancellato i seed V9 di marzo;
-        // V27 inserisce movimenti a partire da maggio 2026.
-        byte[] bytes = given()
-            .queryParam("from", "2026-05-01")
-            .queryParam("to", "2026-05-31")
+    void exportMovimentiXLSX_conDati_fileNonVuoto() {
+        // V27 (dati maggio 2026) vive in db/seed/dev e NON è caricato in %test. Ci
+        // appoggiamo quindi ai 93 movimenti reali seminati dalla migration V38
+        // (gen–apr 2026), presenti in ogni profilo. Asserzione senza soglia "magica":
+        // l'export del range con dati dev'essere più grande di un mese senza movimenti.
+        byte[] conDati = exportMovimentiXlsx("2026-01-01", "2026-04-30");
+        byte[] vuoto   = exportMovimentiXlsx("2030-01-01", "2030-01-31");
+
+        assertTrue(conDati.length > vuoto.length,
+            "L'XLSX con i movimenti V38 (gen–apr 2026) deve essere più grande dell'export " +
+            "di un mese vuoto: " + conDati.length + " vs " + vuoto.length + " byte");
+    }
+
+    private byte[] exportMovimentiXlsx(String from, String to) {
+        return given()
+            .queryParam("from", from)
+            .queryParam("to", to)
             .queryParam("format", "xlsx")
             .when().get("/api/reporting/export/movimenti")
             .then().statusCode(200)
             .extract().asByteArray();
-
-        // Un XLSX con dati reali ha dimensione significativa (almeno 5 KB)
-        assertTrue(bytes.length > 5000,
-            "L'XLSX con dati V27 maggio 2026 deve avere dimensione > 5 KB, trovato: " + bytes.length + " byte");
     }
 
     // ═══════════════════════════════════════════════════════════

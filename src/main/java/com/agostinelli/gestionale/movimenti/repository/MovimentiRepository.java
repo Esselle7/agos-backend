@@ -143,11 +143,6 @@ public class MovimentiRepository implements PanacheRepositoryBase<Movimento, UUI
         return new HashSet<>(refs);
     }
 
-    /** Movimenti non riconciliati da estratto conto bancario (per riconciliazione manuale). */
-    public List<Movimento> findNonRiconciliatiDaBanca() {
-        return list("stato = 'REGISTRATO' AND fonte = 'IMPORT_BANCA'");
-    }
-
     /**
      * Aggregazione per stato e tipo, stessi filtri opzionali del findWithFilters.
      * Restituisce righe [stato, tipo, SUM(importo), COUNT(*)].

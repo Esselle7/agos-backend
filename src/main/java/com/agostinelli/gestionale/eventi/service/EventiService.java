@@ -168,12 +168,15 @@ public class EventiService {
         repo.delete(e);
     }
 
-    // ── MENU PDF ──────────────────────────────────────────────────────────────
+    // ── MENU (PDF / Word) ─────────────────────────────────────────────────────
+
+    /** Risultato di {@link #getMenuStream}: stream + metadati HTTP per la risposta. */
+    public record MenuResult(InputStream stream, String mimeType, String filename) {}
 
     /**
-     * Carica il menu PDF su R2 e salva l'URL pubblica sull'evento.
+     * Carica il menu (PDF o Word) su R2 e salva l'URL pubblica sull'evento.
      * Lancia 404 se l'evento non esiste, 400 (da {@link R2StorageService})
-     * se il file non è un PDF valido o supera 10 MB.
+     * se il tipo file non è supportato o la size supera 10 MB.
      */
     @Transactional
     public String uploadMenuPdf(UUID eventoId, java.io.InputStream content, long size, String mimeType) {
@@ -184,24 +187,34 @@ public class EventiService {
     }
 
     /**
-     * Apre un InputStream sul menu PDF dell'evento letto direttamente da R2.
-     * Lancia 404 se l'evento non esiste o non ha un PDF caricato.
+     * Apre un InputStream sul menu dell'evento letto direttamente da R2.
+     * Ritorna anche il mimeType e il filename corretti per l'header HTTP.
+     * Lancia 404 se l'evento non esiste o non ha un file caricato.
      */
     @Transactional(Transactional.TxType.REQUIRED)
-    public InputStream getMenuPdfStream(UUID eventoId) {
+    public MenuResult getMenuStream(UUID eventoId) {
         Evento e = findOrThrow(eventoId);
         if (e.menuPdfUrl == null) {
-            throw new ApiException(Response.Status.NOT_FOUND, "MENU_PDF_NON_TROVATO",
-                    "Nessun menu PDF per questo evento");
+            throw new ApiException(Response.Status.NOT_FOUND, "MENU_NON_TROVATO",
+                    "Nessun menu caricato per questo evento");
         }
-        return r2Storage.getMenuPdf(eventoId);
+        InputStream stream = r2Storage.getMenuPdf(e.menuPdfUrl);
+        String ext      = e.menuPdfUrl.substring(e.menuPdfUrl.lastIndexOf('.') + 1);
+        String mimeType = switch (ext) {
+            case "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+            case "doc"  -> "application/msword";
+            default     -> "application/pdf";
+        };
+        return new MenuResult(stream, mimeType, "menu." + ext);
     }
 
-    /** Rimuove il menu PDF da R2 e azzera l'URL sull'evento (404 se non esiste). */
+    /** Rimuove il menu da R2 e azzera l'URL sull'evento (404 se l'evento non esiste). */
     @Transactional
     public void deleteMenuPdf(UUID eventoId) {
         Evento e = findOrThrow(eventoId);
-        r2Storage.deleteMenuPdf(eventoId);
+        if (e.menuPdfUrl != null) {
+            r2Storage.deleteMenuPdf(e.menuPdfUrl);
+        }
         e.menuPdfUrl = null;
     }
 

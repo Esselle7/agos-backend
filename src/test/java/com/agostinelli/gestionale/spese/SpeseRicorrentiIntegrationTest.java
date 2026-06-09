@@ -1205,9 +1205,15 @@ class SpeseRicorrentiIntegrationTest {
         // Refresh MV per includere i nuovi movimenti
         txHelper.refreshPlMv();
 
-        // Query P&L per maggio 2026 (mese del pagamento = mese corrente in test)
+        // Query P&L sul MESE CORRENTE: il pagamento di una rata FINANZIAMENTO usa
+        // LocalDate.now() come data del movimento (RecurringExpenseService#pagaRata),
+        // quindi il range deve seguire l'orologio, non una data hardcoded (altrimenti
+        // il test diventa un time-bomb che passa solo nel mese in cui fu scritto).
+        java.time.LocalDate oggi = java.time.LocalDate.now();
+        String from = oggi.withDayOfMonth(1).toString();
+        String to   = oggi.withDayOfMonth(oggi.lengthOfMonth()).toString();
         io.restassured.path.json.JsonPath jp = given()
-            .when().get("/api/reporting/pl/tutte-bu?from=2026-05-01&to=2026-05-31")
+            .when().get("/api/reporting/pl/tutte-bu?from=" + from + "&to=" + to)
             .then().statusCode(200).extract().jsonPath();
 
         double oneriFinanziari = jp.getDouble("totaleConsolidato.oneriFinanziari");

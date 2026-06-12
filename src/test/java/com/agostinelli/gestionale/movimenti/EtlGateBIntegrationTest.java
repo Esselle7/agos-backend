@@ -100,6 +100,19 @@ class EtlGateBIntegrationTest {
         assertTrue(importedOnCoge(bpm.importLogId(), "90.02.001") >= 1,
                 "I versamenti soci devono finire su 90.02.001");
 
+        // ── Regressione: evento con keyword debole + data TESTUALE su bonifico estero ──
+        // "...patrizia casolari . acconto festa 7 marzo 2026": niente "BON.DA" (ordinante
+        // non estratto) e data a parole. Deve comunque essere parcheggiato come ACCONTO,
+        // non finire nei transitori. (Gate B → contesto evento via data testuale.)
+        long casolari = ((Number) em.createNativeQuery(
+                        "SELECT count(*) FROM eventi_da_riconciliare " +
+                        "WHERE descrizione_norm LIKE '%CASOLARI%' " +
+                        "AND tipo_evento_presunto = 'ACCONTO' " +
+                        "AND data_evento_estratta = DATE '2026-03-07'")
+                .getSingleResult()).longValue();
+        assertEquals(1, casolari,
+                "L'acconto festa Casolari (data testuale '7 marzo 2026') deve essere parcheggiato come ACCONTO con data 2026-03-07");
+
         // ── Dedup cross-sorgente: nessuna chiave_aggancio duplicata in coda ──
         long chiaviDuplicate = ((Number) em.createNativeQuery(
                         "SELECT count(*) FROM (SELECT chiave_aggancio FROM eventi_da_riconciliare " +

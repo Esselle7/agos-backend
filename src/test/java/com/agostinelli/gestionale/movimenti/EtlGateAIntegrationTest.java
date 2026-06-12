@@ -101,6 +101,17 @@ class EtlGateAIntegrationTest {
         // Stripe NON è POS: resta un ricavo importato (il tag Alveare arriva in F3).
         assertTrue(importedWithDesc(logId, "%STRIPE%") >= 1,
                 "Gli incassi Stripe restano movimenti (non sono POS)");
+
+        // Regressione: i payout Satispay sono SKIP_POS (duplicati di Billy), NON giroconti.
+        // La descrizione contiene "societa' agricola agostinelli" (beneficiario), ma il check
+        // Satispay precede quello del giroconto interno: niente più scarto come SKIP_GIROCONTO.
+        assertEquals(0, scartatiConDesc(logId, "SKIP_GIROCONTO", "%SATISPAY%"),
+                "Nessun Satispay deve essere scartato come giroconto");
+        assertEquals(3, scartatiConDesc(logId, "SKIP_POS", "%SATISPAY%"),
+                "I 3 payout Satispay devono essere SKIP_POS");
+        // I giroconti BPM restano solo quelli veri: 3 trasferimenti interni + 6 versamenti ATM (78A).
+        assertEquals(9, skipCount(logId, "SKIP_GIROCONTO"),
+                "Giroconti BPM = 3 trasferimenti interni + 6 versamenti contante ATM");
     }
 
     // ── Billy ───────────────────────────────────────────────────────────────────
@@ -129,6 +140,16 @@ class EtlGateAIntegrationTest {
                         "SELECT count(*) FROM import_scartati WHERE import_log_id = :id AND motivo = :m")
                 .setParameter("id", logId)
                 .setParameter("m", motivo)
+                .getSingleResult()).longValue();
+    }
+
+    long scartatiConDesc(UUID logId, String motivo, String like) {
+        return ((Number) em.createNativeQuery(
+                        "SELECT count(*) FROM import_scartati WHERE import_log_id = :id AND motivo = :m " +
+                        "AND upper(raw_data->>'DESCRIZIONE') LIKE :like")
+                .setParameter("id", logId)
+                .setParameter("m", motivo)
+                .setParameter("like", like)
                 .getSingleResult()).longValue();
     }
 

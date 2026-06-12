@@ -57,6 +57,15 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
     private static final Pattern EVENTO_DATE = Pattern.compile(
             "\\b(\\d{1,2})[/.](\\d{1,2})[/.](\\d{2,4})\\b");
 
+    // Data evento in forma testuale italiana: "7 MARZO 2026". I bonifici esteri/SEPA in
+    // entrata riportano spesso la causale per esteso (niente "BON.DA", data a parole),
+    // quindi senza questo riconoscimento il Gate B non aggancia il contesto evento.
+    private static final List<String> MESI_IT = List.of(
+            "GENNAIO", "FEBBRAIO", "MARZO", "APRILE", "MAGGIO", "GIUGNO",
+            "LUGLIO", "AGOSTO", "SETTEMBRE", "OTTOBRE", "NOVEMBRE", "DICEMBRE");
+    private static final Pattern EVENTO_DATE_TESTUALE = Pattern.compile(
+            "\\b(\\d{1,2})\\s+(" + String.join("|", MESI_IT) + ")\\s+(\\d{4})\\b");
+
     private volatile boolean loaded = false;
     private final Map<String, Integer> cogeByCode = new HashMap<>();
     private final Map<Integer, String> cogeCodeById = new HashMap<>(); // reverse, per log leggibili
@@ -191,16 +200,19 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
      * degli incassi POS e non contiene spese ricorrenti.
      */
     private MappingResult.MappingOutcome gateA(RawMovimento n, String sorgente) {
-        // A2 — giroconto interno (rilevato dal normalizzatore, simmetrico CA↔BPM)
-        if (n.girosalto() != null) return MappingResult.MappingOutcome.SKIP_GIROCONTO;
-
-        if (Sorgente.BILLY.equals(sorgente)) return null;
+        if (Sorgente.BILLY.equals(sorgente)) return null; // Billy non ha giroconti né POS duplicati
 
         String desc = n.descrizione() == null ? "" : n.descrizione();
         String causale = upperCausale(n);
 
-        // A1 — POS / Satispay (duplicati di Billy)
+        // A1 — POS / Satispay (duplicati di Billy). Il check Satispay precede il giroconto:
+        // il payout Satispay riporta in descrizione il beneficiario "SOCIETA AGRICOLA
+        // AGOSTINELLI", la stessa stringa che marca i trasferimenti interni; senza questa
+        // precedenza verrebbe scartato come SKIP_GIROCONTO invece che SKIP_POS.
         if (desc.contains("SATISPAY EUROPE")) return MappingResult.MappingOutcome.SKIP_POS;
+
+        // A2 — giroconto interno (rilevato dal normalizzatore, simmetrico CA↔BPM)
+        if (n.girosalto() != null) return MappingResult.MappingOutcome.SKIP_GIROCONTO;
         if (Sorgente.CA.equals(sorgente)) {
             if ("INCASSO TRAMITE POS".equals(causale)
                     || desc.contains("INCASSO POS") || desc.contains("NUMIA")
@@ -314,16 +326,29 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
     private LocalDate extractEventoDate(String descrizione) {
         if (descrizione == null) return null;
         Matcher m = EVENTO_DATE.matcher(descrizione);
-        if (!m.find()) return null;
-        try {
-            int d = Integer.parseInt(m.group(1));
-            int mo = Integer.parseInt(m.group(2));
-            int y = Integer.parseInt(m.group(3));
-            if (y < 100) y += 2000;
-            return LocalDate.of(y, mo, d);
-        } catch (Exception e) {
-            return null;
+        if (m.find()) {
+            try {
+                int d = Integer.parseInt(m.group(1));
+                int mo = Integer.parseInt(m.group(2));
+                int y = Integer.parseInt(m.group(3));
+                if (y < 100) y += 2000;
+                return LocalDate.of(y, mo, d);
+            } catch (Exception ignored) {
+                // formato numerico non valido (es. 32/13/2026): provo quello testuale
+            }
         }
+        Matcher mt = EVENTO_DATE_TESTUALE.matcher(descrizione);
+        if (mt.find()) {
+            try {
+                int d = Integer.parseInt(mt.group(1));
+                int mo = MESI_IT.indexOf(mt.group(2)) + 1;
+                int y = Integer.parseInt(mt.group(3));
+                return LocalDate.of(y, mo, d);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        return null;
     }
 
     // ── ENTRATE ────────────────────────────────────────────────────────────────

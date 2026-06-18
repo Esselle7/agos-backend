@@ -27,7 +27,16 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
     private static final DateTimeFormatter IT_DATE = DateTimeFormatter.ofPattern("dd/MM/yyyy");
     private static final Pattern STRIPE_DATE = Pattern.compile("PO(\\d{4})(\\d{2})(\\d{2})", Pattern.CASE_INSENSITIVE);
 
+    // Data reale dell'incasso POS, riportata nella descrizione banca come "... DEL gg/mm/aa[aa]".
+    // È diversa dalla data contabile dell'accredito (sfasata di 1-3 giorni) ed è la chiave di
+    // confronto preferita con lo scontrino Billy (REFACTOR-IMPORT-CONGIUNTO §FASE1).
+    private static final Pattern POS_DEL_DATE = Pattern.compile("\\bDEL\\s+(\\d{1,2})/(\\d{1,2})/(\\d{2,4})\\b");
+
     public static final String GIROCONTO_SKIP = "GIROCONTO_SKIP";
+
+    // Circuiti POS → banca di accredito (fact #2): il marcatore vive SOLO in descrizione banca.
+    public static final String CIRCUITO_NUMIA = "NUMIA"; // POS fisico Numia → Banco BPM
+    public static final String CIRCUITO_NEXI = "NEXI";   // app NFC Nexi → Crédit Agricole
 
     @Override
     public RawMovimento normalize(RawRow row) {
@@ -73,7 +82,8 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
                 canonicalAmount(c.get("ORTOFRUTTA_4")),
                 DescNormalizer.compact(descrizione), chiave,
                 DescNormalizer.extract(descrizione, Sorgente.BILLY),
-                row);
+                row,
+                null, null); // Billy non è una riga banca: nessun incasso/circuito POS
     }
 
     private Short contoFromBanca(String banca) {
@@ -101,42 +111,83 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
     private RawMovimento normalizeBpm(RawRow row) {
         var c = row.campi();
         LocalDate data = parseItDate(c.get("DATA_CONTABILE"));
-        BigDecimal importo = abs(parseEuroAmount(c.get("IMPORTO")));
+        // BPM ha UNA colonna Importo con segno: il segno determina entrata/uscita. (Prima era
+        // sempre ENTRATA: corretto solo perché le uscite erano comunque ambigue e non salvate.)
+        BigDecimal segnato = parseEuroAmount(c.get("IMPORTO"));
+        BigDecimal importo = abs(segnato);
+        String tipo = (segnato != null && segnato.signum() < 0) ? "USCITA" : "ENTRATA";
         String descrizione = clean(c.get("DESCRIZIONE"));
-        String causale = trimToEmpty(c.get("CAUSALE"));
+        String causale = trimToEmpty(c.get("CAUSALE")).toUpperCase();
 
-        String metodo = null;
+        String metodo = metodoBpm(causale);
+
+        // "RIMBORSO CARTA" condivide la causale POS (349) ma è uno STORNO, non una vendita: lo
+        // riportiamo a CARTA_DEBITO così non è un incasso POS (niente circuito, fuori dalla
+        // riconciliazione/aggregato-giorno e dalla vista "Incassi POS da ripartire", che filtra POS_*).
+        boolean rimborsoCarta = descrizione != null && descrizione.contains("RIMBORSO CARTA");
+        if (rimborsoCarta) metodo = "CARTA_DEBITO";
+
+        // Giroconti interni → scarto deterministico (non sono né incassi né costi reali).
         String girosalto = null;
-        if (causale.equalsIgnoreCase("480")) {
-            metodo = "BONIFICO";
-            if (descrizione != null && stripApostrophe(descrizione).contains("SOCIETA AGRICOLA AGOSTINELLI")) {
-                girosalto = GIROCONTO_SKIP; // trasferimento interno CA->BPM
-            }
-        } else if (causale.equalsIgnoreCase("090") || causale.equalsIgnoreCase("092")) {
-            metodo = "POS_BPM";
-        } else if (causale.equalsIgnoreCase("78A")) {
-            girosalto = GIROCONTO_SKIP; // versamento contante ATM
-        } else if (causale.equalsIgnoreCase("ZI0")) {
-            metodo = "BONIFICO";
-        } else if (causale.equalsIgnoreCase("349")) {
-            metodo = "POS_BPM";
+        if ("480".equals(causale) && descrizione != null
+                && stripApostrophe(descrizione).contains("SOCIETA AGRICOLA AGOSTINELLI")) {
+            girosalto = GIROCONTO_SKIP; // trasferimento interno CA → BPM
+        } else if ("78A".equals(causale)) {
+            girosalto = GIROCONTO_SKIP; // versamento contante ATM (no doppio conteggio cassa→banca)
         }
-        // causale sconosciuta -> metodo null -> CAUSALE_NON_MAPPATA nel mapping engine
 
         LocalDate dataCompetenza = extractStripeDate(descrizione);
 
+        // Incasso POS (Numia → BPM): solo entrate POS_BPM. Conserva circuito e data reale
+        // "DEL gg/mm/aa" per la riconciliazione con lo scontrino Billy.
+        String circuitoPos = null;
+        LocalDate dataIncassoPos = null;
+        if ("POS_BPM".equals(metodo) && "ENTRATA".equals(tipo)) { // RIMBORSO CARTA è già stato dirottato a CARTA_DEBITO
+            circuitoPos = CIRCUITO_NUMIA;
+            dataIncassoPos = extractPosDate(descrizione);
+        }
+
         String chiave = trimToEmpty(c.get("CHIAVE"));
-        String rif = rifBanca(chiave, importo, descrizione);
+        String rif = rifBanca(chiave, importo, descrizione, data, c.get("DATA_VALUTA"));
 
         return new RawMovimento(
                 row.riga(), "IMPORT_BANCA",
-                data, dataCompetenza, importo, "ENTRATA", descrizione,
+                data, dataCompetenza, importo, tipo, descrizione,
                 (short) 1, metodo, BigDecimal.ZERO, null,
                 rif, girosalto,
                 null, null, null, null,
                 DescNormalizer.compact(descrizione), chiave,
                 DescNormalizer.extract(descrizione, Sorgente.BPM),
-                row);
+                row,
+                dataIncassoPos, circuitoPos);
+    }
+
+    /**
+     * Mappa il codice causale BPM (codici interni della banca) al metodo di pagamento, così
+     * che la riga non resti {@code CAUSALE_NON_MAPPATA}. Criterio: il metodo riflette lo
+     * <b>strumento</b> con cui il denaro si è mosso (bonifico, carta, addebito…), NON la natura
+     * contabile — quella la deduce {@code classifyEntrata/Uscita} dal COGE. Vedi AMBIGUI-OVERVIEW.md.
+     *
+     * <p>Causali non previste → {@code null}: la riga resta in revisione manuale, senza ipotesi
+     * azzardate (rete di sicurezza per codici nuovi/rari).
+     */
+    private String metodoBpm(String causale) {
+        return switch (causale) {
+            // ── INCASSI (accrediti, segno +) ──
+            case "480", "ZI0" -> "BONIFICO";        // bonifico in accredito (Stripe/Satispay/estero/generico)
+            case "090", "092", "349" -> "POS_BPM";  // incassi POS Numia (+ rimborso carta)
+            // ── PAGAMENTI (addebiti, segno −) ──
+            case "260" -> "BONIFICO";               // "vostra disposizione" = bonifico a fornitore
+            case "118" -> "CARTA_DEBITO";           // pagamento con carta di debito aziendale
+            case "50C", "110", "150", "174"         // addebiti SEPA: SDD B2B, utenze CBILL, rata mutuo, premi assicurativi
+                    -> "RID_SDDMANDAT";
+            case "310", "314" -> "RID_SDDMANDAT";   // effetti ritirati / RIBA (addebito a scadenza)
+            case "662", "660", "16H", "16I", "16G", "16X", "16Z", "18D", "195"
+                    -> "ADDEBITO_CONTO";            // commissioni, spese, competenze, interessi, imposta di bollo c/c
+            case "198" -> "F24";                    // tributi (I24 Agenzia Entrate)
+            // 78A (versamento ATM) → giroconto, il metodo non serve
+            default -> null;                        // causale sconosciuta → CAUSALE_NON_MAPPATA (rivedere a mano)
+        };
     }
 
     // ── CA ───────────────────────────────────────────────────────────────────
@@ -172,8 +223,17 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
             girosalto = GIROCONTO_SKIP;
         }
 
+        // Incasso POS (Nexi → CA): causale "INCASSO TRAMITE POS" (metodo POS_CA_NEXI).
+        // Conserva circuito e data reale "DEL gg/mm/aa" per la riconciliazione con Billy.
+        String circuitoPos = null;
+        LocalDate dataIncassoPos = null;
+        if ("POS_CA_NEXI".equals(metodo)) {
+            circuitoPos = CIRCUITO_NEXI;
+            dataIncassoPos = extractPosDate(descrizione);
+        }
+
         String chiave = trimToEmpty(c.get("CHIAVE"));
-        String rif = rifBanca(chiave, importo, descrizione);
+        String rif = rifBanca(chiave, importo, descrizione, data, c.get("DATA_VALUTA"));
 
         return new RawMovimento(
                 row.riga(), "IMPORT_BANCA",
@@ -183,7 +243,8 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
                 null, null, null, null,
                 DescNormalizer.compact(descrizione), chiave,
                 DescNormalizer.extract(descrizione, Sorgente.CA),
-                row);
+                row,
+                dataIncassoPos, circuitoPos);
     }
 
     private String metodoCa(String causale) {
@@ -192,6 +253,7 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
             case "INCASSO TRAMITE POS" -> "POS_CA_NEXI";
             case "GIROCONTO/BONIFICO", "DISPOSIZIONE DI PAGAMENTO" -> "BONIFICO";
             case "COMMISSIONI/SPESE", "PAGAMENTO UTENZE", "EFFETTI RITIRATI/RICHIAMATI" -> "RID_SDDMANDAT";
+            case "IMPOSTE E TASSE" -> "F24"; // tributi addebitati dal conto
             default -> null; // CAUSALE_NON_MAPPATA
         };
     }
@@ -253,6 +315,24 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
         return null;
     }
 
+    /** Data reale dell'incasso POS dalla descrizione ("... DEL gg/mm/aa"); null se assente. */
+    private LocalDate extractPosDate(String descrizione) {
+        if (descrizione == null) return null;
+        Matcher m = POS_DEL_DATE.matcher(descrizione);
+        if (m.find()) {
+            try {
+                int d = Integer.parseInt(m.group(1));
+                int mo = Integer.parseInt(m.group(2));
+                int y = Integer.parseInt(m.group(3));
+                if (y < 100) y += 2000;
+                return LocalDate.of(y, mo, d);
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
     private BigDecimal abs(BigDecimal v) {
         return v == null ? null : v.abs();
     }
@@ -288,15 +368,36 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
     }
 
     /**
-     * Riferimento esterno per la dedup delle righe banca.
-     * Il vecchio formato {@code chiave + descr[:30]} (CA) / {@code descr[:20]} (BPM)
-     * collassava righe diverse con stessa chiave/giorno (es. più "COMMISSIONI …"
-     * con primi 30 char identici). Si usa {@code chiave|importo|hash(descr)}:
-     * discriminante e deterministico tra reimport dello stesso file.
+     * Riferimento esterno per la dedup delle righe banca:
+     * {@code chiave|importo|hash(descr)|data}.
+     * <p>La <b>data</b> è parte della chiave (coerente con l'indice univoco DB
+     * {@code (fonte, riferimento_esterno, data_movimento)}): senza di essa gli addebiti
+     * ricorrenti con stesso importo e stessa descrizione ma date diverse (es. commissione
+     * SDD €1,00 mensile, rata mutuo) verrebbero erroneamente collassati come duplicati nel
+     * loop di import. Resta deterministico tra reimport dello stesso file (stessa data).
      */
-    private String rifBanca(String chiave, BigDecimal importo, String descrizione) {
+    private String rifBanca(String chiave, BigDecimal importo, String descrizione, LocalDate data, String dataValuta) {
         String imp = importo == null ? "" : importo.toPlainString();
         String d = descrizione == null ? "" : descrizione;
-        return chiave + "|" + imp + "|" + Integer.toHexString(d.hashCode());
+        String dt = data == null ? "" : data.toString();
+        String dv = dataValuta == null ? "" : dataValuta;
+        // SHA-256 della descrizione (anti-collisione) al posto del vecchio String.hashCode() che
+        // poteva fondere righe distinte; + data valuta per disambiguare stesso-importo/stesso-giorno.
+        return chiave + "|" + imp + "|" + sha256hex(d) + "|" + dt + "|" + dv;
+    }
+
+    /** SHA-256 esadecimale (primi 24 char): hash anti-collisione per la chiave di dedup banca. */
+    private String sha256hex(String s) {
+        try {
+            byte[] h = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(24);
+            for (int i = 0; i < 12; i++) {
+                sb.append(Character.forDigit((h[i] >> 4) & 0xF, 16)).append(Character.forDigit(h[i] & 0xF, 16));
+            }
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return Integer.toHexString(s.hashCode());
+        }
     }
 }

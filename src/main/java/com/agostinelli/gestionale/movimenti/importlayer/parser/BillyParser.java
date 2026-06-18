@@ -5,137 +5,97 @@ import com.agostinelli.gestionale.movimenti.importlayer.MovimentoParser;
 import com.agostinelli.gestionale.movimenti.importlayer.model.RawRow;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.core.Response;
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 
 import java.io.InputStream;
-import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Parser Billy (registratore di cassa). Legge un file Excel .xlsx tramite Apache POI.
- * Foglio "Corrispettivi" (index 0); processa SOLO le righe con Tipo='S' (scontrini reali);
- * le altre righe (Tipo null) sono aggregati/riepiloghi del foglio e vanno escluse.
+ * Parser Billy (registratore di cassa), header-driven: legge per nome di colonna
+ * sia l'export Excel "Corrispettivi" (con colonna {@code Tipo}: si tengono solo le
+ * righe scontrino {@code Tipo='S'}) sia il CSV "Elaborazione corrispettivi" (senza
+ * {@code Tipo}: si tengono le righe transazione, riconosciute dall'orario nella
+ * colonna {@code Data}, scartando preambolo, riepiloghi e seconda tabella).
  *
- * Le celle numeriche Excel (data, importi) vengono convertite in stringa canonica
- * (ISO date / toPlainString) e re-interpretate dal normalizzatore SENZA parseEuroAmount.
+ * Conversioni di formato delegate a {@link Valori} (data → ISO, importi → canonici)
+ * così che {@code normalizeBilly} resti invariato.
+ *
+ * <p><b>Limite noto del CSV corrispettivi</b>: non contiene la colonna {@code Banca},
+ * quindi l'attribuzione al conto bancario (BPM/CA/Cassa) non è derivabile e tali
+ * righe finiscono in revisione manuale. È un limite del dato esportato, non del parser.
  */
 @ApplicationScoped
 public class BillyParser implements MovimentoParser {
 
     public static final String SORGENTE_VALUE = "BILLY";
 
-    private static final int COL_DATA = 1;
-    private static final int COL_TIPO = 4;
-    private static final int COL_IMPORTO = 9;
+    private static final Set<String> ANCHORS = Set.of("Data", "Importo", "Agriturismo");
+    private static final String SHEET = "Corrispettivi";
+    /** Suffisso metodo pagamento nel CSV: "DCW2026/9201-1006 (E)" → E / C. */
+    private static final Pattern PAGAMENTO_SUFFISSO = Pattern.compile("\\(([CEce])\\)\\s*$");
 
     @Override
     public List<RawRow> parse(InputStream file) {
-        List<RawRow> rows = new ArrayList<>();
-        try (Workbook wb = new XSSFWorkbook(file)) {
-            Sheet sheet = wb.getSheetAt(0);
-            int rigaOut = 0;
-            for (Row row : sheet) {
-                if (row.getRowNum() == 0) continue; // header
+        try {
+            Tabella t = TabularReader.read(file, ANCHORS, SHEET);
+            boolean conTipo = t.haColonna("Tipo"); // export Excel completo vs CSV corrispettivi
 
-                // Filtro: solo Tipo='S'
-                String tipo = getCellString(row, COL_TIPO);
-                if (!"S".equals(tipo)) continue;
+            List<RawRow> rows = new ArrayList<>();
+            int rigaOut = 0;
+            for (Tabella.Riga r : t.righe()) {
+                String data = t.valore(r, "Data");
+
+                if (conTipo) {
+                    if (!"S".equals(t.valore(r, "Tipo"))) continue; // solo scontrini reali
+                } else {
+                    // CSV: solo righe transazione (orario presente); esclude riepiloghi e 2ª tabella
+                    if (!Valori.hasTime(data)) continue;
+                }
+
+                String numeroRaw = t.valore(r, "Numero"); // "Numero" | "Numero (Pagamento)"
+                String pagamento = t.valore(r, "Pagamento");
+                String numero = numeroRaw;
+                if (numeroRaw != null) {
+                    Matcher m = PAGAMENTO_SUFFISSO.matcher(numeroRaw);
+                    if (m.find()) {
+                        if (pagamento == null) pagamento = m.group(1).toUpperCase();
+                        numero = numeroRaw.substring(0, m.start()).trim();
+                    }
+                }
 
                 Map<String, String> campi = new LinkedHashMap<>();
                 campi.put(Sorgente.KEY, SORGENTE_VALUE);
-
-                campi.put("DATA_ORA", getCellString(row, 0));
-                campi.put("DATA", getDateString(row, COL_DATA));
-                campi.put("NOTE", getCellString(row, 2));
-                campi.put("CHIAVE", getCellString(row, 3));
-                campi.put("TIPO", tipo);
-                campi.put("NUMERO", getCellString(row, 5));
-                campi.put("BANCA", getCellString(row, 6));
-                campi.put("DESCRIZIONE", getCellString(row, 7));
-                campi.put("RIFERIMENTO", getCellString(row, 8));
-                campi.put("IMPORTO", getNumericString(row, COL_IMPORTO));
-                campi.put("PAGAMENTO", getCellString(row, 10));
-                campi.put("AGRITURISMO", getNumericString(row, 11));
-                campi.put("ALTRO", getNumericString(row, 12));
-                campi.put("CARNE_10", getNumericString(row, 13));
-                campi.put("PROD_TRASF_10", getNumericString(row, 14));
-                campi.put("ORTOFRUTTA_4", getNumericString(row, 15));
-                campi.put("IVA_4", getNumericString(row, 16));
-                campi.put("IVA_10", getNumericString(row, 17));
-                campi.put("CONTANTI", getNumericString(row, 18));
-                campi.put("ELETTRONICO", getNumericString(row, 19));
-                campi.put("NR_SERVIZI", getNumericString(row, 20));
-                campi.put("NR_BENI", getNumericString(row, 21));
-                campi.put("NR_FATTURA", getNumericString(row, 22));
-                campi.put("BUONI_PASTO", getNumericString(row, 23));
+                campi.put("DATA", Valori.toIso(data));
+                campi.put("NOTE", t.valore(r, "Note"));
+                campi.put("CHIAVE", t.valore(r, "Chiave Aggancio", "Chiave"));
+                campi.put("NUMERO", numero);
+                campi.put("BANCA", t.valore(r, "Banca"));
+                campi.put("DESCRIZIONE", t.valore(r, "Descrizione"));
+                campi.put("IMPORTO", Valori.toCanonicalNumber(t.valore(r, "Importo")));
+                campi.put("PAGAMENTO", pagamento);
+                campi.put("AGRITURISMO", Valori.toCanonicalNumber(t.valore(r, "Agriturismo")));
+                campi.put("ALTRO", Valori.toCanonicalNumber(t.valore(r, "Altro", "Altro No Agriturismo")));
+                campi.put("CARNE_10", Valori.toCanonicalNumber(t.valore(r, "Carne 10", "Carne")));
+                campi.put("ORTOFRUTTA_4", Valori.toCanonicalNumber(t.valore(r, "Ortofrutta 4", "Ortofrutta")));
+                // Categoria aggiuntiva del CSV corrispettivi (IVA 4%, accorpata a 30.03.002 in
+                // riconciliazione): serve al resolver mono-categoria dell'import congiunto.
+                campi.put("PRODOTTI_TRASFORMATI", Valori.toCanonicalNumber(t.valore(r, "Prodotti trasformati", "Trasformati")));
+                // "Servizi" (CSV corrispettivi, IVA 10%, ristorazione): serve al resolver mono-categoria.
+                campi.put("SERVIZI", Valori.toCanonicalNumber(t.valore(r, "Servizi")));
 
                 rows.add(new RawRow(++rigaOut, campi));
             }
+            return rows;
         } catch (ApiException e) {
             throw e;
         } catch (Exception e) {
             throw new ApiException(Response.Status.BAD_REQUEST, "BILLY_PARSE_ERROR",
-                    "Impossibile leggere il file Billy (.xlsx): " + e.getMessage());
+                    "Impossibile leggere il file Billy: " + e.getMessage());
         }
-        return rows;
-    }
-
-    /** Cella stringa robusta (gestisce celle numeriche/booleane/formula). */
-    private String getCellString(Row row, int idx) {
-        Cell cell = row.getCell(idx);
-        if (cell == null) return null;
-        return switch (cell.getCellType()) {
-            case STRING -> blankToNull(cell.getStringCellValue().trim());
-            case BOOLEAN -> String.valueOf(cell.getBooleanCellValue());
-            case NUMERIC -> {
-                if (DateUtil.isCellDateFormatted(cell)) {
-                    yield cell.getLocalDateTimeCellValue().toLocalDate().toString();
-                }
-                yield BigDecimal.valueOf(cell.getNumericCellValue()).toPlainString();
-            }
-            case FORMULA -> blankToNull(safeFormulaString(cell));
-            default -> null;
-        };
-    }
-
-    /** Data Excel (cella numerica formattata data) → ISO yyyy-MM-dd. */
-    private String getDateString(Row row, int idx) {
-        Cell cell = row.getCell(idx);
-        if (cell == null) return null;
-        if (cell.getCellType() == CellType.NUMERIC && DateUtil.isCellDateFormatted(cell)) {
-            return cell.getLocalDateTimeCellValue().toLocalDate().toString();
-        }
-        // fallback: già stringa
-        return getCellString(row, idx);
-    }
-
-    /** Cella numerica Excel → stringa canonica BigDecimal (NO parseEuroAmount). */
-    private String getNumericString(Row row, int idx) {
-        Cell cell = row.getCell(idx);
-        if (cell == null) return null;
-        if (cell.getCellType() == CellType.NUMERIC) {
-            return BigDecimal.valueOf(cell.getNumericCellValue()).toPlainString();
-        }
-        return getCellString(row, idx);
-    }
-
-    private String safeFormulaString(Cell cell) {
-        try {
-            return cell.getStringCellValue();
-        } catch (Exception e) {
-            try {
-                return BigDecimal.valueOf(cell.getNumericCellValue()).toPlainString();
-            } catch (Exception ignored) {
-                return null;
-            }
-        }
-    }
-
-    private String blankToNull(String s) {
-        return (s == null || s.isBlank()) ? null : s;
     }
 }

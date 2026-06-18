@@ -17,6 +17,6 @@ public record ClassificaAmbiguitaRequest(
         UUID eventoId,
         String tipoEventoMovimento,
         String nota,
-        boolean aggiungiRegola,   // se true: inserisce in fornitore_alias_matching
+        boolean apprendiKeyword,  // se true: estrae firme IDENTITA dalla descrizione → target scelto
         boolean scarta            // se true: marca SCARTATO senza creare movimento
 ) {}

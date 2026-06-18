@@ -233,7 +233,7 @@ class LookupEndpointsIntegrationTest {
             .then()
                 .statusCode(200)
                 .contentType(ContentType.JSON)
-                .body("$", hasSize(10));
+                .body("$", hasSize(12));
     }
 
     @Test
@@ -322,7 +322,7 @@ class LookupEndpointsIntegrationTest {
             .when().get("/api/metodi-pagamento")
             .then()
                 .statusCode(200)
-                .body("$", hasSize(10));
+                .body("$", hasSize(12));
     }
 
     @Test

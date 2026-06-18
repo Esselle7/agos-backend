@@ -1029,17 +1029,37 @@ class ReportingIntegrationTest {
     @Test
     @Order(119)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportMovimentiXLSX_conDati_fileNonVuoto() {
-        // V27 (dati maggio 2026) vive in db/seed/dev e NON è caricato in %test. Ci
-        // appoggiamo quindi ai 93 movimenti reali seminati dalla migration V38
-        // (gen–apr 2026), presenti in ogni profilo. Asserzione senza soglia "magica":
-        // l'export del range con dati dev'essere più grande di un mese senza movimenti.
+    void exportMovimentiXLSX_conDati_fileNonVuoto() throws Exception {
+        // I dati demo (vecchia migration V38) non esistono più dopo la consolidazione delle
+        // migration (V1–V4, nessun INSERT INTO movimenti nei seed). Il test si auto-semina un
+        // movimento nel range gen–apr 2026 così da restare deterministico in ogni profilo.
+        seedMovimentoTest();
+
         byte[] conDati = exportMovimentiXlsx("2026-01-01", "2026-04-30");
         byte[] vuoto   = exportMovimentiXlsx("2030-01-01", "2030-01-31");
 
         assertTrue(conDati.length > vuoto.length,
-            "L'XLSX con i movimenti V38 (gen–apr 2026) deve essere più grande dell'export " +
+            "L'XLSX con almeno un movimento (gen–apr 2026) deve essere più grande dell'export " +
             "di un mese vuoto: " + conDati.length + " vs " + vuoto.length + " byte");
+    }
+
+    /** Semina (idempotente) un movimento ENTRATA nel range gen–apr 2026 per l'export. */
+    private void seedMovimentoTest() throws Exception {
+        tx.begin();
+        em.createNativeQuery("DELETE FROM movimenti WHERE riferimento_esterno = 'TEST-REPORTING-EXPORT'")
+            .executeUpdate();
+        // conto_bancario_id e business_unit_id valorizzati: l'export fa INNER JOIN su entrambi.
+        em.createNativeQuery(
+                "INSERT INTO movimenti (id, data_movimento, tipo, importo_lordo, data_competenza, "
+                + "data_finanziaria, data_liquidita, conto_bancario_id, conto_coge_id, business_unit_id, "
+                + "fonte, riferimento_esterno, descrizione, created_by, stato) "
+                + "VALUES (gen_random_uuid(), DATE '2026-02-15', 'ENTRATA', 123.45, DATE '2026-02-15', "
+                + "DATE '2026-02-15', DATE '2026-02-15', 1, "
+                + "(SELECT id FROM piano_dei_conti_coge WHERE codice = '30.01.001'), 1, 'MANUALE', "
+                + "'TEST-REPORTING-EXPORT', 'Movimento di test per export', CAST(:u AS uuid), 'REGISTRATO')")
+            .setParameter("u", TEST_USER)
+            .executeUpdate();
+        tx.commit();
     }
 
     private byte[] exportMovimentiXlsx(String from, String to) {

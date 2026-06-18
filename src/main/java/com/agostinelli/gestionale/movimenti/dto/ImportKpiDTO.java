@@ -15,5 +15,11 @@ public record ImportKpiDTO(
         long movimentiTransitori,
         BigDecimal saldoTransitori,
         double tassoAmbiguitaPct,
-        double coperturaFornitoriPct
+        double coperturaFornitoriPct,
+        // Split del transitorio: il "saldo" è una somma LORDA entrate+uscite (non un saldo netto),
+        // quindi si espongono separati ricavi e costi da classificare, con i relativi conteggi.
+        long ricaviTransitoriCount,
+        BigDecimal ricaviDaClassificare,
+        long costiTransitoriCount,
+        BigDecimal costiDaClassificare
 ) {}

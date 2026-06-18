@@ -26,11 +26,18 @@ public class MovimentiResource {
 
     private static final int DEFAULT_SIZE = 20;
     private static final int MAX_SIZE = 100;
+    /**
+     * Cap più alto per le liste del centro di smistamento (transitori/eventi): sono code di
+     * lavorazione interne che vanno mostrate INTERE, non paginate a 100 (altrimenti restano
+     * righe non catalogabili dalla UI). Vedi ANALISI-IMPORT "troncamento lista transitori".
+     */
+    private static final int MAX_TRIAGE_SIZE = 2000;
 
     @Inject MovimentiService service;
     @Inject MovimentoImportService importService;
     @Inject ImportLogService importLogService;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.ImportTriageService triageService;
+    @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService keywordService;
 
     @GET
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
@@ -123,42 +130,29 @@ public class MovimentiResource {
         return service.bulkImport(req, userId);
     }
 
-    // ── Import ETL (Billy / BPM / CA) ─────────────────────────────────────────
+    // ── Import ETL CONGIUNTO (Billy + BPM + CA) ───────────────────────────────────────
+    // L'import single-file (billy/bpm/ca) è stato RIMOSSO (PROMPT-KEYWORD-LEARNING.md §4.9):
+    // si importa solo congiunto. Il metodo interno importFile resta per i test (non più REST).
 
+    /**
+     * Import ETL CONGIUNTO: i 3 file (Billy + BPM + CA) dello stesso periodo, OBBLIGATORI,
+     * caricati e riconciliati insieme (REFACTOR-IMPORT-CONGIUNTO). Una sola operazione di
+     * import (rollback atomico). Unica modalità di import disponibile.
+     */
     @POST
-    @Path("/import/billy")
+    @Path("/import/congiunto")
     @Consumes(MediaType.MULTIPART_FORM_DATA)
     @RolesAllowed("ADMIN")
-    public EtlImportResponse importBilly(
-            @RestForm("file") java.io.InputStream fileStream,
-            @RestForm("filename") String filename,
+    public EtlImportResponse importCongiunto(
+            @RestForm("billy") java.io.InputStream billy,
+            @RestForm("bpm") java.io.InputStream bpm,
+            @RestForm("ca") java.io.InputStream ca,
+            @RestForm("filenameBilly") String fnBilly,
+            @RestForm("filenameBpm") String fnBpm,
+            @RestForm("filenameCa") String fnCa,
             @Context SecurityContext ctx) {
         UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
-        return importService.importFile(fileStream, filename, "IMPORT_BILLY", userId);
-    }
-
-    @POST
-    @Path("/import/bpm")
-    @Consumes(MediaType.MULTIPART_FORM_DATA)
-    @RolesAllowed("ADMIN")
-    public EtlImportResponse importBpm(
-            @RestForm("file") java.io.InputStream fileStream,
-            @RestForm("filename") String filename,
-            @Context SecurityContext ctx) {
-        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
-        return importService.importFile(fileStream, filename, "IMPORT_BANCA_BPM", userId);
-    }
-
-    @POST
-    @Path("/import/ca")
-    @Consumes(MediaType.MULTIPART_FORM_DATA)
-    @RolesAllowed("ADMIN")
-    public EtlImportResponse importCa(
-            @RestForm("file") java.io.InputStream fileStream,
-            @RestForm("filename") String filename,
-            @Context SecurityContext ctx) {
-        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
-        return importService.importFile(fileStream, filename, "IMPORT_BANCA_CA", userId);
+        return importService.importCongiunto(billy, bpm, ca, fnBilly, fnBpm, fnCa, userId);
     }
 
     @DELETE
@@ -213,11 +207,10 @@ public class MovimentiResource {
     }
 
     @GET
-    @Path("/import/ambiguita/{id}/suggerimenti")
+    @Path("/import/eventi/analisi-duplicati")
     @RolesAllowed("ADMIN")
-    public List<com.agostinelli.gestionale.movimenti.dto.SuggerimentoControparteDTO> suggerimenti(
-            @PathParam("id") UUID id) {
-        return triageService.suggerimenti(id);
+    public com.agostinelli.gestionale.movimenti.dto.AnalisiDuplicatiDTO analisiDuplicati() {
+        return triageService.analisiDuplicati();
     }
 
     @GET
@@ -260,14 +253,7 @@ public class MovimentiResource {
             @QueryParam("tipo") String tipo,
             @QueryParam("page") @DefaultValue("0") int page,
             @QueryParam("size") @DefaultValue("20") int size) {
-        return triageService.listTransitori(tipo, page, Math.min(Math.max(size, 1), MAX_SIZE));
-    }
-
-    @GET
-    @Path("/import/transitori/{movimentoId}/suggerimenti")
-    @RolesAllowed("ADMIN")
-    public List<SuggerimentoControparteDTO> suggerimentiTransitorio(@PathParam("movimentoId") UUID movimentoId) {
-        return triageService.suggerimentiTransitorio(movimentoId);
+        return triageService.listTransitori(tipo, page, Math.min(Math.max(size, 1), MAX_TRIAGE_SIZE));
     }
 
     @PUT
@@ -289,7 +275,7 @@ public class MovimentiResource {
             @QueryParam("stato") @DefaultValue("DA_RICONCILIARE") String stato,
             @QueryParam("page") @DefaultValue("0") int page,
             @QueryParam("size") @DefaultValue("20") int size) {
-        return triageService.listEventi(stato, page, Math.min(Math.max(size, 1), MAX_SIZE));
+        return triageService.listEventi(stato, page, Math.min(Math.max(size, 1), MAX_TRIAGE_SIZE));
     }
 
     @PUT
@@ -301,6 +287,110 @@ public class MovimentiResource {
             @Context SecurityContext ctx) {
         UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
         triageService.risolviEvento(id, req, userId);
+        return Response.noContent().build();
+    }
+
+    // ── Parcheggio spese ricorrenti / finanziamenti (V9) ──────────────────────────────
+
+    @GET
+    @Path("/import/ricorrenti")
+    @RolesAllowed("ADMIN")
+    public PagedResponse<RicorrenteParcheggiataDTO> listRicorrenti(
+            @QueryParam("stato") @DefaultValue("DA_RICONCILIARE") String stato,
+            @QueryParam("page") @DefaultValue("0") int page,
+            @QueryParam("size") @DefaultValue("20") int size) {
+        return triageService.listRicorrenti(stato, page, Math.min(Math.max(size, 1), MAX_TRIAGE_SIZE));
+    }
+
+    @PUT
+    @Path("/import/ricorrenti/{id}/risolvi")
+    @RolesAllowed("ADMIN")
+    public Response risolviRicorrente(@PathParam("id") UUID id, RisolviRicorrenteRequest req,
+                                      @Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        triageService.risolviRicorrente(id, req, userId);
+        return Response.noContent().build();
+    }
+
+    // ── Vista Effetti / RiBa da catalogare (transitori filtrati) ──────────────────────
+
+    @GET
+    @Path("/import/transitori/riba")
+    @RolesAllowed("ADMIN")
+    public PagedResponse<TransitorioDTO> listRibaTransitori(
+            @QueryParam("page") @DefaultValue("0") int page,
+            @QueryParam("size") @DefaultValue("20") int size) {
+        return triageService.listRibaTransitori(page, Math.min(Math.max(size, 1), MAX_TRIAGE_SIZE));
+    }
+
+    // ── Pannello di quadratura di periodo (sostituisce "Incassi POS da ripartire") ──────
+    // PROMPT-RICONCILIAZIONE-PERIODO §5: i ricavi POS nascono da Billy; qui si mostra solo il
+    // controllo di quadratura Σ Billy ↔ Σ POS banca dell'ultimo import congiunto (o di un import
+    // specifico via ?importLogId=). Restituisce 204 se non c'è ancora nessuna quadratura.
+    @GET
+    @Path("/import/quadratura")
+    @RolesAllowed("ADMIN")
+    public Response getQuadratura(@QueryParam("importLogId") UUID importLogId) {
+        QuadraturaPeriodoDTO q = triageService.getQuadratura(importLogId);
+        return q == null ? Response.noContent().build() : Response.ok(q).build();
+    }
+
+    // ── Gestione Keyword (pagina dedicata, PROMPT-KEYWORD-LEARNING.md §4.8) ──────────────
+
+    @GET
+    @Path("/keyword")
+    @RolesAllowed("ADMIN")
+    public List<KeywordFirmaDTO> listKeyword(@QueryParam("natura") String natura,
+                                             @QueryParam("stato") String stato) {
+        return keywordService.listFirme(natura, stato);
+    }
+
+    @POST
+    @Path("/keyword")
+    @RolesAllowed("ADMIN")
+    public Response createKeyword(@Valid KeywordFirmaDTO d) {
+        UUID id = keywordService.createFirma(d);
+        return Response.status(Response.Status.CREATED).entity(java.util.Map.of("id", id)).build();
+    }
+
+    @PUT
+    @Path("/keyword/{id}")
+    @RolesAllowed("ADMIN")
+    public Response updateKeyword(@PathParam("id") UUID id, @Valid KeywordFirmaDTO d) {
+        keywordService.updateFirma(id, d);
+        return Response.noContent().build();
+    }
+
+    @DELETE
+    @Path("/keyword/{id}")
+    @RolesAllowed("ADMIN")
+    public Response deleteKeyword(@PathParam("id") UUID id) {
+        keywordService.deleteFirma(id);
+        return Response.noContent().build();
+    }
+
+    @POST
+    @Path("/keyword/anteprima")
+    @RolesAllowed("ADMIN")
+    public KeywordAnteprimaDTO anteprimaKeyword(KeywordAnteprimaRequest req) {
+        return keywordService.anteprima(req.descrizione(), req.sorgente());
+    }
+
+    @GET
+    @Path("/keyword/conflitti")
+    @RolesAllowed("ADMIN")
+    public List<KeywordConflittoDTO> listConflittiKeyword(@QueryParam("stato") String stato) {
+        return keywordService.listConflitti(stato);
+    }
+
+    @PUT
+    @Path("/keyword/conflitti/{id}/risolvi")
+    @RolesAllowed("ADMIN")
+    public Response risolviConflittoKeyword(@PathParam("id") UUID id,
+                                            RisolviConflittoKeywordRequest req,
+                                            @Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        keywordService.risolviConflitto(id, req, userId);
         return Response.noContent().build();
     }
 }

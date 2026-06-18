@@ -15,5 +15,13 @@ public record EtlImportResponse(
         int ambigui,
         int scartati,
         int parcheggiati,
-        List<EtlRowError> errori
+        int ricorrenti,   // spese ricorrenti/finanziamenti parcheggiate (solo flusso congiunto)
+        List<EtlRowError> errori,
+        /**
+         * Avvisi NON bloccanti (≠ errori): scontrini Billy elettronici non agganciati a un
+         * accredito banca. Il {@code messaggio} è prefissato dalla natura dell'orfano:
+         * {@code EVENTO_ATTESO:…} (incasso-evento agriturismo: il ricavo arriva dal bonifico
+         * parcheggiato) oppure {@code SPACCIO_DA_VERIFICARE:…} (incasso spaccio non riconciliato).
+         */
+        List<EtlRowError> avvisi
 ) {}

@@ -5,7 +5,10 @@ import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
 import com.agostinelli.gestionale.movimenti.importlayer.model.MappingResult;
 import com.agostinelli.gestionale.movimenti.importlayer.model.ParkEvento;
 import com.agostinelli.gestionale.movimenti.importlayer.model.RawMovimento;
+import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordClassificazioneEngine;
 import com.agostinelli.gestionale.movimenti.importlayer.parser.Sorgente;
+import com.agostinelli.gestionale.movimenti.importlayer.reconcile.DettagliBilly;
+import com.agostinelli.gestionale.movimenti.importlayer.reconcile.RawMovimentoArricchito;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
@@ -27,6 +30,7 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
 
     @Inject EntityManager em;
     @Inject RegoleClassificazioneEngine regoleEngine;
+    @Inject KeywordClassificazioneEngine keywordEngine;
 
     // COGE per codice (mai hardcodare l'ID)
     private static final String COGE_CARNE_10 = "30.03.001";
@@ -45,13 +49,9 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
     private static final BigDecimal IVA_04 = new BigDecimal("0.04");
     private static final BigDecimal IVA_00 = new BigDecimal("0.00");
 
-    // Gate B — keyword evento (ETL v2 §5), cercate sulla vista COMPACT.
-    private static final String[] EVENTO_FORTI = {
-            "MATRIMONIO", "BATTESIMO", "CRESIMA", "COMUNIONE", "COMPLEANNO", "ANNIVERSARIO",
-            "CERIMONIA", "DICIOTTESIMO", "18ESIMO", "18ANNI", "GENDER", "LAUREA",
-            "AFFITTOSALA", "CAPARRA"
-    };
-    private static final String[] EVENTO_DEBOLI = { "ACCONTO", "SALDO", "AFFITTO", "EVENTO", "FESTA" };
+    // Gate B — keyword evento (ETL v2 §5), cercate sulla vista COMPACT. Le liste FORTE/DEBOLE
+    // NON sono più hardcoded: provengono dalle firme DOMINIO azione=PARK_EVENTO (editabili da UI)
+    // via KeywordClassificazioneEngine. Vedi PROMPT-KEYWORD-LEARNING.md §3.2/§4.3.
 
     // Data evento best-effort: prima occorrenza gg/mm/aaaa (o gg.mm.aaaa) nella descrizione.
     private static final Pattern EVENTO_DATE = Pattern.compile(
@@ -71,15 +71,9 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
     private final Map<Integer, String> cogeCodeById = new HashMap<>(); // reverse, per log leggibili
     private final Map<String, Integer> metodiByCode = new HashMap<>();
     private final List<AliasRule> aliasRules = new ArrayList<>();
-    // Rubrica controparti (§7): IBAN forte + lista per match a token sul nome normalizzato.
-    private final Map<String, Controparte> contropartiByIban = new HashMap<>();
-    private final List<Controparte> contropartiList = new ArrayList<>();
 
     private record AliasRule(String pattern, String matchType, UUID fornitoreId,
                              Integer cogeDefaultId, Short buDefaultId) {}
-
-    private record Controparte(String iban, String nomeNorm, UUID fornitoreId,
-                               Integer cogeDefaultId, Short buDefaultId) {}
 
     /** Esito intermedio della classificazione contabile. */
     private static final class Classify {
@@ -93,6 +87,7 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
         String descrizioneOverride; // es. tag Alveare "[ALVEARE] …"
         String note;                // es. "Incasso Alveare (Stripe)"
         String motivo;              // se valorizzato → AMBIGUOUS
+        String keywordConflittoSig; // se valorizzato → conflitto keyword di MATCH (riga su transitorio)
     }
 
     @Override
@@ -181,10 +176,91 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
                 n.fonte(),
                 null                       // allegatoPath
         );
-        return MappingResult.success(req, n).withTrace(
+        MappingResult res = MappingResult.success(req, n).withTrace(
                 via + " → BOOK (coge=" + codeOf(cl.cogeId) + ", bu=" + cl.bu
                 + (cl.fornitoreId != null ? ", fornitore" : "")
+                + (cl.keywordConflittoSig != null ? ", KEYWORD_CONFLITTO" : "")
                 + (cl.descrizioneOverride != null ? ", tag ALVEARE" : "") + ")");
+        // Conflitto keyword di MATCH: la riga è booked sul transitorio; l'orchestratore registrerà
+        // il keyword_conflitto (la scrittura non avviene nel motore puro, §4.6).
+        return cl.keywordConflittoSig != null ? res.withKeywordConflitto(cl.keywordConflittoSig) : res;
+    }
+
+    // BU di default del transitorio ricavi (allineata al fallback di classifyEntrata).
+    private static final short BU_TRANSITORIO = 5;
+
+    /**
+     * Mapping dell'import congiunto a periodo (PROMPT-RICONCILIAZIONE-PERIODO §4). Qui le righe
+     * arricchite sono <b>scontrini Billy</b> già trasformati in ricavo dal
+     * {@link com.agostinelli.gestionale.movimenti.importlayer.reconcile.RiconciliazioneService}:
+     * categoria/COGE/BU/IVA da Billy, conto bancario (BPM/CA) dalla ripartizione di periodo, o
+     * Cassa per i contanti. Se la categoria Billy non è determinabile → transitorio ricavi
+     * 39.99.999 (triage "Da catalogare"). Le righe banca NON-POS (dettagli == null: costi, eventi,
+     * SDD, commissioni, Stripe, giroconti, Satispay) sono delegate al mapping AS-IS invariato.
+     */
+    public MappingResult map(RawMovimentoArricchito a) {
+        if (!a.isArricchito()) {
+            return map(a.banca()); // riga banca non-POS → pipeline single-file invariata
+        }
+        ensureLoaded();
+
+        RawMovimento n = a.banca();
+        DettagliBilly d = a.dettagli();
+
+        // Categoria da Billy se determinabile; altrimenti transitorio ricavi (→ triage "Da catalogare").
+        boolean categorizzato = d.cogeCodice() != null;
+        String cogeCodice = categorizzato ? d.cogeCodice() : COGE_RICAVI_DACLASS;
+        Short bu = categorizzato ? d.bu() : BU_TRANSITORIO;
+        BigDecimal aliquota = categorizzato ? d.aliquotaIva() : IVA_00;
+        Integer cogeId = coge(cogeCodice);
+
+        // Metodo e conto: assegnati dalla ripartizione (POS_BPM/POS_CA_NEXI/CONTANTI; conto 1/2/3).
+        String metodoCodice = d.metodoCodice();
+        Integer metodoId = metodoCodice == null ? null : metodiByCode.get(metodoCodice);
+        Short conto = d.contoBancarioId();
+
+        String motivo = validateArricchito(n, conto, metodoCodice, metodoId, cogeId, bu);
+        if (motivo != null) {
+            return MappingResult.ambiguous(motivo, n)
+                    .withTrace("CONGIUNTO " + d.esito() + " → AMBIGUOUS (validazione): " + motivo);
+        }
+
+        MovimentoCreateRequest req = new MovimentoCreateRequest(
+                n.tipo(),
+                n.importo(),
+                null,                      // importoLordo
+                aliquota,
+                n.dataMovimento(),         // = data vendita Billy
+                n.dataCompetenza(),
+                n.dataMovimento(),         // dataFinanziaria = dataMovimento (già liquidato)
+                null,
+                conto,
+                metodoId,
+                bu,
+                cogeId,
+                null, null, null, null,
+                n.descrizione(),
+                null,
+                n.riferimentoEsterno(),
+                n.fonte(),
+                null);
+        return MappingResult.success(req, n).withTrace(
+                "CONGIUNTO " + d.esito() + " → BOOK (coge=" + cogeCodice + ", bu=" + bu
+                + (categorizzato ? "" : ", TRANSITORIO") + ", conto=" + conto + ", metodo=" + metodoCodice + ")");
+    }
+
+    /** Validazione invarianti per le righe arricchite (conto/metodo risolti fuori dal Classify). */
+    private String validateArricchito(RawMovimento n, Short conto, String metodoCodice,
+                                      Integer metodoId, Integer cogeId, Short bu) {
+        if (n.importo() == null || n.importo().compareTo(BigDecimal.ZERO) <= 0) return "IMPORTO_NON_POSITIVO";
+        if (n.dataMovimento() == null) return "DATA_MANCANTE";
+        if (n.dataMovimento().isAfter(LocalDate.now())) return "DATA_FUTURA";
+        if (n.dataMovimento().isBefore(LocalDate.of(2023, 1, 1))) return "DATA_TROPPO_VECCHIA";
+        if (conto == null) return "BANCA_NON_IDENTIFICATA";
+        if (metodoId == null) return metodoCodice == null ? "METODO_NON_MAPPATO" : "METODO_NON_IDENTIFICATO";
+        if (cogeId == null) return "COGE_NON_DETERMINABILE";
+        if (bu == null) return "BU_AMBIGUA";
+        return null;
     }
 
     /** Codice COGE da id (per i log leggibili). */
@@ -272,10 +348,13 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
         boolean fatturaCtx = spaced.contains("FATTURA") || spaced.contains("FATT")
                 || spaced.contains("DOCUM") || spaced.contains("NOTA CREDITO");
 
+        java.util.Set<String> forti = keywordEngine.eventiForti();
+        java.util.Set<String> deboli = keywordEngine.eventiDeboli();
+
         if (Sorgente.BILLY.equals(sorgente)) {
             if (!positive(n.billyAgriturismo())) {
                 // Billy non-agri: parcheggia solo su keyword evento esplicita (forte)
-                return (!fatturaCtx && containsAny(compact, EVENTO_FORTI)) ? buildPark(spaced, compact) : null;
+                return (!fatturaCtx && containsAny(compact, forti)) ? buildPark(spaced, compact) : null;
             }
             // Agriturismo>0: evento salvo carve-out (gestiti in classifyEntrata)
             if (isPosIncasso(spaced) || "SATISPAY".equals(n.metodoPagamentoCodice())) return null;
@@ -285,8 +364,8 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
 
         // Banca (CA / BPM)
         if (fatturaCtx) return null;
-        if (containsAny(compact, EVENTO_FORTI)) return buildPark(spaced, compact);
-        if (containsAny(compact, EVENTO_DEBOLI) && hasEventoContext(n)) return buildPark(spaced, compact);
+        if (containsAny(compact, forti)) return buildPark(spaced, compact);
+        if (containsAny(compact, deboli) && hasEventoContext(n)) return buildPark(spaced, compact);
         return null;
     }
 
@@ -303,7 +382,7 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
         else if (compact.contains("ACCONTO")) { tipo = "ACCONTO"; keyword = "ACCONTO"; }
         else if (compact.contains("AFFITTOSALA") || compact.contains("AFFITTO")) { tipo = "AFFITTO_SALA"; keyword = "AFFITTO"; }
         else if (compact.contains("SALDO")) { tipo = "SALDO"; keyword = "SALDO"; }
-        else { tipo = null; keyword = firstMatch(compact, EVENTO_FORTI); }
+        else { tipo = null; keyword = firstMatch(compact, keywordEngine.eventiForti()); }
         return new ParkEvento(tipo, keyword, extractEventoDate(spaced));
     }
 
@@ -313,12 +392,12 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
                 || spaced.contains("INCAS. TRAMITE P.O.S");
     }
 
-    private boolean containsAny(String s, String[] keys) {
+    private boolean containsAny(String s, java.util.Set<String> keys) {
         for (String k : keys) if (s.contains(k)) return true;
         return false;
     }
 
-    private String firstMatch(String s, String[] keys) {
+    private String firstMatch(String s, java.util.Set<String> keys) {
         for (String k : keys) if (s.contains(k)) return k;
         return null;
     }
@@ -408,6 +487,18 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
             cl.cogeId = coge(COGE_VERSAMENTO_SOCI); cl.bu = 5; cl.aliquota = IVA_00;
             return cl;
         }
+        // Rimborso/storno su carta (es. reso o chargeback): NON è un ricavo di vendita. Lo si lascia
+        // sul transitorio ricavi ma marcato, così l'operatore lo riconduce al costo originario.
+        // (Non è un incasso POS: il normalizzatore non gli assegna il circuito.)
+        if (desc.contains("RIMBORSO CARTA")) {
+            cl.cogeId = coge(COGE_RICAVI_DACLASS); cl.bu = 5; cl.aliquota = IVA_00;
+            cl.note = "Rimborso/storno su carta — da ricondurre al costo originario";
+            return cl;
+        }
+
+        // Keyword apprese (§4.6): consultate PRIMA del fallback. Match unico → target appreso;
+        // conflitto di MATCH → segnalato (cl.keywordConflittoSig) e riga lasciata al transitorio.
+        if (applyKeyword(cl, n, sorgente)) return cl;
 
         // Fornitore/COGE non bloccante (ETL v2 §6 C3): entrata non riconosciuta →
         // transitorio "Ricavi da classificare" + monitoraggio triage (niente più scarto).
@@ -415,11 +506,42 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
         return cl;
     }
 
+    /**
+     * Consulta il motore keyword (§4.6). Se una firma BOOK matcha senza conflitto valorizza
+     * coge/bu/fornitore e ritorna true (auto-catalogazione). In caso di conflitto di MATCH
+     * valorizza {@code cl.keywordConflittoSig} e ritorna false (la riga resta sul transitorio,
+     * l'orchestratore registra il conflitto). COGE per codice, come il resto del motore.
+     */
+    private boolean applyKeyword(Classify cl, RawMovimento n, String sorgente) {
+        var match = keywordEngine.classifica(n, sorgente);
+        if (match.isEmpty()) return false;
+        var m = match.get();
+        if (m.conflitto()) {
+            cl.keywordConflittoSig = m.signatureHash();
+            return false;
+        }
+        Integer cogeId = coge(m.cogeCodice());
+        if (cogeId == null || m.bu() == null) return false; // target non risolvibile → fallback
+        cl.cogeId = cogeId;
+        cl.bu = m.bu();
+        cl.fornitoreId = m.fornitoreId();
+        if ("ENTRATA".equals(n.tipo())) cl.aliquota = IVA_00;
+        return true;
+    }
+
     // ── USCITE (solo CA) ─────────────────────────────────────────────────────────
     private Classify classifyUscita(RawMovimento n, String sorgente) {
         Classify cl = new Classify();
         String desc = n.descrizione() == null ? "" : n.descrizione();
         String causale = upperCausale(n);
+
+        // Addebiti automatici di conto (commissioni, spese, competenze, interessi, bolli):
+        // il metodo ADDEBITO_CONTO è già il segnale univoco → spese bancarie 40.02.002.
+        if ("ADDEBITO_CONTO".equals(n.metodoPagamentoCodice())) {
+            cl.cogeId = coge(COGE_SPESE_BANCA);
+            cl.bu = 5;
+            return cl;
+        }
 
         boolean sdd = causale.contains("SDD") || "PAGAMENTO UTENZE".equals(causale);
         if (desc.contains("NEXI") && (sdd || "COMMISSIONI/SPESE".equals(causale))) {
@@ -440,19 +562,13 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
             return cl;
         }
 
-        // Rubrica controparti (§7.1): IBAN forte → token sul nome. Arricchisce il fornitore
-        // e, se la controparte ha COGE/BU di default, mappa direttamente.
-        Controparte cp = matchControparte(desc, n.entita());
-        if (cp != null) {
-            cl.fornitoreId = cp.fornitoreId();
-            if (cp.cogeDefaultId() != null && cp.buDefaultId() != null) {
-                cl.cogeId = cp.cogeDefaultId();
-                cl.bu = cp.buDefaultId();
-                return cl;
-            }
-        }
+        // Keyword apprese (§4.6): sostituiscono la vecchia rubrica controparti (IBAN). Consultate
+        // PRIMA del fallback transitorio. Match unico → target; conflitto → transitorio + segnale.
+        if (applyKeyword(cl, n, sorgente)) return cl;
+        if (cl.keywordConflittoSig != null) { cl.cogeId = coge(COGE_COSTI_DACLASS); cl.bu = 5; return cl; }
 
         // EFFETTI RITIRATI/RICHIAMATI (RIBA) e fallback: matching alias fornitore storico
+        // (fornitore_alias_matching, curato a mano in anagrafica — resta come ulteriore fonte, §2.2)
         AliasRule alias = matchAlias(desc);
         if (alias != null && alias.buDefaultId() != null && alias.cogeDefaultId() != null) {
             cl.cogeId = alias.cogeDefaultId();
@@ -529,10 +645,9 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
         cogeCodeById.clear();
         metodiByCode.clear();
         aliasRules.clear();
-        contropartiByIban.clear();
-        contropartiList.clear();
         loadLookups();
         regoleEngine.refresh();
+        keywordEngine.refresh();
         loaded = true;
     }
 
@@ -558,34 +673,8 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
             Short buDef = r[4] == null ? null : ((Number) r[4]).shortValue();
             aliasRules.add(new AliasRule(((String) r[0]).toUpperCase(), (String) r[1], fid, cogeDef, buDef));
         }
-        for (Object[] r : (List<Object[]>) em.createNativeQuery(
-                "SELECT iban, nome_normalizzato, fornitore_id, coge_default_id, bu_default_id FROM controparti")
-                .getResultList()) {
-            String iban = (String) r[0];
-            String nomeNorm = DescNormalizer.normalizeToken((String) r[1]);
-            UUID fid = r[2] == null ? null : (r[2] instanceof UUID u ? u : UUID.fromString(r[2].toString()));
-            Integer cogeDef = r[3] == null ? null : ((Number) r[3]).intValue();
-            Short buDef = r[4] == null ? null : ((Number) r[4]).shortValue();
-            Controparte c = new Controparte(iban, nomeNorm, fid, cogeDef, buDef);
-            if (iban != null && !iban.isBlank()) contropartiByIban.put(iban, c);
-            if (nomeNorm != null && nomeNorm.length() >= 4) contropartiList.add(c);
-        }
-    }
-
-    /**
-     * Matching controparte (§7.1): IBAN forte → token sul nome normalizzato.
-     * Il fuzzy (trigrammi) è riservato ai suggerimenti del triage (F6), non all'auto-book.
-     */
-    private Controparte matchControparte(String desc, EntitaEstratte ent) {
-        if (ent != null && ent.ibanControparte() != null) {
-            Controparte byIban = contropartiByIban.get(ent.ibanControparte());
-            if (byIban != null) return byIban;
-        }
-        String descNorm = DescNormalizer.normalizeToken(desc);
-        if (descNorm == null || descNorm.isBlank()) return null;
-        for (Controparte c : contropartiList) {
-            if (descNorm.contains(c.nomeNorm())) return c;
-        }
-        return null;
+        // La rubrica controparti (apprendimento per IBAN) è dismessa (tabella droppata in V7):
+        // l'auto-apprendimento ora è a keyword (KeywordClassificazioneEngine), ricaricato in
+        // refreshLookups() via keywordEngine.refresh().
     }
 }

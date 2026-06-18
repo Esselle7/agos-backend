@@ -5,74 +5,58 @@ import com.agostinelli.gestionale.movimenti.importlayer.MovimentoParser;
 import com.agostinelli.gestionale.movimenti.importlayer.model.RawRow;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.core.Response;
-import org.apache.commons.csv.CSVFormat;
-import org.apache.commons.csv.CSVParser;
-import org.apache.commons.csv.CSVRecord;
 
 import java.io.InputStream;
-import java.io.StringReader;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
- * Parser Banco BPM. CSV separatore ';', UTF-8, prima riga = header (saltata).
- * Line endings reali \r\r\n: normalizzati a \n prima del parse.
- * Header reale: Data contabile;Data valuta;CHECK;chiave;Importo;Divisa;Causale;Banca;Descrizione;Canale
- * Accesso per indice (robusto al case di "chiave" lowercase vs "Chiave").
+ * Parser Banco BPM, header-driven: legge per nome di colonna (non per posizione)
+ * sia il CSV nativo ("MovimentiCC OnLine": {@code Data contabile;Data valuta;Importo;
+ * Divisa;Causale;Descrizione;Canale}) sia eventuali export arricchiti/Excel con
+ * colonne extra (CHECK/chiave/Banca) o riordinate.
+ *
+ * Le colonne obbligatorie sono Data contabile, Importo, Causale; chiave (per la
+ * dedup) e le altre sono opzionali. La conversione di formato (data → dd/MM/yyyy,
+ * importo → italiano) è demandata a {@link Valori} così che il normalizzatore resti
+ * invariato.
  */
 @ApplicationScoped
 public class BancaBpmParser implements MovimentoParser {
 
+    private static final Set<String> ANCHORS = Set.of("Data contabile", "Importo", "Causale");
+
     @Override
     public List<RawRow> parse(InputStream file) {
-        List<RawRow> rows = new ArrayList<>();
         try {
-            String content = new String(file.readAllBytes(), StandardCharsets.UTF_8)
-                    .replace("\r\r\n", "\n");
-            CSVFormat fmt = CSVFormat.DEFAULT.builder().setDelimiter(';').build();
-            try (CSVParser parser = CSVParser.parse(new StringReader(content), fmt)) {
-                int rigaOut = 0;
-                boolean header = true;
-                for (CSVRecord rec : parser) {
-                    if (header) { header = false; continue; }
-                    if (rec.size() == 0 || isAllBlank(rec)) continue;
+            Tabella t = TabularReader.read(file, ANCHORS, null);
+            List<RawRow> rows = new java.util.ArrayList<>();
+            int rigaOut = 0;
+            for (Tabella.Riga r : t.righe()) {
+                String dataContabile = t.valore(r, "Data contabile");
+                if (dataContabile == null) continue; // riga non-dato / continuazione
 
-                    Map<String, String> campi = new LinkedHashMap<>();
-                    campi.put(Sorgente.KEY, Sorgente.BPM);
-                    campi.put("DATA_CONTABILE", at(rec, 0));
-                    campi.put("DATA_VALUTA", at(rec, 1));
-                    campi.put("CHECK", at(rec, 2));
-                    campi.put("CHIAVE", at(rec, 3));
-                    campi.put("IMPORTO", at(rec, 4));
-                    campi.put("DIVISA", at(rec, 5));
-                    campi.put("CAUSALE", at(rec, 6));
-                    campi.put("BANCA", at(rec, 7));
-                    campi.put("DESCRIZIONE", at(rec, 8));
-                    campi.put("CANALE", at(rec, 9));
+                Map<String, String> campi = new LinkedHashMap<>();
+                campi.put(Sorgente.KEY, Sorgente.BPM);
+                campi.put("DATA_CONTABILE", Valori.toItSlash(dataContabile));
+                campi.put("DATA_VALUTA", Valori.toItSlash(t.valore(r, "Data valuta")));
+                campi.put("IMPORTO", Valori.toItalianNumber(t.valore(r, "Importo")));
+                campi.put("DIVISA", t.valore(r, "Divisa"));
+                campi.put("CAUSALE", t.valore(r, "Causale"));
+                campi.put("DESCRIZIONE", t.valore(r, "Descrizione"));
+                campi.put("CHIAVE", t.valore(r, "chiave", "Chiave"));
+                campi.put("CANALE", t.valore(r, "Canale"));
 
-                    rows.add(new RawRow(++rigaOut, campi));
-                }
+                rows.add(new RawRow(++rigaOut, campi));
             }
+            return rows;
+        } catch (ApiException e) {
+            throw e;
         } catch (Exception e) {
             throw new ApiException(Response.Status.BAD_REQUEST, "BPM_PARSE_ERROR",
-                    "Impossibile leggere il file Banco BPM (.csv): " + e.getMessage());
+                    "Impossibile leggere il file Banco BPM: " + e.getMessage());
         }
-        return rows;
-    }
-
-    private String at(CSVRecord rec, int i) {
-        if (i >= rec.size()) return null;
-        String v = rec.get(i);
-        return (v == null || v.isBlank()) ? null : v.trim();
-    }
-
-    private boolean isAllBlank(CSVRecord rec) {
-        for (String s : rec) {
-            if (s != null && !s.isBlank()) return false;
-        }
-        return true;
     }
 }

@@ -40,5 +40,11 @@ public record RawMovimento(
         String chiaveAggancio,        // colonna CHIAVE grezza (numeroMovBanca/importo): dedup cross-sorgente
         EntitaEstratte entita,        // IBAN / ordinante / beneficiario / codice Stripe (best-effort)
 
-        RawRow rawOriginale           // conservare per errori_dettaglio / raw_data ambiguità
+        RawRow rawOriginale,          // conservare per errori_dettaglio / raw_data ambiguità
+
+        // ── Riconciliazione POS (import congiunto, REFACTOR-IMPORT-CONGIUNTO §FASE1) ──
+        // Solo per le righe banca di incasso POS; null altrimenti. Servono al
+        // RiconciliazioneService per agganciare l'accredito banca allo scontrino Billy.
+        LocalDate dataIncassoPos,     // data reale "DEL gg/mm/aa" estratta dalla descrizione (≠ data contabile)
+        String circuitoPos            // "NUMIA" (→BPM) | "NEXI" (→CA); null se non POS
 ) {}

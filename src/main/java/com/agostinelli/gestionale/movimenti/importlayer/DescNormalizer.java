@@ -40,6 +40,16 @@ public final class DescNormalizer {
     // Beneficiario CA uscita: "...AGRICOLA AGO<num> <beneficiario> (RIF|V/ORDINE|DESCR)"
     private static final Pattern BENEF_CA = Pattern.compile(
             "AGRICOLA\\s+AGO\\w*?\\d{6,}\\s+(.+?)\\s+(?:RIF\\.?|V/ORDINE|DESCR)");
+    // Esercente di un pagamento carta BPM (causale 118): "...CARTA <num>-[HH:MM-]<esercente> <indirizzo>".
+    // L'esercente sta tra il numero carta e il primo marcatore di indirizzo / CAP / "-DA CONTAB" / fine.
+    // Senza questa estrazione il nome esercente è solo testo "NORMALE" e non genera keyword apprendibili.
+    private static final Pattern MERCHANT_CARTA = Pattern.compile(
+            "CARTA\\s*\\*?\\s*\\d+\\s*-\\s*(?:\\d{1,2}:\\d{2}\\s*-\\s*)?(.+?)"
+            + "(?:\\s+(?:VIA|VIALE|V\\.LE|P\\.ZA|PIAZZA|CORSO|C\\.SO|LOC\\.?|LOCALITA|SNC|STR\\.?|STRADA)\\b"
+            + "|\\s+\\d{4,}|\\s*-\\s*DA\\b|$)");
+    // Creditore di un'utenza CBILL BPM: "...BOLL.CBILL <creditore> [- R] CBILL <codice>".
+    private static final Pattern CREDITORE_CBILL = Pattern.compile(
+            "BOLL\\.?\\s*CBILL\\s+(.+?)\\s*(?:-\\s*R\\s+)?CBILL\\s+\\d");
 
     /** Vista COMPACT: rimuove tutti gli spazi (ricongiunge le parole spezzate dal word-wrap). */
     public static String compact(String spaced) {
@@ -85,6 +95,10 @@ public final class DescNormalizer {
             beneficiario = clean(firstGroup(BENEF_CA, descSpaced));
         } else if (Sorgente.BPM.equals(sorgente)) {
             ordinante = clean(firstGroup(ORD_BPM, descSpaced));
+            // Pagamenti carta / utenze CBILL: l'esercente/creditore è la controparte → beneficiario,
+            // così l'estrattore keyword lo riconosce come IDENTITÀ (e non più testo NORMALE ignorato).
+            beneficiario = clean(firstGroup(MERCHANT_CARTA, descSpaced));
+            if (beneficiario == null) beneficiario = clean(firstGroup(CREDITORE_CBILL, descSpaced));
         }
 
         return new EntitaEstratte(iban, ordinante, beneficiario, stripe);

@@ -48,9 +48,26 @@ public class AuditFilter implements ContainerRequestFilter, ContainerResponseFil
                 MDC.get("userId"),
                 duration);
 
+        // Profiling mirato (richiesta utente): appende i tempi delle chiamate import/smistamento su
+        // un file txt, così si può capire quale endpoint rallenta il caricamento dello smistamento.
+        perfLog(requestContext.getUriInfo().getPath(), requestContext.getMethod(), duration);
+
         MDC.remove("userId");
         MDC.remove("method");
         MDC.remove("path");
+    }
+
+    /** Append su import-traces/perf.txt dei tempi delle sole chiamate import/smistamento. */
+    private void perfLog(String path, String method, long ms) {
+        if (path == null || !path.contains("movimenti/import")) return;
+        try {
+            java.nio.file.Path dir = java.nio.file.Path.of("import-traces");
+            java.nio.file.Files.createDirectories(dir);
+            String line = String.format("%s  %4dms  %-4s /%s%n",
+                    java.time.LocalTime.now().withNano(0), ms, method, path);
+            java.nio.file.Files.writeString(dir.resolve("perf.txt"), line,
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        } catch (Exception ignore) { /* il profiling non deve mai disturbare la richiesta */ }
     }
 
     private String extractUserId(ContainerRequestContext ctx) {

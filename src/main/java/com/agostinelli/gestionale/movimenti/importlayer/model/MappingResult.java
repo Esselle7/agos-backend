@@ -22,7 +22,8 @@ public record MappingResult(
         String motivoAmbiguita,          // valorizzato se AMBIGUOUS / SKIP_* / ERROR
         ParkEvento park,                 // valorizzato solo se PARK_EVENTO
         String trace,                    // spiegazione del percorso decisionale (per il log per-import)
-        RawMovimento rawNormalizzato     // sempre: per logging
+        RawMovimento rawNormalizzato,    // sempre: per logging
+        String keywordConflittoSig       // signature_hash se la riga ha innescato un conflitto keyword di MATCH
 ) {
 
     public enum MappingOutcome {
@@ -37,22 +38,27 @@ public record MappingResult(
 
     /** Copia con la traccia decisionale valorizzata (per il logging passo-passo). */
     public MappingResult withTrace(String t) {
-        return new MappingResult(outcome, request, motivoAmbiguita, park, t, rawNormalizzato);
+        return new MappingResult(outcome, request, motivoAmbiguita, park, t, rawNormalizzato, keywordConflittoSig);
+    }
+
+    /** Copia che segnala un conflitto keyword di MATCH (riga booked sul transitorio). */
+    public MappingResult withKeywordConflitto(String sig) {
+        return new MappingResult(outcome, request, motivoAmbiguita, park, trace, rawNormalizzato, sig);
     }
 
     public static MappingResult success(MovimentoCreateRequest request, RawMovimento raw) {
-        return new MappingResult(MappingOutcome.SUCCESS, request, null, null, null, raw);
+        return new MappingResult(MappingOutcome.SUCCESS, request, null, null, null, raw, null);
     }
 
     public static MappingResult ambiguous(String motivo, RawMovimento raw) {
-        return new MappingResult(MappingOutcome.AMBIGUOUS, null, motivo, null, null, raw);
+        return new MappingResult(MappingOutcome.AMBIGUOUS, null, motivo, null, null, raw, null);
     }
 
     public static MappingResult skip(MappingOutcome outcome, RawMovimento raw) {
-        return new MappingResult(outcome, null, outcome.name(), null, null, raw);
+        return new MappingResult(outcome, null, outcome.name(), null, null, raw, null);
     }
 
     public static MappingResult parkEvento(ParkEvento park, RawMovimento raw) {
-        return new MappingResult(MappingOutcome.PARK_EVENTO, null, "PARK_EVENTO", park, null, raw);
+        return new MappingResult(MappingOutcome.PARK_EVENTO, null, "PARK_EVENTO", park, null, raw, null);
     }
 }

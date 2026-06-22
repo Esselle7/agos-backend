@@ -1,11 +1,15 @@
 # ETL Import — Regole di classificazione e catalogazione intelligente (v2)
 
-> Documento infrastrutturale. Definisce il **nuovo motore di classificazione** dei movimenti
+> Documento infrastrutturale. Definisce il **motore di classificazione** dei movimenti
 > importati da Billy / Crédit Agricole / Banco BPM, con l'obiettivo di **minimizzare le ambiguità**
 > e di **catalogare in modo assistito e auto-apprendente** ciò che resta incerto (inclusi i fornitori).
 >
-> Sostituisce concettualmente la logica binaria `SUCCESS / AMBIGUOUS` descritta in
-> `IMPORT_BULK_REGOLE.md` (che resta valido come fotografia dell'implementazione attuale, v1).
+> **Questo è il motore IMPLEMENTATO e attivo**: il modello a gate qui descritto è quello eseguito da
+> `MovimentoMappingEngineImpl.map()` (regole data-driven → Gate A → Gate B → Gate C con transitori
+> `39.99.999`/`49.99.999`). Ha **superato** la logica binaria `SUCCESS / AMBIGUOUS`: `IMPORT_BULK_REGOLE.md`
+> resta valido **solo** per lo strato **parse/normalize** (parser per sorgente + `MovimentoNormalizerImpl`,
+> tuttora invariati) e come memoria storica della classificazione v1. Import: **solo congiunto**
+> (`POST /api/movimenti/import/congiunto`, 3 file dello stesso periodo). Schema DB consolidato in `V1`–`V10`.
 >
 > **Principio guida:** *nessun dato finanziario va perso e nessuna riga viene "indovinata".*
 > Ogni riga o viene classificata con alta confidenza, o viene **registrata in forma neutra** e messa

@@ -4,6 +4,29 @@
 > diventa un **movimento mappato** in DB. Pensata per essere modificata: ogni regola è isolata e
 > rimanda al punto esatto del codice.
 
+> ⚠️ **Stato del documento (aggiornato al consolidamento schema).**
+> Le sezioni **Parse** e **Normalize** (parser per sorgente + `MovimentoNormalizerImpl`) sono tuttora
+> **attuali**: descrivono fedelmente il codice. La sezione di **classificazione** descritta qui in forma
+> binaria `SUCCESS / AMBIGUOUS` è invece **superata**: il motore vivo (`MovimentoMappingEngineImpl.map()`)
+> implementa il **modello a gate** documentato in [`ETL_CLASSIFICAZIONE_v2.md`](./ETL_CLASSIFICAZIONE_v2.md)
+> e [`../Documentazione/IMPORT-RULES.md`](../Documentazione/IMPORT-RULES.md):
+> regole data-driven → **Gate A** (skip tracciati in `import_scartati`) → **Gate B** (parcheggio eventi in
+> `eventi_da_riconciliare`) → **Gate C** (classificazione con keyword + fallback su conti **transitori**
+> `39.99.999` ricavi / `49.99.999` costi); gli alias fornitori restano solo come fallback. Per la
+> classificazione fai riferimento a quei due documenti; qui resta valida la pipeline parse/normalize.
+>
+> **Import: solo CONGIUNTO.** Gli endpoint single-file `/import/{billy,bpm,ca}` sono stati **rimossi**:
+> si importano i **3 file dello stesso periodo insieme** via `POST /api/movimenti/import/congiunto`
+> (rollback atomico). Il dispatch interno per sorgente (`_SORGENTE` = BILLY/BPM/CA) resta valido dentro
+> il flusso congiunto.
+>
+> **Schema DB consolidato in `V1__…`–`V10__…`** (vedi [`project_schema_consolidation`] in memoria): i
+> riferimenti a singole migration storiche (V5/V6/V8/V34…) vanno letti come "schema in `V1`, seed in `V4`,
+> metodi banca in `V6`, keyword in `V7`/`V8`". Le tabelle ora stanno in: schema operativo `V2`
+> (`movimenti`, `eventi`, `import_log`, `import_ambiguita`), keyword/triage `V7`
+> (`keyword_*`, `import_scartati`, `eventi_da_riconciliare`), ricorrenti da riconciliare `V9`,
+> quadratura POS `V10`.
+
 ## Indice
 - [Pipeline ETL (comune a tutte le fonti)](#pipeline-etl-comune-a-tutte-le-fonti)
 - [Tabelle di lookup e ID fissi](#tabelle-di-lookup-e-id-fissi)
@@ -33,13 +56,15 @@ file → [PARSE] → RawRow → [NORMALIZE] → RawMovimento → [MAP] → Mappi
 
 **Endpoint REST** (`MovimentiResource`, multipart, `@RolesAllowed("ADMIN")`):
 
-| Fonte | Endpoint | chiave fonte (`fonteStr`) | fonte DB |
-|-------|----------|---------------------------|----------|
-| Billy | `POST /api/movimenti/import/billy` | `IMPORT_BILLY` | `IMPORT_BILLY` |
-| BPM | `POST /api/movimenti/import/bpm` | `IMPORT_BANCA_BPM` | `IMPORT_BANCA` |
-| CA | `POST /api/movimenti/import/ca` | `IMPORT_BANCA_CA` | `IMPORT_BANCA` |
+| Operazione | Endpoint | Note |
+|-----------|----------|------|
+| Import congiunto | `POST /api/movimenti/import/congiunto` | **Unica modalità.** I 3 file (`billy`+`bpm`+`ca`) dello stesso periodo sono obbligatori e riconciliati insieme; un solo `import_log`, rollback atomico. |
+| Rollback import | `DELETE /api/movimenti/import/{importLogId}/rollback` | Annulla un import completo. |
 
-> BPM e CA condividono la stessa `BancaImportStrategy` e la stessa fonte DB `IMPORT_BANCA`; cambia solo il parser.
+> Gli endpoint single-file `/import/{billy,bpm,ca}` sono **rimossi**. Il metodo interno `importFile()`
+> resta solo a uso dei test. Dentro il congiunto, ogni file è comunque parsato dalla sua strategia
+> (`BillyImportStrategy` / `BancaImportStrategy`); BPM e CA condividono la stessa `BancaImportStrategy` e la
+> stessa fonte DB `IMPORT_BANCA`, cambia solo il parser.
 
 **Dispatch per fonte:** `MovimentoImportService` non conosce i parser direttamente. Risolve la
 strategia con `ImportStrategyFactory.get(fonteStr)` (cerca tra le `ImportStrategy` iniettate quella il
@@ -56,7 +81,7 @@ all'inizio di ogni import (`refreshLookups()`) e referenzia i COGE per **codice*
 
 ## Tabelle di lookup e ID fissi
 
-### Conti bancari (`conti_bancari`, ID fissi) — `V6`
+### Conti bancari (`conti_bancari`, ID fissi) — schema `V1`, seed `V4`
 | ID | Conto |
 |----|-------|
 | 1 | Banco BPM – c/c operativo |
@@ -65,7 +90,7 @@ all'inizio di ogni import (`refreshLookups()`) e referenzia i COGE per **codice*
 | 4 | Satispay – portafoglio digitale |
 | 5 | Stripe / Alveare – portafoglio |
 
-### Business Unit (`business_units`, ID fissi) — `V5`
+### Business Unit (`business_units`, ID fissi) — schema `V1`, seed `V4`
 | ID | BU | Nome |
 |----|-----|------|
 | 1 | BU1 | Ristorazione e Agriturismo |
@@ -74,7 +99,7 @@ all'inizio di ogni import (`refreshLookups()`) e referenzia i COGE per **codice*
 | 4 | BU4 | Manutenzione Verde |
 | 5 | BU5 | Overhead (costi generali) |
 
-### COGE usati dal mapping (per codice) — `V5`/`V8`
+### COGE usati dal mapping (per codice) — schema `V1`, seed `V4`
 | Costante codice | Codice COGE | Descrizione |
 |-----------------|-------------|-------------|
 | `COGE_CAPARRA` | `30.02.001` | Caparre eventi |
@@ -86,18 +111,22 @@ all'inizio di ogni import (`refreshLookups()`) e referenzia i COGE per **codice*
 | `COGE_COMMISSIONI_POS` | `40.02.001` | Commissioni Nexi (POS Crédit Agricole) |
 | `COGE_SPESE_BANCA` | `40.02.002` | Spese tenuta conto bancario |
 
-### Metodi di pagamento (`metodi_pagamento`, per codice) — `V6`
+### Metodi di pagamento (`metodi_pagamento`, per codice) — schema `V1`, seed `V4` + `V6` (metodi banca)
 `CONTANTI`, `POS_BPM`, `POS_CA_NEXI`, `SATISPAY`, `BONIFICO`, `ALVEARE_STRIPE`, `SHOPIFY_STRIPE`, `F24`, `ASSEGNO`, `RID_SDDMANDAT`.
 
-### Alias fornitori (`fornitore_alias_matching` + `fornitori`) — `V6`/`V8`
+### Alias fornitori (`fornitore_alias_matching` + `fornitori`) — schema `V1`, seed `V4`
+> **Ruolo ridotto a fallback.** Dal modello a gate, il riconoscimento controparti primario è il
+> **keyword engine** (`keyword_firma`/`keyword_token`, seed `V7`/`V8`). Gli alias qui descritti restano
+> attivi solo come **fallback nelle uscite** in `classifyUscita` quando nessuna keyword aggancia.
+
 Usati **solo nelle uscite** (e per la sola attribuzione del fornitore nelle commissioni POS).
 Ogni regola = `pattern` + `match_type` (`CONTAINS` | `STARTS_WITH` | `REGEX`) → `fornitore_id`,
 con `coge_default_id` e `bu_default_id` opzionali dal fornitore.
 
-Pattern attualmente seedati (tutti `CONTAINS`, confronto in UPPERCASE):
-- **V6:** `PASTICCERIA RM`, `PASINI`, `ORMA BIRRA`, `GRUPPO ITALIANO VI`, `NICELLINI`, `ZEUS`, `CIOCCA`,
+Pattern attualmente seedati (tutti `CONTAINS`, confronto in UPPERCASE; tutti nel seed consolidato `V4`):
+- `PASTICCERIA RM`, `PASINI`, `ORMA BIRRA`, `GRUPPO ITALIANO VI`, `NICELLINI`, `ZEUS`, `CIOCCA`,
   `SOGEGROSS`, `VAL MULINI`, `TELEPASS`, `NEXI`, `GPL`, `GAS PROPANO`.
-- **V8:** `LODETTI`, `COMEDIL MANGINO`, `ZEP ITALIA`, `FATTORIA GINESTRA`.
+- `LODETTI`, `COMEDIL MANGINO`, `ZEP ITALIA`, `FATTORIA GINESTRA`.
 
 > Il match va a buon fine sull'uscita **solo se** il fornitore ha sia `coge_default_id` sia
 > `bu_default_id` valorizzati (eccezione: il ramo commissioni POS Nexi, che imposta COGE/BU da sé).
@@ -319,9 +348,11 @@ JSON della riga originale, per riclassificazione manuale dall'operatore.
 | Colonne lette / filtro righe | `importlayer/parser/{BillyParser,BancaCaParser,BancaBpmParser}.java` |
 | Conto/metodo da banca o causale, parsing date/importi, giroconti | `importlayer/MovimentoNormalizerImpl.java` |
 | Regole COGE/BU/IVA, eventi, alias fornitori, invarianti | `importlayer/MovimentoMappingEngineImpl.java` |
-| Codici COGE / metodi / conti / BU | migration `V5`, `V6`, `V8` |
-| Pattern alias fornitori | tabella `fornitore_alias_matching` (seed in `V6` + `V8`) |
-| Schema tabella ambiguità / motivi | migration `V34` |
-| Orchestrazione, dedup, stato import | `importlayer/MovimentoImportService.java` |
+| Codici COGE / metodi / conti / BU | schema `V1`, seed `V4` (metodi banca anche in `V6`) |
+| Pattern alias fornitori (fallback) | tabella `fornitore_alias_matching` (schema `V1`, seed `V4`) |
+| Regole keyword (riconoscimento primario) | tabelle `keyword_firma`/`keyword_token` (migration `V7` + seed `V8`) |
+| Gate / regole data-driven / transitori | `importlayer/{MovimentoMappingEngineImpl,RegoleClassificazioneEngine,keyword/KeywordClassificazioneEngine}.java` |
+| Schema tabella ambiguità / motivi | `import_ambiguita` in `V2`; `import_scartati` + `eventi_da_riconciliare` in `V7` |
+| Orchestrazione, dedup, stato import, gate A/B | `importlayer/MovimentoImportService.java` |
 | Dispatch fonte→parser/normalizer | `importlayer/{ImportStrategy,ImportStrategyFactory,BillyImportStrategy,BancaImportStrategy}.java` |
-| Endpoint REST import | `resource/MovimentiResource.java` (`/import/{billy,bpm,ca}`) |
+| Endpoint REST import | `resource/MovimentiResource.java` (`POST /import/congiunto`; single-file rimossi) |

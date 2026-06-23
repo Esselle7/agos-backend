@@ -9,7 +9,6 @@ import com.agostinelli.gestionale.movimenti.importlayer.model.RawRow;
 import com.agostinelli.gestionale.movimenti.importlayer.reconcile.DatasetRiconciliato;
 import com.agostinelli.gestionale.movimenti.importlayer.reconcile.RawMovimentoArricchito;
 import com.agostinelli.gestionale.movimenti.importlayer.reconcile.RiconciliazioneService;
-import com.agostinelli.gestionale.movimenti.importlayer.debug.ImportTracer;
 import com.agostinelli.gestionale.movimenti.repository.MovimentiRepository;
 import com.agostinelli.gestionale.movimenti.service.MovimentiService;
 import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
@@ -174,18 +173,6 @@ public class MovimentoImportService {
 
         UUID importLogId = creaImportLog("IMPORT_CONGIUNTO", fileLabel(fnBilly, fnBpm, fnCa), userId);
 
-        // [DEBUG — DA RIMUOVERE] trace strutturato su file di questo import.
-        ImportTracer trace = ImportTracer.create("congiunto", importLogId.toString());
-        try {
-        trace.line("================================================================")
-                .line(" IMPORT CONGIUNTO — TRACE DI DEBUG")
-                .line("================================================================")
-                .kv("importLogId", importLogId)
-                .kv("timestamp", java.time.LocalDateTime.now())
-                .kv("file Billy", safeName(fnBilly))
-                .kv("file BPM", safeName(fnBpm))
-                .kv("file CA", safeName(fnCa));
-
         // ── [1] PARSE + NORMALIZE (invariato) ──
         ImportStrategy billyStrat = strategyFactory.get("IMPORT_BILLY");
         ImportStrategy bancaStrat = strategyFactory.get("IMPORT_BANCA_BPM");
@@ -203,43 +190,13 @@ public class MovimentoImportService {
         normalizeAll(norm, bpmRows, normBpm, errori);
         normalizeAll(norm, caRows, normCa, errori);
 
-        trace.section("FASE 1 — PARSE + NORMALIZE")
-                .kv("Billy righe", billyRows.size() + " (normalizzati " + normBilly.size() + ")")
-                .kv("BPM righe", bpmRows.size() + " (normalizzati " + normBpm.size() + ")")
-                .kv("CA righe", caRows.size() + " (normalizzati " + normCa.size() + ")")
-                .kv("errori normalizzazione", errori.size());
-
         // ── [2] RICONCILIAZIONE A PERIODO (funzione pura, Billy = verità) ──
         DatasetRiconciliato ds = riconciliazione.riconcilia(normBilly, normBpm, normCa);
-        var q = ds.quadratura();
-        trace.section("FASE 2 — RICONCILIAZIONE A PERIODO (stats)")
-                .kv("anno periodo", q.anno())
-                .kv("righe banca POS", ds.stat().righeBancaPos())
-                .kv("coda testa esclusa", ds.stat().testaEsclusa() + " (" + q.codaTesta().toPlainString() + " €)")
-                .kv("ricavi POS Billy", ds.stat().ricaviPos() + " (BPM=" + ds.stat().assegnatiBpm()
-                        + ", CA=" + ds.stat().assegnatiCa() + ")")
-                .kv("contanti → Cassa", ds.stat().contanti())
-                .kv("eventi agriturismo (esclusi → modulo Eventi)", ds.stat().eventiAttesi())
-                .kv("in attesa di accredito", ds.stat().inAttesaAccredito() + " (" + q.codaFondo().toPlainString() + " €)")
-                .kv("banca non-POS (passthrough)", ds.stat().bancaNonPos())
-                .section("FASE 2b — QUADRATURA")
-                .kv("Billy elettronico no-agri", q.billyElettronicoNonAgri().toPlainString())
-                .kv("Billy contabilizzato", q.billyContabilizzato().toPlainString())
-                .kv("POS banca totale", q.posBancaTotale().toPlainString())
-                .kv("POS banca core", q.posBancaCore().toPlainString())
-                .kv("Σ_BPM / Σ_CA core", q.sigmaBpm().toPlainString() + " / " + q.sigmaCa().toPlainString())
-                .kv("assegnato BPM / CA", q.assegnatoBpm().toPlainString() + " / " + q.assegnatoCa().toPlainString())
-                .kv("residuo CORE", q.residuoCore().toPlainString());
-        for (String nota : q.note()) trace.line("    · " + nota);
 
         // ── [3]+[4] MAP (gate riusato) + PERSIST ──
-        trace.section("FASE 3+4 — MAP + PERSIST (per riga)");
         int importati = 0, duplicati = 0, ambigui = 0, scartati = 0, parcheggiati = 0, ricorrenti = 0;
         Set<String> rifEsistenti = new java.util.HashSet<>(repo.findRifimentiEsterniByFonte("IMPORT_BANCA"));
         rifEsistenti.addAll(repo.findRifimentiEsterniByFonte("IMPORT_BILLY"));
-
-        // Diagnostica su file (richiesta utente): righe scartate per dedup → import-traces/diagnostica_<logId>.txt
-        List<String> diagDuplicati = new ArrayList<>();
 
         // Feature 2 — Matching differiti: indice in memoria (O(1) lookup per riga) dei movimenti
         // DA_LIQUIDARE aperti. Caricato una sola volta a inizio loop; ogni riga banca fa una
@@ -252,7 +209,6 @@ public class MovimentoImportService {
         for (RawMovimentoArricchito a : ds.daMappare()) {
             RawMovimento n = a.banca();
             RawRow raw = n.rawOriginale();
-            String recon = a.isArricchito() ? a.dettagli().esito().name() : "passthrough";
             try {
                 MappingResult mapped = mappingEngine.map(a);
 
@@ -260,26 +216,22 @@ public class MovimentoImportService {
                     // Spese ricorrenti/finanziamenti: parcheggiate (NON contabilizzate, gestite a mano).
                     salvaRicorrenteParcheggiata(importLogId, raw, n, n.fonte());
                     ricorrenti++;
-                    traceRiga(trace, n, recon, "RICORRENTE", mapped.motivoAmbiguita());
                     continue;
                 }
                 if (mapped.outcome().isSkip()) {
                     salvaScartato(importLogId, raw, n, mapped.motivoAmbiguita(), n.fonte());
                     scartati++;
-                    traceRiga(trace, n, recon, "SCARTATO", mapped.motivoAmbiguita());
                     continue;
                 }
                 if (mapped.outcome() == MappingResult.MappingOutcome.PARK_EVENTO) {
                     boolean ins = salvaEventoParcheggiato(importLogId, raw, n, mapped.park(), n.fonte());
                     if (ins) parcheggiati++; else duplicati++;
-                    traceRiga(trace, n, recon, ins ? "EVENTO" : "EVENTO_DUP", mapped.trace());
                     continue;
                 }
                 if (mapped.outcome() == MappingResult.MappingOutcome.AMBIGUOUS
                         || mapped.outcome() == MappingResult.MappingOutcome.ERROR) {
                     salvaAmbiguita(importLogId, raw, n, mapped.motivoAmbiguita(), n.fonte());
                     ambigui++;
-                    traceRiga(trace, n, recon, "AMBIGUO", mapped.motivoAmbiguita());
                     continue;
                 }
 
@@ -287,8 +239,6 @@ public class MovimentoImportService {
                 String rif = req.riferimentoEsterno();
                 if (rif != null && !rif.isBlank() && rifEsistenti.contains(rif)) {
                     duplicati++;
-                    diagDuplicati.add(formatDiag(n, n.metodoPagamentoCodice()) + " | rif=" + rif);
-                    traceRiga(trace, n, recon, "DUPLICATO", "rif già presente");
                     continue;
                 }
 
@@ -302,8 +252,6 @@ public class MovimentoImportService {
                     matchingDifferitiService.salvaMatch(importLogId, movEsistenteId, req,
                             n.fonte(), raw.riga());
                     matchingDifferiti++;
-                    traceRiga(trace, n, recon, "MATCH_DIFFERITO",
-                            "riconcilia con movimento DA_LIQUIDARE " + movEsistenteId);
                     continue;
                 }
 
@@ -315,12 +263,10 @@ public class MovimentoImportService {
                 }
                 if (rif != null && !rif.isBlank()) rifEsistenti.add(rif);
                 importati++;
-                traceRiga(trace, n, recon, "IMPORTATO", mapped.trace());
 
             } catch (Exception e) {
                 log.warnf("Import congiunto riga %d (%s) fallita: %s", raw.riga(), n.fonte(), e.getMessage());
                 errori.add(new EtlRowError(raw.riga(), e.getMessage(), raw.campi()));
-                traceRiga(trace, n, recon, "ERRORE", e.getMessage());
             }
         }
 
@@ -348,7 +294,6 @@ public class MovimentoImportService {
                 ds.quadratura().sigmaBpm(), ds.quadratura().sigmaCa(), ds.quadratura().residuoCore());
 
         salvaQuadratura(importLogId, ds.quadratura(), ds.inAttesaAccredito());
-        scriviDiagnostica(importLogId, diagDuplicati, ds.quadratura(), ds.inAttesaAccredito(), ds.eventiAttesi());
 
         int totali = billyRows.size() + bpmRows.size() + caRows.size();
         String statoFinale = statoFinale(errori.size(), ambigui, totali);
@@ -358,102 +303,10 @@ public class MovimentoImportService {
         chiudiImportLog(importLogId, totali, importati, errori.size(), duplicati, ambigui,
                 scartati, parcheggiati, ricorrenti, matchingDifferiti, statoFinale, diagnostica);
 
-        // [DEBUG] SUMMARY DB: come sono catalogati i movimenti creati da questo import.
-        trace.section("ESITI (totali)")
-                .kv("importati", importati).kv("duplicati", duplicati).kv("ambigui", ambigui)
-                .kv("scartati", scartati).kv("parcheggiati (eventi)", parcheggiati)
-                .kv("ricorrenti parcheggiate", ricorrenti)
-                .kv("matching differiti (riconciliazione manuale)", matchingDifferiti)
-                .kv("errori", errori.size())
-                .kv("avvisi (eventi attesi + in attesa accredito)", avvisi.size());
-        scriviSummaryDb(trace, importLogId);
-
         if (importati > 0) mvRefresh.requestRefreshAfterCommit();
 
         return new EtlImportResponse(importLogId, importati, duplicati, ambigui, scartati, parcheggiati,
                 ricorrenti, errori, avvisi);
-        } finally {
-            trace.close();
-        }
-    }
-
-    /** [DEBUG — DA RIMUOVERE] una riga di trace per movimento catalogato. */
-    private void traceRiga(ImportTracer t, RawMovimento n, String recon, String esito, String dettaglio) {
-        if (!t.attivo()) return;
-        t.line("  [%-5s r.%-4d] %-11s recon=%-13s imp=%9s | %s",
-                fonteBreve(n.fonte()), n.rawOriginale().riga(), esito, recon,
-                n.importo() == null ? "-" : n.importo().toPlainString(),
-                dettaglio == null ? "" : dettaglio);
-    }
-
-    private String fonteBreve(String fonte) {
-        return "IMPORT_BILLY".equals(fonte) ? "BILLY" : "BANCA";
-    }
-
-    /** [DEBUG — DA RIMUOVERE] aggregati DB dei movimenti creati: per BU / COGE / conto / metodo. */
-    private void scriviSummaryDb(ImportTracer t, UUID importLogId) {
-        if (!t.attivo()) return;
-        t.section("SUMMARY DB — movimenti creati (catalogazione)");
-        t.line("  per BUSINESS UNIT:");
-        for (Object[] r : aggregato(
-                "SELECT m.business_unit_id, count(*) FROM movimenti m "
-                + "WHERE m.fonte_importazione_id = :id GROUP BY m.business_unit_id ORDER BY 1", importLogId)) {
-            t.line("    BU %-3s : %s", r[0], r[1]);
-        }
-        t.line("  per COGE:");
-        for (Object[] r : aggregato(
-                "SELECT p.codice, p.descrizione, count(*) FROM movimenti m "
-                + "JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id "
-                + "WHERE m.fonte_importazione_id = :id GROUP BY p.codice, p.descrizione ORDER BY 1", importLogId)) {
-            t.line("    %-10s %-45s : %s", r[0], r[1], r[2]);
-        }
-        t.line("  per CONTO bancario:");
-        for (Object[] r : aggregato(
-                "SELECT cb.id, cb.nome, count(*) FROM movimenti m "
-                + "JOIN conti_bancari cb ON cb.id = m.conto_bancario_id "
-                + "WHERE m.fonte_importazione_id = :id GROUP BY cb.id, cb.nome ORDER BY 1", importLogId)) {
-            t.line("    %-2s %-35s : %s", r[0], r[1], r[2]);
-        }
-        t.line("  per METODO pagamento:");
-        for (Object[] r : aggregato(
-                "SELECT mp.codice, count(*) FROM movimenti m "
-                + "JOIN metodi_pagamento mp ON mp.id = m.metodo_pagamento_id "
-                + "WHERE m.fonte_importazione_id = :id GROUP BY mp.codice ORDER BY 1", importLogId)) {
-            t.line("    %-14s : %s", r[0], r[1]);
-        }
-        t.line("  per TIPO:");
-        for (Object[] r : aggregato(
-                "SELECT m.tipo, count(*) FROM movimenti m WHERE m.fonte_importazione_id = :id "
-                + "GROUP BY m.tipo ORDER BY 1", importLogId)) {
-            t.line("    %-10s : %s", r[0], r[1]);
-        }
-        t.line("  scartati per MOTIVO:");
-        for (Object[] r : aggregato(
-                "SELECT motivo, count(*) FROM import_scartati WHERE import_log_id = :id GROUP BY motivo ORDER BY 1", importLogId)) {
-            t.line("    %-18s : %s", r[0], r[1]);
-        }
-        t.line("  eventi parcheggiati per TIPO:");
-        for (Object[] r : aggregato(
-                "SELECT COALESCE(tipo_evento_presunto,'(n/d)'), count(*) FROM eventi_da_riconciliare "
-                + "WHERE import_log_id = :id GROUP BY tipo_evento_presunto ORDER BY 1", importLogId)) {
-            t.line("    %-14s : %s", r[0], r[1]);
-        }
-        t.line("  ambiguità per MOTIVO:");
-        for (Object[] r : aggregato(
-                "SELECT motivo, count(*) FROM import_ambiguita WHERE import_log_id = :id GROUP BY motivo ORDER BY 1", importLogId)) {
-            t.line("    %-22s : %s", r[0], r[1]);
-        }
-        t.line("  ambiguità per FONTE + CAUSALE (raw):");
-        for (Object[] r : aggregato(
-                "SELECT fonte, raw_data->>'CAUSALE' AS causale, count(*) FROM import_ambiguita "
-                + "WHERE import_log_id = :id GROUP BY fonte, raw_data->>'CAUSALE' ORDER BY 3 DESC", importLogId)) {
-            t.line("    %-13s causale=%-26s : %s", r[0], r[1], r[2]);
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private List<Object[]> aggregato(String sql, UUID importLogId) {
-        return em.createNativeQuery(sql).setParameter("id", importLogId).getResultList();
     }
 
     private void normalizeAll(MovimentoNormalizer norm, List<RawRow> rows,
@@ -552,57 +405,6 @@ public class MovimentoImportService {
                 .setParameter("uid", userId)
                 .executeUpdate();
         return id;
-    }
-
-    /** Riga formattata per i file di diagnostica (duplicati / non riconciliati / orfani). */
-    private String formatDiag(RawMovimento n, String metodo) {
-        String desc = n.descrizione() == null ? "" : n.descrizione();
-        if (desc.length() > 95) desc = desc.substring(0, 95);
-        return String.format("riga %-4d %-5s | %s | %10s | %-13s | %s",
-                n.rawOriginale() != null ? n.rawOriginale().riga() : 0,
-                fonteBreve(n.fonte()),
-                n.dataMovimento() == null ? "----------" : n.dataMovimento().toString(),
-                n.importo() == null ? "-" : n.importo().toPlainString(),
-                metodo == null ? "-" : metodo, desc);
-    }
-
-    /**
-     * Scrive un file txt di diagnostica per l'import: righe scartate dalla dedup, la quadratura
-     * di periodo scomposta per causa, la coda fondo (in attesa di accredito) e gli scontrini
-     * agriturismo pagati a POS. Serve a controllare la dedup e a studiare il residuo core.
-     */
-    private void scriviDiagnostica(UUID logId, List<String> dup, com.agostinelli.gestionale.movimenti.importlayer.reconcile.QuadraturaPeriodo q,
-                                   List<RawMovimento> inAttesa, List<RawMovimento> eventiAttesi) {
-        try {
-            java.nio.file.Path dir = java.nio.file.Path.of("import-traces");
-            java.nio.file.Files.createDirectories(dir);
-            StringBuilder sb = new StringBuilder();
-            sb.append("DIAGNOSTICA IMPORT ").append(logId).append("  ").append(java.time.LocalDateTime.now()).append('\n');
-            sb.append("================================================================\n\n");
-            sb.append("== DUPLICATI SCARTATI (collisione riferimento_esterno): ").append(dup.size()).append(" ==\n");
-            sb.append("   (verifica che siano davvero la stessa transazione e non righe distinte perse)\n");
-            for (String s : dup) sb.append("  ").append(s).append('\n');
-            sb.append("\n== QUADRATURA DI PERIODO (anno ").append(q.anno()).append(") ==\n");
-            sb.append(String.format("  Billy elettronico no-agri : %12s%n", q.billyElettronicoNonAgri().toPlainString()));
-            sb.append(String.format("  Billy contabilizzato      : %12s%n", q.billyContabilizzato().toPlainString()));
-            sb.append(String.format("  POS banca totale          : %12s%n", q.posBancaTotale().toPlainString()));
-            sb.append(String.format("  POS banca core            : %12s  (Σ_BPM %s + Σ_CA %s)%n",
-                    q.posBancaCore().toPlainString(), q.sigmaBpm().toPlainString(), q.sigmaCa().toPlainString()));
-            sb.append(String.format("  assegnato BPM / CA        : %12s / %s%n",
-                    q.assegnatoBpm().toPlainString(), q.assegnatoCa().toPlainString()));
-            sb.append(String.format("  coda testa (esclusa)      : %12s%n", q.codaTesta().toPlainString()));
-            sb.append(String.format("  coda fondo (in attesa)    : %12s%n", q.codaFondo().toPlainString()));
-            sb.append(String.format("  RESIDUO CORE              : %12s%n", q.residuoCore().toPlainString()));
-            for (String nota : q.note()) sb.append("    · ").append(nota).append('\n');
-            sb.append("\n== CODA FONDO — IN ATTESA DI ACCREDITO (non contabilizzati): ").append(inAttesa.size()).append(" ==\n");
-            for (RawMovimento o : inAttesa) sb.append("  ").append(formatDiag(o, o.metodoPagamentoCodice())).append('\n');
-            sb.append("\n== AGRITURISMO (EVENTI) — ESCLUSO DALLA CONTABILITA' IMPORT (gestito dal modulo Eventi): ").append(eventiAttesi.size()).append(" ==\n");
-            for (RawMovimento o : eventiAttesi) sb.append("  ").append(formatDiag(o, o.metodoPagamentoCodice())).append('\n');
-            java.nio.file.Files.writeString(dir.resolve("diagnostica_" + logId + ".txt"), sb.toString());
-            log.infof("Diagnostica import scritta: import-traces/diagnostica_%s.txt", logId);
-        } catch (Exception e) {
-            log.warnf("Impossibile scrivere la diagnostica import: %s", e.getMessage());
-        }
     }
 
     /**

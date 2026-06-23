@@ -7,6 +7,7 @@ import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
 import jakarta.transaction.Transactional;
 import jakarta.ws.rs.core.Response;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.eclipse.microprofile.faulttolerance.Timeout;
 
 import java.math.BigDecimal;
@@ -35,6 +36,18 @@ public class ForecastingService {
     @Inject
     EntityManager em;
 
+    /** Segmento (conto, dow) escluso dalla stima se osservato in meno di N giorni distinti (anti-rumore). */
+    @ConfigProperty(name = "forecast.baseline.min-giorni", defaultValue = "4")
+    int minGiorni;
+
+    /** Oltre questo orizzonte la stima non viene proiettata (solo certo): una media settimanale su
+     *  mesi lontani ignora la stagione. */
+    @ConfigProperty(name = "forecast.baseline.orizzonte-giorni", defaultValue = "90")
+    int orizzonteStimaGiorni;
+
+    @ConfigProperty(name = "forecast.baseline.finestra-settimane", defaultValue = "8")
+    int finestraSettimane;
+
     @Transactional
     @Timeout(value = 15, unit = ChronoUnit.SECONDS)
     public ForecastingRispostaDTO computeForecasting(String horizon) {
@@ -55,9 +68,14 @@ public class ForecastingService {
 
         LocalDate start = oggi.plusDays(1);
 
+        // Layer STIMATO: ricavi cash proiettati dalla baseline. Calcolato una volta e passato a
+        // entrambe le viste (dettaglio economico + timeline finanziaria).
+        StimaRicaviCash stima = projectStimaRicaviCash(start, fine, oggi);
+
         ForecastingAsIsDTO asIs = buildAsIs(oggi);
-        ForecastingEconomicoDTO economico = buildEconomico(start, fine);
-        ForecastingFinanziarioDTO finanziario = buildFinanziario(start, fine, asIs.saldoLiquidita(), horizon);
+        ForecastingEconomicoDTO economico = buildEconomico(start, fine, stima.righe());
+        ForecastingFinanziarioDTO finanziario =
+                buildFinanziario(start, fine, asIs.saldoLiquidita(), horizon, stima.giornaliera());
 
         return new ForecastingRispostaDTO(asIs, economico, finanziario);
     }
@@ -116,7 +134,8 @@ public class ForecastingService {
 
     // ── ECONOMICO ─────────────────────────────────────────────────────────────
 
-    private ForecastingEconomicoDTO buildEconomico(LocalDate start, LocalDate end) {
+    private ForecastingEconomicoDTO buildEconomico(LocalDate start, LocalDate end,
+                                                   List<ForecastingDettaglioDTO> righeStimate) {
         List<ForecastingDettaglioDTO> dettaglio = new ArrayList<>();
 
         // 1a. Movimenti con data economica futura (impatto P&L previsto)
@@ -137,11 +156,17 @@ public class ForecastingService {
         // 4. Stipendi
         dettaglio.addAll(buildStipendi(start, end));
 
+        // 5. Ricavi cash STIMATI (layer non-certo, aggregati per conto). Mostrati nel dettaglio con
+        //    flag affidabilita=STIMATO, ma esclusi dai subtotali P&L "certi" sotto.
+        dettaglio.addAll(righeStimate);
+
         dettaglio.sort(Comparator.comparing(ForecastingDettaglioDTO::data));
 
-        // Aggregati P&L: escludono FINANZIARIA-only (impatto solo cassa, P&L già storico)
+        // Aggregati P&L "certi": escludono FINANZIARIA-only (cassa, P&L già storico) e le voci STIMATE
+        // (il combinato certo+stimato lo compone il frontend dai flag/entrateStimate).
         BigDecimal ricavi = dettaglio.stream()
                 .filter(d -> !"FINANZIARIA".equals(d.vista()))
+                .filter(d -> !"STIMATO".equals(d.affidabilita()))
                 .map(ForecastingDettaglioDTO::importoEntrata)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
@@ -179,7 +204,8 @@ public class ForecastingService {
     // ── FINANZIARIO ───────────────────────────────────────────────────────────
 
     private ForecastingFinanziarioDTO buildFinanziario(LocalDate start, LocalDate end,
-                                                        BigDecimal saldoPartenza, String horizon) {
+                                                        BigDecimal saldoPartenza, String horizon,
+                                                        Map<LocalDate, BigDecimal> stimaGiornaliera) {
         List<ForecastingDettaglioDTO> items = new ArrayList<>();
 
         // 1. Movimenti DA_LIQUIDARE con data liquidità nel periodo
@@ -203,7 +229,8 @@ public class ForecastingService {
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
         boolean granularitaSettimanale = isSettimanale(horizon);
-        List<ForecastingTimelineDTO> timeline = buildTimeline(items, start, end, saldoPartenza, granularitaSettimanale);
+        List<ForecastingTimelineDTO> timeline =
+                buildTimeline(items, start, end, saldoPartenza, granularitaSettimanale, stimaGiornaliera);
 
         return new ForecastingFinanziarioDTO(
                 saldoPartenza, incassi, uscite,
@@ -241,7 +268,7 @@ public class ForecastingService {
                     data, "MOVIMENTO", desc,
                     "ENTRATA".equals(tipo) ? importo : BigDecimal.ZERO,
                     "USCITA".equals(tipo)  ? importo : BigDecimal.ZERO,
-                    "ECONOMICA"));
+                    "ECONOMICA", "CERTO"));
         }
         return result;
     }
@@ -277,7 +304,7 @@ public class ForecastingService {
                     data, "MOVIMENTO", desc,
                     "ENTRATA".equals(tipo) ? importo : BigDecimal.ZERO,
                     "USCITA".equals(tipo)  ? importo : BigDecimal.ZERO,
-                    "FINANZIARIA"));
+                    "FINANZIARIA", "CERTO"));
         }
         return result;
     }
@@ -308,7 +335,7 @@ public class ForecastingService {
                         (String) r[1],
                         residuo,
                         BigDecimal.ZERO,
-                        "ENTRAMBE"));
+                        "ENTRAMBE", "CERTO"));
             }
         }
         return result;
@@ -343,14 +370,14 @@ public class ForecastingService {
                 BigDecimal quotaInteressi = toBD(r[5]);
                 result.add(new ForecastingDettaglioDTO(
                         data, "RATA_RICORRENTE_CAPITALE", desc + " (capitale)",
-                        BigDecimal.ZERO, quotaCapitale, "ENTRAMBE"));
+                        BigDecimal.ZERO, quotaCapitale, "ENTRAMBE", "CERTO"));
                 result.add(new ForecastingDettaglioDTO(
                         data, "RATA_RICORRENTE_INTERESSI", desc + " (interessi)",
-                        BigDecimal.ZERO, quotaInteressi, "ENTRAMBE"));
+                        BigDecimal.ZERO, quotaInteressi, "ENTRAMBE", "CERTO"));
             } else {
                 result.add(new ForecastingDettaglioDTO(
                         data, "RATA_RICORRENTE", desc,
-                        BigDecimal.ZERO, toBD(r[2]), "ENTRAMBE"));
+                        BigDecimal.ZERO, toBD(r[2]), "ENTRAMBE", "CERTO"));
             }
         }
         return result;
@@ -389,10 +416,77 @@ public class ForecastingService {
                         "Stipendi " + numDip + " dipendenti",
                         BigDecimal.ZERO,
                         totale,
-                        "ENTRAMBE"));
+                        "ENTRAMBE", "CERTO"));
             }
         }
         return result;
+    }
+
+    // ── Stima ricavi cash (layer STIMATO) ─────────────────────────────────────
+
+    /** Risultato della proiezione: righe aggregate per conto (dettaglio) + totale per giorno (timeline). */
+    private record StimaRicaviCash(List<ForecastingDettaglioDTO> righe,
+                                   Map<LocalDate, BigDecimal> giornaliera) {}
+
+    /**
+     * Proietta i ricavi cash stimati leggendo {@code forecast_baseline} (≤21 righe). Per ogni giorno
+     * futuro da {@code start} a {@code min(end, oggi+orizzonte)} somma la media_attesa del suo
+     * giorno-della-settimana. Restituisce sia le righe aggregate per conto (per il dettaglio) sia il
+     * totale giornaliero (per i bucket della timeline). Oltre l'orizzonte: niente stima (solo certo).
+     */
+    @SuppressWarnings("unchecked")
+    private StimaRicaviCash projectStimaRicaviCash(LocalDate start, LocalDate end, LocalDate oggi) {
+        Map<LocalDate, BigDecimal> giornaliera = new LinkedHashMap<>();
+        LocalDate endStima = oggi.plusDays(orizzonteStimaGiorni);
+        if (endStima.isAfter(end)) endStima = end;
+        if (start.isAfter(endStima)) return new StimaRicaviCash(List.of(), giornaliera);
+
+        // Baseline filtrata per soglia anti-rumore. dow Postgres: 0=domenica .. 6=sabato.
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT b.conto_coge_id, b.dow, b.media_attesa, c.descrizione " +
+                "FROM forecast_baseline b " +
+                "JOIN piano_dei_conti_coge c ON c.id = b.conto_coge_id " +
+                "WHERE b.n_giorni >= :soglia AND b.media_attesa > 0")
+                .setParameter("soglia", minGiorni)
+                .getResultList();
+        if (rows.isEmpty()) return new StimaRicaviCash(List.of(), giornaliera);
+
+        // conto -> [media per dow 0..6]; conto -> descrizione (LinkedHashMap mantiene ordine d'arrivo)
+        Map<Integer, BigDecimal[]> mediaByConto = new LinkedHashMap<>();
+        Map<Integer, String>       descrByConto = new LinkedHashMap<>();
+        for (Object[] r : rows) {
+            int contoId = ((Number) r[0]).intValue();
+            int dow     = ((Number) r[1]).intValue();
+            mediaByConto.computeIfAbsent(contoId, k -> new BigDecimal[7])[dow] = toBD(r[2]);
+            descrByConto.putIfAbsent(contoId, (String) r[3]);
+        }
+
+        Map<Integer, BigDecimal> totalePerConto = new LinkedHashMap<>();
+        for (LocalDate d = start; !d.isAfter(endStima); d = d.plusDays(1)) {
+            int pgDow = d.getDayOfWeek().getValue() % 7;  // Java Mon=1..Sun=7 → Postgres 1..6,0
+            BigDecimal dayTot = BigDecimal.ZERO;
+            for (Map.Entry<Integer, BigDecimal[]> e : mediaByConto.entrySet()) {
+                BigDecimal media = e.getValue()[pgDow];
+                if (media == null) continue;
+                dayTot = dayTot.add(media);
+                totalePerConto.merge(e.getKey(), media, BigDecimal::add);
+            }
+            if (dayTot.signum() > 0) giornaliera.put(d, dayTot);
+        }
+
+        // Una riga aggregata per conto, datata a start (il dettaglio è una sintesi; la distribuzione
+        // giorno-per-giorno vive nella timeline). affidabilita=STIMATO la tiene fuori dai subtotali certi.
+        List<ForecastingDettaglioDTO> righe = new ArrayList<>();
+        for (Map.Entry<Integer, BigDecimal> e : totalePerConto.entrySet()) {
+            if (e.getValue().signum() <= 0) continue;
+            String desc = "Stima " + descrByConto.get(e.getKey())
+                    + " — media ultime " + finestraSettimane + " sett.";
+            righe.add(new ForecastingDettaglioDTO(
+                    start, "MOVIMENTO", desc,
+                    e.getValue().setScale(2, java.math.RoundingMode.HALF_UP),
+                    BigDecimal.ZERO, "ENTRAMBE", "STIMATO"));
+        }
+        return new StimaRicaviCash(righe, giornaliera);
     }
 
     // ── Timeline aggregata ────────────────────────────────────────────────────
@@ -401,11 +495,13 @@ public class ForecastingService {
             List<ForecastingDettaglioDTO> items,
             LocalDate start, LocalDate end,
             BigDecimal saldoPartenza,
-            boolean settimanale) {
+            boolean settimanale,
+            Map<LocalDate, BigDecimal> stimaGiornaliera) {
 
         // Aggrega items per bucket
         Map<String, BigDecimal[]> bucketMap = new LinkedHashMap<>();
         Map<String, LocalDate[]>  bucketBounds = new LinkedHashMap<>();
+        Map<String, BigDecimal>   stimaBucket = new LinkedHashMap<>();
 
         // Popola tutti i bucket nell'intervallo per garantire continuità
         if (settimanale) {
@@ -458,7 +554,17 @@ public class ForecastingService {
             vals[1] = vals[1].add(item.importoUscita());
         }
 
-        // Costruisce la lista ordinata con saldo progressivo
+        // Stima ricavi cash: ogni giorno futuro cade già in [start, end] → bucket diretto, nessun
+        // fallback al primo bucket. Tiene la stima separata dal certo (saldo progressivo = solo certo).
+        for (Map.Entry<LocalDate, BigDecimal> s : stimaGiornaliera.entrySet()) {
+            LocalDate d = s.getKey();
+            if (d.isBefore(start) || d.isAfter(end)) continue;
+            String key = settimanale ? bucketKeyWeek(d) : bucketKeyMonth(d);
+            if (!bucketMap.containsKey(key)) continue;
+            stimaBucket.merge(key, s.getValue(), BigDecimal::add);
+        }
+
+        // Costruisce la lista ordinata con saldo progressivo (sul solo certo)
         List<ForecastingTimelineDTO> result = new ArrayList<>();
         BigDecimal saldo = saldoPartenza;
         for (Map.Entry<String, BigDecimal[]> e : bucketMap.entrySet()) {
@@ -468,7 +574,8 @@ public class ForecastingService {
             BigDecimal ebitda = entr.subtract(usc);
             saldo = saldo.add(entr).subtract(usc);
             LocalDate[] bounds = bucketBounds.get(key);
-            result.add(new ForecastingTimelineDTO(key, bounds[0], bounds[1], entr, usc, ebitda, saldo));
+            BigDecimal stimata = stimaBucket.getOrDefault(key, BigDecimal.ZERO);
+            result.add(new ForecastingTimelineDTO(key, bounds[0], bounds[1], entr, usc, ebitda, saldo, stimata));
         }
         return result;
     }

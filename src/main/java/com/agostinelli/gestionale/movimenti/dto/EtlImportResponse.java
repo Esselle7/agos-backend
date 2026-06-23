@@ -23,5 +23,20 @@ public record EtlImportResponse(
          * {@code EVENTO_ATTESO:…} (incasso-evento agriturismo: il ricavo arriva dal bonifico
          * parcheggiato) oppure {@code SPACCIO_DA_VERIFICARE:…} (incasso spaccio non riconciliato).
          */
-        List<EtlRowError> avvisi
-) {}
+        List<EtlRowError> avvisi,
+        /**
+         * Feature 2 — Matching differiti: righe banca che combaciano (importo al centesimo +
+         * descrizione uguale) con un movimento MANUALE DA_LIQUIDARE già presente in gestionale.
+         * NON sono state persistite come nuovi movimenti (evita doppia registrazione): l'utente
+         * le risolve dalla sezione "Matching differiti" dello smistamento (COLLEGA/IGNORA).
+         */
+        int matchingDifferiti
+) {
+    /** Costruttore di compatibilità per i chiamanti che non valorizzano il nuovo campo. */
+    public EtlImportResponse(UUID importLogId, int importati, int duplicati, int ambigui,
+                             int scartati, int parcheggiati, int ricorrenti,
+                             List<EtlRowError> errori, List<EtlRowError> avvisi) {
+        this(importLogId, importati, duplicati, ambigui, scartati, parcheggiati, ricorrenti,
+                errori, avvisi, 0);
+    }
+}

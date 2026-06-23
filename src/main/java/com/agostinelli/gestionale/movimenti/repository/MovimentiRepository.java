@@ -165,4 +165,62 @@ public class MovimentiRepository implements PanacheRepositoryBase<Movimento, UUI
         params.forEach(q::setParameter);
         return q.getResultList();
     }
+
+    // ── Feature 1: movimenti DA_LIQUIDARE non ancora liquidi ────────────────────
+
+    /**
+     * Movimenti in stato DA_LIQUIDARE con data_finanziaria IS NULL (non ancora liquidi)
+     * e data_liquidita nel passato (scadenza superata). Sono i movimenti "in ritardo":
+     *  - tipo=USCITA → "sei in ritardo di tot giorni sul pagamento";
+     *  - tipo=ENTRATA → "qualcuno è in ritardo di tot giorni nel pagarmi".
+     *
+     * Le rate dei piani di spesa ricorrente sono escluse per costruzione: lo scheduler
+     * le converte in movimenti REGISTRATI alla scadenza (dataFinanziaria sempre valorizzata).
+     *
+     * @param tipo   filtro opzionale sulla direzione (ENTRATA/USCITA)
+     * @param oggi   data di riferimento (passata in ingresso per poterla testare)
+     * @param page   pagina 0-based
+     * @param size   dimensione pagina
+     * @param sort   ordinamento ("dataLiquidita"|"importo"|"dataMovimento", default dataLiquidita ASC)
+     */
+    public List<Movimento> findDaLiquidareInRitardo(String tipo, LocalDate oggi, int page, int size, String sort) {
+        StringBuilder jpql = new StringBuilder("FROM Movimento m WHERE m.stato = 'DA_LIQUIDARE' " +
+                "AND m.dataFinanziaria IS NULL AND m.dataLiquidita IS NOT NULL AND m.dataLiquidita < :oggi");
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("oggi", oggi);
+        if (tipo != null && !tipo.isBlank()) {
+            jpql.append(" AND m.tipo = :tipo");
+            params.put("tipo", tipo);
+        }
+        jpql.append(buildRitardoSort(sort));
+
+        TypedQuery<Movimento> q = em.createQuery(jpql.toString(), Movimento.class)
+                .setFirstResult(page * size)
+                .setMaxResults(size);
+        params.forEach(q::setParameter);
+        return q.getResultList();
+    }
+
+    public long countDaLiquidareInRitardo(String tipo, LocalDate oggi) {
+        StringBuilder jpql = new StringBuilder("SELECT COUNT(m) FROM Movimento m WHERE m.stato = 'DA_LIQUIDARE' " +
+                "AND m.dataFinanziaria IS NULL AND m.dataLiquidita IS NOT NULL AND m.dataLiquidita < :oggi");
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("oggi", oggi);
+        if (tipo != null && !tipo.isBlank()) {
+            jpql.append(" AND m.tipo = :tipo");
+            params.put("tipo", tipo);
+        }
+        TypedQuery<Long> q = em.createQuery(jpql.toString(), Long.class);
+        params.forEach(q::setParameter);
+        return q.getSingleResult();
+    }
+
+    private String buildRitardoSort(String sort) {
+        if (sort == null) return " ORDER BY m.dataLiquidita ASC";
+        return switch (sort) {
+            case "importo"      -> " ORDER BY m.importo DESC";
+            case "dataMovimento"-> " ORDER BY m.dataMovimento DESC";
+            default             -> " ORDER BY m.dataLiquidita ASC"; // default: scadenza più vecchia prima
+        };
+    }
 }

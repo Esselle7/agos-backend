@@ -199,6 +199,21 @@ public class MovimentiService {
         return PagedResponse.of(content, page, size, total);
     }
 
+    // ── Feature 1: movimenti "Da liquidare" in ritardo ──────────────────────────
+    //
+    // Movimenti con stato DA_LIQUIDARE, dataFinanziaria IS NULL e dataLiquidita < oggi.
+    // La Mapper.toDTO calcola automaticamente giorniAllaScadenza (negativo = ritardo).
+    // Per le USCITE: "sei in ritardo di |gg| giorni sul pagamento";
+    // per le ENTRATE: "qualcuno è in ritardo di |gg| giorni nel pagarmi".
+    // Le rate ricorrenti NON compaiono qui perché lo scheduler le liquida alla scadenza.
+    public PagedResponse<MovimentoDTO> findDaLiquidareInRitardo(String tipo, int page, int size, String sort) {
+        LocalDate oggi = LocalDate.now();
+        List<MovimentoDTO> content = repo.findDaLiquidareInRitardo(tipo, oggi, page, size, sort)
+                .stream().map(mapper::toDTO).toList();
+        long total = repo.countDaLiquidareInRitardo(tipo, oggi);
+        return PagedResponse.of(content, page, size, total);
+    }
+
     /**
      * Import massivo con deduplication O(1) tramite HashSet pre-caricato.
      * Errori di validazione non bloccano l'intera transazione – solo gli errori

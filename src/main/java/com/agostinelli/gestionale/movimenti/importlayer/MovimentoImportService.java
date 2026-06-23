@@ -24,6 +24,7 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.io.InputStream;
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
@@ -53,6 +54,7 @@ public class MovimentoImportService {
     @Inject RiconciliazioneService riconciliazione;
     @Inject ObjectMapper objectMapper;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService keywordLearning;
+    @Inject MatchingDifferitiService matchingDifferitiService;
 
     @CacheInvalidateAll(cacheName = "dashboard-kpi")
     @CacheInvalidateAll(cacheName = "dashboard-andamento")
@@ -73,6 +75,13 @@ public class MovimentoImportService {
         int importati = 0, duplicati = 0, ambigui = 0, scartati = 0, parcheggiati = 0;
         List<EtlRowError> errori = new ArrayList<>();
         Set<String> rifEsistenti = repo.findRifimentiEsterniByFonte(dbFonte);
+
+        // Feature 2 — Matching differiti: indice in memoria (O(1) lookup per riga) dei movimenti
+        // DA_LIQUIDARE aperti, per riconoscere righe banca che corrispondono a un movimento già
+        // presente in gestionale (match su importo al centesimo + descrizione) ed evitare doppia
+        // registrazione. L'indice è piccolo (decine di righe) e si carica una sola volta.
+        var idxDifferiti = matchingDifferitiService.buildIndiceDifferitiAperti();
+        int matchingDifferiti = 0;
 
         for (RawRow raw : rows) {
             try {
@@ -110,6 +119,19 @@ public class MovimentoImportService {
                     continue;
                 }
 
+                // Feature 2 — Matching differiti: se la riga banca combacia con un movimento
+                // DA_LIQUIDARE esistente (stesso importo al centesimo + stessa descrizione), NON
+                // viene persistita come nuovo movimento. Si salva in matching_differiti e l'utente
+                // risolve dallo smistamento (COLLEGA liquida l'esistente, IGNORA crea comunque).
+                UUID movEsistenteId = matchingDifferitiService.trovaMatch(
+                        idxDifferiti, req.importo(), req.descrizione());
+                if (movEsistenteId != null) {
+                    matchingDifferitiService.salvaMatch(importLogId, movEsistenteId, req,
+                            dbFonte, raw.riga());
+                    matchingDifferiti++;
+                    continue;
+                }
+
                 movimentiService.createMovimentoImport(req, userId, importLogId);
                 if (rif != null && !rif.isBlank()) rifEsistenti.add(rif);
                 importati++;
@@ -122,12 +144,12 @@ public class MovimentoImportService {
 
         String statoFinale = statoFinale(errori.size(), ambigui, rows.size());
         chiudiImportLog(importLogId, rows.size(), importati, errori.size(), duplicati, ambigui,
-                scartati, parcheggiati, 0, statoFinale, errori);
+                scartati, parcheggiati, 0, matchingDifferiti, statoFinale, errori);
 
         if (importati > 0) mvRefresh.requestRefreshAfterCommit();
 
         return new EtlImportResponse(importLogId, importati, duplicati, ambigui, scartati, parcheggiati,
-                0, errori, List.of());
+                0, errori, List.of(), matchingDifferiti);
     }
 
     /**
@@ -219,6 +241,14 @@ public class MovimentoImportService {
         // Diagnostica su file (richiesta utente): righe scartate per dedup → import-traces/diagnostica_<logId>.txt
         List<String> diagDuplicati = new ArrayList<>();
 
+        // Feature 2 — Matching differiti: indice in memoria (O(1) lookup per riga) dei movimenti
+        // DA_LIQUIDARE aperti. Caricato una sola volta a inizio loop; ogni riga banca fa una
+        // lookup nella mappa (chiave = importoAlCentesimo + "|" + descrizione_LOWER_TRIM).
+        // Se la riga combacia con un movimento già presente, NON viene persistita come nuovo
+        // movimento: si salva in matching_differiti e l'utente risolve dallo smistamento.
+        var idxDifferiti = matchingDifferitiService.buildIndiceDifferitiAperti();
+        int matchingDifferiti = 0;
+
         for (RawMovimentoArricchito a : ds.daMappare()) {
             RawMovimento n = a.banca();
             RawRow raw = n.rawOriginale();
@@ -261,6 +291,22 @@ public class MovimentoImportService {
                     traceRiga(trace, n, recon, "DUPLICATO", "rif già presente");
                     continue;
                 }
+
+                // Feature 2 — Matching differiti: riga banca che combacia con un movimento
+                // DA_LIQUIDARE già presente in gestionale (importo al centesimo + descrizione
+                // uguale). NON persistiamo la riga come nuovo movimento: si salva in
+                // matching_differiti e l'utente risolve dallo smistamento (COLLEGA/IGNORA).
+                UUID movEsistenteId = matchingDifferitiService.trovaMatch(
+                        idxDifferiti, req.importo(), req.descrizione());
+                if (movEsistenteId != null) {
+                    matchingDifferitiService.salvaMatch(importLogId, movEsistenteId, req,
+                            n.fonte(), raw.riga());
+                    matchingDifferiti++;
+                    traceRiga(trace, n, recon, "MATCH_DIFFERITO",
+                            "riconcilia con movimento DA_LIQUIDARE " + movEsistenteId);
+                    continue;
+                }
+
                 var creato = movimentiService.createMovimentoImport(req, userId, importLogId);
                 // Conflitto keyword di MATCH (§4.6): la riga è booked sul transitorio; registra il
                 // conflitto così l'utente lo risolve dalla pagina Gestione Keyword (mai catalog cieco).
@@ -310,13 +356,14 @@ public class MovimentoImportService {
         List<EtlRowError> diagnostica = new ArrayList<>(errori);
         diagnostica.addAll(avvisi);
         chiudiImportLog(importLogId, totali, importati, errori.size(), duplicati, ambigui,
-                scartati, parcheggiati, ricorrenti, statoFinale, diagnostica);
+                scartati, parcheggiati, ricorrenti, matchingDifferiti, statoFinale, diagnostica);
 
         // [DEBUG] SUMMARY DB: come sono catalogati i movimenti creati da questo import.
         trace.section("ESITI (totali)")
                 .kv("importati", importati).kv("duplicati", duplicati).kv("ambigui", ambigui)
                 .kv("scartati", scartati).kv("parcheggiati (eventi)", parcheggiati)
                 .kv("ricorrenti parcheggiate", ricorrenti)
+                .kv("matching differiti (riconciliazione manuale)", matchingDifferiti)
                 .kv("errori", errori.size())
                 .kv("avvisi (eventi attesi + in attesa accredito)", avvisi.size());
         scriviSummaryDb(trace, importLogId);
@@ -462,6 +509,7 @@ public class MovimentoImportService {
         long eventi = contaPerImport("eventi_da_riconciliare", importLogId);
         long ambiguita = contaPerImport("import_ambiguita", importLogId);
         long ricorrenti = contaPerImport("ricorrenti_da_riconciliare", importLogId);
+        long matchingDifferiti = contaPerImport("matching_differiti", importLogId);
 
         int movimenti = em.createNativeQuery(
                 "DELETE FROM movimenti WHERE fonte_importazione_id = :id")
@@ -472,8 +520,8 @@ public class MovimentoImportService {
                 .setParameter("id", importLogId).executeUpdate();
 
         mvRefresh.requestRefreshAfterCommit();
-        log.infof("Rollback import %s: rimossi %d movimenti, %d scartati, %d eventi, %d ambiguità, %d ricorrenti",
-                importLogId, movimenti, scartati, eventi, ambiguita, ricorrenti);
+        log.infof("Rollback import %s: rimossi %d movimenti, %d scartati, %d eventi, %d ambiguità, %d ricorrenti, %d matching differiti",
+                importLogId, movimenti, scartati, eventi, ambiguita, ricorrenti, matchingDifferiti);
 
         return Map.of(
                 "importLogId", importLogId.toString(),
@@ -481,7 +529,8 @@ public class MovimentoImportService {
                 "scartatiEliminati", scartati,
                 "eventiEliminati", eventi,
                 "ambiguitaEliminate", ambiguita,
-                "ricorrentiEliminate", ricorrenti);
+                "ricorrentiEliminate", ricorrenti,
+                "matchingDifferitiEliminati", matchingDifferiti);
     }
 
     private long contaPerImport(String tabella, UUID importLogId) {
@@ -600,11 +649,13 @@ public class MovimentoImportService {
 
     private void chiudiImportLog(UUID id, int totali, int importate, int errore, int duplicate,
                                  int ambigue, int scartate, int parcheggiate, int ricorrenti,
+                                 int matchingDifferiti,
                                  String stato, List<EtlRowError> errori) {
         em.createNativeQuery(
                         "UPDATE import_log SET righe_totali = :tot, righe_importate = :imp, " +
                         "righe_errore = :err, righe_duplicate = :dup, righe_ambigue = :amb, " +
                         "righe_scartate = :sca, righe_parcheggiate = :par, righe_ricorrenti = :ric, " +
+                        "righe_matching_differiti = :mat, " +
                         "stato = :stato, errori_dettaglio = CAST(:json AS jsonb) WHERE id = :id")
                 .setParameter("tot", totali)
                 .setParameter("imp", importate)
@@ -614,6 +665,7 @@ public class MovimentoImportService {
                 .setParameter("sca", scartate)
                 .setParameter("par", parcheggiate)
                 .setParameter("ric", ricorrenti)
+                .setParameter("mat", matchingDifferiti)
                 .setParameter("stato", stato)
                 .setParameter("json", toJson(errori))
                 .setParameter("id", id)

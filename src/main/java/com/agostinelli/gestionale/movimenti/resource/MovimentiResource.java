@@ -38,6 +38,7 @@ public class MovimentiResource {
     @Inject ImportLogService importLogService;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.ImportTriageService triageService;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService keywordService;
+    @Inject com.agostinelli.gestionale.movimenti.importlayer.MatchingDifferitiService matchingDifferitiService;
 
     @GET
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
@@ -85,6 +86,25 @@ public class MovimentiResource {
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
     public MovimentoDTO findById(@PathParam("id") UUID id) {
         return service.findById(id);
+    }
+
+    // ── Feature 1: movimenti "Da liquidare" in ritardo ──────────────────────────
+    // Lista paginata dei movimenti manuali in stato DA_LIQUIDARE con scadenza passata.
+    // Il campo derivato giorniAllaScadenza (sul MovimentoDTO) è negativo e rappresenta
+    // il ritardo in giorni: per USCITA = "sei in ritardo sul pagamento",
+    // per ENTRATA = "qualcuno è in ritardo nel pagarmi".
+    // Le rate dei piani di spesa ricorrente NON compaiono qui (lo scheduler le liquida
+    // alla scadenza, quindi sono sempre REGISTRATE e non DA_LIQUIDARE).
+    @GET
+    @Path("/da-liquidare-in-ritardo")
+    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    public PagedResponse<MovimentoDTO> daLiquidareInRitardo(
+            @QueryParam("tipo") String tipo,
+            @QueryParam("page") @DefaultValue("0") int page,
+            @QueryParam("size") @DefaultValue("20") int size,
+            @QueryParam("sort") String sort) {
+        int safeSize = Math.min(Math.max(size, 1), MAX_SIZE);
+        return service.findDaLiquidareInRitardo(tipo, page, safeSize, sort);
     }
 
     @POST
@@ -309,6 +329,34 @@ public class MovimentiResource {
                                       @Context SecurityContext ctx) {
         UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
         triageService.risolviRicorrente(id, req, userId);
+        return Response.noContent().build();
+    }
+
+    // ── Feature 2 — Matching differiti (V11): righe banca che combaciano con ────
+    //    movimenti DA_LIQUIDARE già presenti in gestionale (match su importo al centesimo +
+    //    descrizione uguale). Evita la doppia registrazione: la riga banca NON diventa movimento
+    //    in fase di import, viene parcheggiata qui. L'utente risolve dallo smistamento scegliendo
+    //    COLLEGA (liquida il movimento esistente con i dati della riga banca) oppure
+    //    IGNORA (crea comunque un nuovo movimento dalla riga banca — falso positivo del match).
+
+    @GET
+    @Path("/import/matching-differiti")
+    @RolesAllowed("ADMIN")
+    public PagedResponse<MatchingDifferitoDTO> listMatchingDifferiti(
+            @QueryParam("stato") @DefaultValue("DA_RICONCILIARE") String stato,
+            @QueryParam("page") @DefaultValue("0") int page,
+            @QueryParam("size") @DefaultValue("20") int size) {
+        return matchingDifferitiService.list(stato, page, Math.min(Math.max(size, 1), MAX_TRIAGE_SIZE));
+    }
+
+    @PUT
+    @Path("/import/matching-differiti/{id}/risolvi")
+    @RolesAllowed("ADMIN")
+    public Response risolviMatchingDifferito(@PathParam("id") UUID id,
+                                             @Valid RisolviMatchingDifferitoRequest req,
+                                             @Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        matchingDifferitiService.risolvi(id, req, userId);
         return Response.noContent().build();
     }
 

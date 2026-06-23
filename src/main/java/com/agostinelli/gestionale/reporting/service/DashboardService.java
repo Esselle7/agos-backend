@@ -313,7 +313,53 @@ public class DashboardService {
                     );
                 }).toList();
 
-        return new ScadenzeImminentiDTO(eventi, rateRicorrenti, usciteDaLiquidare);
+        // ── Query 4: entrate DA_LIQUIDARE con data_liquidita (incassi attesi) ──
+        // Simmetrica alla Query 3 ma su tipo='ENTRATA': incassi economicamente registrati
+        // (data_movimento <= oggi) non ancora arrivati sul conto (data_finanziaria IS NULL),
+        // con una scadenza attesa. Usata dallo Scadenzario come "Incassi da ricevere".
+        @SuppressWarnings("unchecked")
+        List<Object[]> entrateRows = em.createNativeQuery(
+                "SELECT m.id, m.descrizione, m.importo_lordo, " +
+                "m.data_movimento, m.data_liquidita, " +
+                "c.nome AS categoria_nome, bu.nome AS bu_nome, " +
+                "COALESCE(f.alias, f.ragione_sociale) AS fornitore_nome " +
+                "FROM movimenti m " +
+                "LEFT JOIN categorie c  ON c.id = m.categoria_id " +
+                "JOIN  business_units bu ON bu.id = m.business_unit_id " +
+                "LEFT JOIN fornitori f  ON f.id = m.fornitore_id " +
+                "WHERE m.tipo = 'ENTRATA' " +
+                "  AND m.stato = 'DA_LIQUIDARE' " +
+                "  AND m.data_movimento <= CURRENT_DATE " +
+                "  AND m.data_finanziaria IS NULL " +
+                "  AND m.data_liquidita IS NOT NULL " +
+                "ORDER BY m.data_liquidita ASC " +
+                "LIMIT 100")
+                .getResultList();
+
+        List<UscitaDaLiquidareDTO> entrateDaRicevere = entrateRows.stream()
+                .map(r -> {
+                    LocalDate scadenza = toLocalDate(r[4]);
+                    long gg = ChronoUnit.DAYS.between(oggi, scadenza);
+                    String urgenza;
+                    if (gg < 0)       urgenza = "SCADUTA";
+                    else if (gg < 7)  urgenza = "ALTA";
+                    else if (gg < 30) urgenza = "MEDIA";
+                    else              urgenza = "BASSA";
+                    return new UscitaDaLiquidareDTO(
+                            toUUID(r[0]),
+                            (String) r[1],
+                            toBD(r[2]),
+                            toLocalDate(r[3]),
+                            scadenza,
+                            gg,
+                            urgenza,
+                            (String) r[5],
+                            (String) r[6],
+                            (String) r[7]
+                    );
+                }).toList();
+
+        return new ScadenzeImminentiDTO(eventi, rateRicorrenti, usciteDaLiquidare, entrateDaRicevere);
     }
 
     // ── helpers privati ───────────────────────────────────────────────────────

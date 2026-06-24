@@ -48,7 +48,7 @@ public class ReportJobService {
     }
 
     // WHY in-memory e non DB: per MVP è sufficiente; i job durano < 30 secondi.
-    // LIMITE DOCUMENTATO: job persi al restart JVM (Neon può mettere in idle il serverless).
+    // LIMITE DOCUMENTATO: job persi al restart JVM (in-memory, non persistiti su DB).
     @Scheduled(every = "10m")
     void cleanupOldJobs() {
         store.entrySet().removeIf(e ->

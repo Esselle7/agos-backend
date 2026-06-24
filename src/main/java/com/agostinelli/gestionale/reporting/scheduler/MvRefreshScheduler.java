@@ -19,8 +19,8 @@ public class MvRefreshScheduler {
     @Inject
     MvRefreshRunner runner;
 
-    // WHY intervallo configurabile: su Neon free tier il cold-start può allungare il refresh;
-    // permettere di aumentare l'intervallo via env var senza deploy.
+    // WHY intervallo configurabile: permette di tarare la frequenza del refresh via env var
+    // senza deploy, in base al carico.
     @Scheduled(every = "${reporting.mv.refresh-interval:30m}")
     void refreshMaterializedViews() {
         try {
@@ -28,7 +28,7 @@ public class MvRefreshScheduler {
             runner.refresh();
             log.infof("MV refresh schedulato completato in %dms", System.currentTimeMillis() - start);
         } catch (Exception e) {
-            log.warnf("MV refresh schedulato fallito (Neon potrebbe essere in sleep): %s", e.getMessage());
+            log.warnf("MV refresh schedulato fallito: %s", e.getMessage());
         }
     }
 }

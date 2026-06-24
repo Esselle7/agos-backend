@@ -10,8 +10,8 @@ import org.jboss.logging.Logger;
 /**
  * Ricalcolo notturno della {@code forecast_baseline} (layer STIMATO del previsionale).
  *
- * <p>Riusa il pattern di {@link MvRefreshScheduler}: try/catch + log, tollerante a Neon in sleep
- * (su free tier il cold-start può far fallire il primo tentativo). Il job è idempotente
+ * <p>Riusa il pattern di {@link MvRefreshScheduler}: try/catch + log, tollerante a errori
+ * transitori del DB. Il job è idempotente
  * (DELETE+INSERT) → un'esecuzione persa la notte non rompe nulla, la successiva riallinea.</p>
  */
 @ApplicationScoped
@@ -28,7 +28,7 @@ public class ForecastBaselineScheduler {
             int n = service.recompute();
             log.infof("Forecast baseline ricalcolata: %d segmenti", n);
         } catch (Exception e) {
-            log.warnf("Ricalcolo forecast baseline fallito (Neon potrebbe essere in sleep): %s", e.getMessage());
+            log.warnf("Ricalcolo forecast baseline fallito: %s", e.getMessage());
         }
     }
 

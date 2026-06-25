@@ -26,7 +26,7 @@ import java.util.regex.Pattern;
  * restituisce AMBIGUOUS: nessuna euristica per "provare a mappare".
  */
 @ApplicationScoped
-public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
+public class MovimentoMappingEngineImpl {
 
     @Inject EntityManager em;
     @Inject RegoleClassificazioneEngine regoleEngine;
@@ -90,7 +90,6 @@ public class MovimentoMappingEngineImpl implements MovimentoMappingEngine {
         String keywordConflittoSig; // se valorizzato → conflitto keyword di MATCH (riga su transitorio)
     }
 
-    @Override
     public MappingResult map(RawMovimento n) {
         ensureLoaded();
 

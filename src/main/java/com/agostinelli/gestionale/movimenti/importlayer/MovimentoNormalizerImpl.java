@@ -17,7 +17,7 @@ import java.util.regex.Pattern;
  * Normalizzatore unico per le tre fonti. Esegue solo trasformazioni di formato
  * (date, importi, descrizioni, tipo, conto/metodo deterministici dalla fonte,
  * giroconto, riferimento esterno). NON accede al DB: coge/BU/fornitore/evento
- * sono delegati al {@link MovimentoMappingEngine}.
+ * sono delegati al {@link MovimentoMappingEngineImpl}.
  *
  * La fonte è riconosciuta dal discriminatore {@link Sorgente#KEY} iniettato dai parser.
  */

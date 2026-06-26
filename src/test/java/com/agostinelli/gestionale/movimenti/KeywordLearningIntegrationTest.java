@@ -17,6 +17,7 @@ import org.junit.jupiter.api.*;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -102,6 +103,29 @@ class KeywordLearningIntegrationTest {
         assertEquals(MappingResult.MappingOutcome.SUCCESS, r.outcome());
         assertEquals(cogeId("30.03.001"), r.request().contoCoge(), "SPACCIO → ricavi spaccio");
         assertEquals((short) 3, (short) r.request().businessUnitId(), "SPACCIO → BU3");
+    }
+
+    @Test
+    void listFirme_tokenRaggruppatiPerFirma() {
+        // Due firme BOOK con token distinti: listFirme deve restituire a ciascuna i SUOI token
+        // (la lettura batch non deve mischiare i token tra firme).
+        UUID a = learning.createFirma(firmaBook(List.of("ALFA", "BETA"), (short) 5, "40.11.001"));
+        UUID b = learning.createFirma(firmaBook(List.of("GAMMA"), (short) 3, "30.03.001"));
+
+        Map<UUID, List<String>> tokenById = learning.listFirme(null, null).stream()
+                .collect(java.util.stream.Collectors.toMap(
+                        com.agostinelli.gestionale.movimenti.dto.KeywordFirmaDTO::id,
+                        com.agostinelli.gestionale.movimenti.dto.KeywordFirmaDTO::token));
+
+        assertEquals(List.of("ALFA", "BETA"), tokenById.get(a), "token della firma A, ordinati");
+        assertEquals(List.of("GAMMA"), tokenById.get(b), "token della firma B");
+    }
+
+    private com.agostinelli.gestionale.movimenti.dto.KeywordFirmaDTO firmaBook(
+            List<String> token, short bu, String coge) {
+        return new com.agostinelli.gestionale.movimenti.dto.KeywordFirmaDTO(
+                null, "DOMINIO", "BOOK", "*", "*", bu, coge, null, null, null,
+                null, "MANUALE", "ATTIVA", null, token, null);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────

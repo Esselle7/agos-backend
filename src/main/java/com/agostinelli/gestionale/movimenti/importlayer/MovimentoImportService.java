@@ -18,6 +18,7 @@ import io.quarkus.cache.CacheInvalidateAll;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.FlushModeType;
 import jakarta.transaction.Transactional;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
@@ -169,6 +170,13 @@ public class MovimentoImportService {
     @Transactional
     public EtlImportResponse importCongiunto(InputStream billy, InputStream bpm, InputStream ca,
                                              String fnBilly, String fnBpm, String fnCa, UUID userId) {
+        // Le native executeUpdate dei rami skip (scartati/ambigui/parcheggiati) altrimenti
+        // forzano un auto-flush del persistence context ad ogni riga: rompono il batch JDBC dei
+        // movimenti managed e ri-dirty-checkano il context che cresce (O(n²): 27ms/riga su 949).
+        // COMMIT differisce il flush dei managed al commit (batch unico); le native colpiscono il
+        // DB subito comunque, e nel loop nessuna native rilegge i movimenti persistiti → sicuro.
+        em.setFlushMode(FlushModeType.COMMIT);
+
         mappingEngine.refreshLookups();
 
         UUID importLogId = creaImportLog("IMPORT_CONGIUNTO", fileLabel(fnBilly, fnBpm, fnCa), userId);

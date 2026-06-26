@@ -58,10 +58,18 @@ public class JwtService {
     @PostConstruct
     void init() {
         try {
+            // security: in produzione (NORMAL) le chiavi DEVONO arrivare dalle env
+            // BASE64_*. Vietiamo il fallback silenzioso sui .pem di dev impacchettati
+            // nell'artifact: firmare con una chiave nota inclusa nel jar permetterebbe
+            // di forgiare token. In dev/test il fallback su classpath resta.
+            boolean prod = io.quarkus.runtime.LaunchMode.current() == io.quarkus.runtime.LaunchMode.NORMAL;
+
             if (!base64PrivateKey.isBlank()) {
                 byte[] keyBytes = Base64.getDecoder().decode(base64PrivateKey);
                 privateKey = (RSAPrivateKey) KeyFactory.getInstance("RSA")
                     .generatePrivate(new PKCS8EncodedKeySpec(keyBytes));
+            } else if (prod) {
+                throw new IllegalStateException("BASE64_PRIVATE_KEY obbligatoria in produzione");
             } else {
                 privateKey = loadPrivateKeyFromClasspath("privateKey.pem");
                 if (privateKey == null) {
@@ -73,12 +81,16 @@ public class JwtService {
                 byte[] keyBytes = Base64.getDecoder().decode(base64PublicKey);
                 publicKey = (RSAPublicKey) KeyFactory.getInstance("RSA")
                     .generatePublic(new X509EncodedKeySpec(keyBytes));
+            } else if (prod) {
+                throw new IllegalStateException("BASE64_PUBLIC_KEY obbligatoria in produzione");
             } else {
                 publicKey = loadPublicKeyFromClasspath("publicKey.pem");
                 if (publicKey == null) {
                     log.warn("BASE64_PUBLIC_KEY non configurata e publicKey.pem non trovato: la validazione interna dei token fallirà");
                 }
             }
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
             log.error("Errore caricamento chiavi RSA per JWT: {}", e.getMessage());
         }

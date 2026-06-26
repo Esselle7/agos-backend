@@ -35,7 +35,8 @@ class EventiIntegrationTest {
     private static Integer metodoPagamentoId;
     private static Short   contoBancarioId;
     private static Integer contoCoge;
-    private static String  personaleId;  // UUID stringa, inserito nel @BeforeEach
+    private static String  personaleId;        // UUID stringa, MENSILE, inserito nel @BeforeEach
+    private static String  personaleOrariaId;  // UUID stringa, ORARIA con paga oraria (per allocaOre)
 
     @BeforeEach
     @Transactional
@@ -63,6 +64,17 @@ class EventiIntegrationTest {
                     .executeUpdate();
             personaleId = em
                     .createNativeQuery("SELECT id FROM personale WHERE nome='Test' AND cognome='Personale'")
+                    .getSingleResult()
+                    .toString();
+        }
+        if (personaleOrariaId == null) {
+            em.createNativeQuery(
+                    "INSERT INTO personale (nome, cognome, is_active, tipo_retribuzione, paga_oraria) " +
+                    "VALUES ('Test', 'Oraria', true, 'ORARIA', 20.00) " +
+                    "ON CONFLICT DO NOTHING")
+                    .executeUpdate();
+            personaleOrariaId = em
+                    .createNativeQuery("SELECT id FROM personale WHERE nome='Test' AND cognome='Oraria'")
                     .getSingleResult()
                     .toString();
         }
@@ -573,6 +585,66 @@ class EventiIntegrationTest {
                 .body("code", equalTo("EVENTO_ANNULLATO"));
     }
 
+    @Test
+    @Order(75)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void saldoPienoSuEventoPreventivato_portaASaldato() {
+        // Pagamento in un'unica soluzione (SALDO) su un evento ancora PREVENTIVATO:
+        // un evento incassato al 100% NON può restare PREVENTIVATO.
+        String id = creaEventoTest("Evento Saldo da Preventivato", "1000");
+        given().when().get("/api/eventi/" + id).then().body("stato", equalTo("PREVENTIVATO"));
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("SALDO", "1000.00"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(201)
+                .header("X-Suggest-Completamento", equalTo("true"));
+
+        given()
+            .when().get("/api/eventi/" + id)
+            .then()
+                .body("importoResiduo", equalTo(0.0f))
+                .body("stato",          equalTo("SALDATO"));
+    }
+
+    @Test
+    @Order(76)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void pagamentoSuEventoSaldato_409() {
+        String id = creaEventoConfermato("Evento Saldato Poi Pagamento", "500");
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("SALDO", "500.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("ACCONTO", "100.00"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("EVENTO_SALDATO"));
+    }
+
+    @Test
+    @Order(77)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void doppiaCaparra_409() {
+        String id = creaEventoConfermato("Evento Doppia Caparra", "2000");
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("CAPARRA", "500.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("CAPARRA", "300.00"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("PAGAMENTO_GIA_PRESENTE"));
+    }
+
     // ── 9. Pagamenti – RIMBORSO ───────────────────────────────────────────────
 
     @Test
@@ -600,6 +672,28 @@ class EventiIntegrationTest {
             .then()
                 .body("importoIncassato", equalTo(600.0f))
                 .body("importoResiduo",   equalTo(1400.0f));
+    }
+
+    @Test
+    @Order(81)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void rimborsoSuperaIncassato_409() {
+        String id = creaEventoConfermato("Evento Rimborso Eccessivo", "2000");
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("CAPARRA", "500.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        // Rimborso > incassato: vietato (porterebbe importoIncassato negativo)
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("RIMBORSO", "800.00"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("RIMBORSO_SUPERA_INCASSATO"));
+
+        given().when().get("/api/eventi/" + id)
+            .then().body("importoIncassato", equalTo(500.0f));
     }
 
     // ── 10. Flusso completo: PREVENTIVATO → CONFERMATO → SALDATO ─────────────
@@ -951,6 +1045,170 @@ class EventiIntegrationTest {
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
+
+    // ── 11. Costi diretti (DJ/Torta/Custom → movimento USCITA DA_LIQUIDARE) ─────
+
+    @Test
+    @Order(100)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void costoDiretto_crud_djCreaMovimentoEPoiRimuovi() {
+        String id = creaEventoTest("Evento Costi DJ", "5000");
+        int costoId = given().contentType(ContentType.JSON)
+            .body("""
+                {"tipoCosto":"FISSO","voce":"DJ","importo":300.00}
+                """)
+            .when().post("/api/eventi/" + id + "/costi-diretti")
+            .then().statusCode(201)
+                .body("voce",        equalTo("DJ"))
+                .body("etichetta",   equalTo("DJ e Intrattenimento"))
+                .body("importo",     equalTo(300.0f))
+                .body("movimentoId", notNullValue())
+            .extract().path("id");
+
+        given().when().get("/api/eventi/" + id + "/costi-diretti")
+            .then().statusCode(200).body("size()", equalTo(1));
+
+        given().when().delete("/api/eventi/" + id + "/costi-diretti/" + costoId)
+            .then().statusCode(204);
+
+        given().when().get("/api/eventi/" + id + "/costi-diretti")
+            .then().statusCode(200).body("size()", equalTo(0));
+    }
+
+    @Test
+    @Order(101)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void costoDiretto_voceNonValida_400() {
+        String id = creaEventoTest("Evento Voce Errata", "1000");
+        given().contentType(ContentType.JSON)
+            .body("""
+                {"tipoCosto":"FISSO","voce":"PIPPO","importo":100.00}
+                """)
+            .when().post("/api/eventi/" + id + "/costi-diretti")
+            .then().statusCode(400).body("code", equalTo("VOCE_NON_VALIDA"));
+    }
+
+    @Test
+    @Order(102)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void costoDiretto_customSenzaEtichetta_400() {
+        String id = creaEventoTest("Evento Custom No Label", "1000");
+        given().contentType(ContentType.JSON)
+            .body("""
+                {"tipoCosto":"VARIABILE","voce":"CUSTOM","importo":100.00}
+                """)
+            .when().post("/api/eventi/" + id + "/costi-diretti")
+            .then().statusCode(400).body("code", equalTo("ETICHETTA_MANCANTE"));
+    }
+
+    @Test
+    @Order(103)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void costoDiretto_eventoAnnullato_409() {
+        String id = creaEventoTest("Evento Annullato Costo", "1000");
+        given().contentType(ContentType.JSON)
+                .body("{\"stato\":\"ANNULLATO\",\"noteAnnullamento\":\"Test\"}")
+                .when().put("/api/eventi/" + id).then().statusCode(200);
+        given().contentType(ContentType.JSON)
+            .body("""
+                {"tipoCosto":"FISSO","voce":"DJ","importo":100.00}
+                """)
+            .when().post("/api/eventi/" + id + "/costi-diretti")
+            .then().statusCode(409).body("code", equalTo("EVENTO_ANNULLATO"));
+    }
+
+    @Test
+    @Order(104)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void getCostiDiretti_eventoInesistente_404() {
+        given().when().get("/api/eventi/" + NIL_UUID + "/costi-diretti")
+            .then().statusCode(404);
+    }
+
+    // ── 12. Ore su partecipante (paga oraria → movimento costo) ─────────────────
+
+    @Test
+    @Order(110)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void allocaOre_oraria_creaCostoEPoiRimuovi() {
+        String id = creaEventoTest("Evento Ore Oraria", "5000");
+        int pid = given().contentType(ContentType.JSON)
+            .body("""
+                {"personaleId":"%s","ruolo":"Cameriere"}
+                """.formatted(personaleOrariaId))
+            .when().post("/api/eventi/" + id + "/partecipanti")
+            .then().statusCode(201).extract().path("id");
+
+        // 20 EUR/h × 5h = 100.00
+        given().contentType(ContentType.JSON)
+            .body("""
+                {"ore":5.0}
+                """)
+            .when().post("/api/eventi/partecipanti/" + pid + "/ore")
+            .then().statusCode(200)
+                .body("ore",   equalTo(5.0f))
+                .body("costo", equalTo(100.0f));
+
+        given().when().delete("/api/eventi/partecipanti/" + pid + "/ore")
+            .then().statusCode(200).body("costo", nullValue());
+    }
+
+    @Test
+    @Order(111)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void allocaOre_dipendenteNonOrario_400() {
+        String id = creaEventoTest("Evento Ore Mensile", "5000");
+        int pid = given().contentType(ContentType.JSON)
+            .body("""
+                {"personaleId":"%s","ruolo":"Cuoco"}
+                """.formatted(personaleId))
+            .when().post("/api/eventi/" + id + "/partecipanti")
+            .then().statusCode(201).extract().path("id");
+
+        given().contentType(ContentType.JSON)
+            .body("""
+                {"ore":3.0}
+                """)
+            .when().post("/api/eventi/partecipanti/" + pid + "/ore")
+            .then().statusCode(400).body("code", equalTo("NON_ORARIA"));
+    }
+
+    @Test
+    @Order(112)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void allocaOre_partecipanteInesistente_404() {
+        given().contentType(ContentType.JSON)
+            .body("""
+                {"ore":2.0}
+                """)
+            .when().post("/api/eventi/partecipanti/999999/ore")
+            .then().statusCode(404);
+    }
+
+    // ── 13. Monitoring preventivato (AFFITTO/CATERING, no contabilità) ──────────
+
+    @Test
+    @Order(120)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void preventivoTracking_upsertGetRimuovi() {
+        String id = creaEventoTest("Evento Preventivo Tracking", "5000");
+        int tid = given().contentType(ContentType.JSON)
+            .body("""
+                {"tipo":"AFFITTO","importoIncasso":1200.00}
+                """)
+            .when().post("/api/eventi/" + id + "/preventivo-tracking")
+            .then().statusCode(200).body("tipo", equalTo("AFFITTO"))
+            .extract().path("id");
+
+        given().when().get("/api/eventi/" + id + "/preventivo-tracking")
+            .then().statusCode(200).body("size()", equalTo(1));
+
+        given().when().delete("/api/eventi/" + id + "/preventivo-tracking/" + tid)
+            .then().statusCode(204);
+
+        given().when().get("/api/eventi/" + id + "/preventivo-tracking")
+            .then().statusCode(200).body("size()", equalTo(0));
+    }
 
     private String creaEventoTest(String nome, String importo) {
         String importoJson = importo != null ? "\"importoTotalePreviventivato\":" + importo + "," : "";

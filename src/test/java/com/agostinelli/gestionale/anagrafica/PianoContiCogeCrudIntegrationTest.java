@@ -119,6 +119,46 @@ class PianoContiCogeCrudIntegrationTest {
     }
 
     @Test
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void delete_contoSenzaDipendenze_spariscoDallaLista() {
+        Integer id = given().contentType(ContentType.JSON)
+            .body("""
+                {"codice":"ZZ.60","descrizione":"Da eliminare","tipo":"RICAVO","parentId":null}
+                """)
+            .when().post("/api/piano-dei-conti")
+            .then().statusCode(201).extract().path("id");
+
+        given().when().delete("/api/piano-dei-conti/" + id).then().statusCode(204);
+
+        given().queryParam("tipo", "all")
+            .when().get("/api/piano-dei-conti")
+            .then().statusCode(200).body("codice", not(hasItem("ZZ.60")));
+    }
+
+    @Test
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void delete_contoReferenziatoDaRegola_409() {
+        Integer id = given().contentType(ContentType.JSON)
+            .body("""
+                {"codice":"ZZ.61","descrizione":"Usato","tipo":"RICAVO","parentId":null}
+                """)
+            .when().post("/api/piano-dei-conti")
+            .then().statusCode(201).extract().path("id");
+
+        insertRegola("ZZ.61", "ZZTESTDELETE");
+
+        given().when().delete("/api/piano-dei-conti/" + id)
+            .then().statusCode(409).body("code", equalTo("CONTO_REFERENZIATO"));
+    }
+
+    @Test
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void delete_contoInesistente_404() {
+        given().when().delete("/api/piano-dei-conti/999999")
+            .then().statusCode(404).body("code", equalTo("CONTO_NON_TROVATO"));
+    }
+
+    @Test
     @TestSecurity(user = "test-dip", roles = {"DIPENDENTE"})
     void create_nonAdmin_403() {
         given().contentType(ContentType.JSON)
@@ -131,9 +171,15 @@ class PianoContiCogeCrudIntegrationTest {
 
     @Transactional
     void insertRegola(String cogeCodice) {
+        insertRegola(cogeCodice, "ZZTESTCASCADE");
+    }
+
+    @Transactional
+    void insertRegola(String cogeCodice, String pattern) {
         em.createNativeQuery(
                 "INSERT INTO regole_classificazione (priorita, campo, match_type, pattern, azione, coge_codice) " +
-                "VALUES (100, 'DESCRIZIONE', 'CONTAINS', 'ZZTESTCASCADE', 'BOOK', :coge)")
+                "VALUES (100, 'DESCRIZIONE', 'CONTAINS', :pattern, 'BOOK', :coge)")
+                .setParameter("pattern", pattern)
                 .setParameter("coge", cogeCodice)
                 .executeUpdate();
     }
@@ -145,7 +191,7 @@ class PianoContiCogeCrudIntegrationTest {
 
     @Transactional
     void cleanupTx() {
-        em.createNativeQuery("DELETE FROM regole_classificazione WHERE pattern = 'ZZTESTCASCADE'").executeUpdate();
+        em.createNativeQuery("DELETE FROM regole_classificazione WHERE pattern LIKE 'ZZTEST%'").executeUpdate();
         em.createNativeQuery("DELETE FROM piano_dei_conti_coge WHERE codice LIKE 'ZZ.%'").executeUpdate();
     }
 }

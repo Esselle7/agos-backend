@@ -32,14 +32,14 @@ public class RateLimitFilter implements ContainerRequestFilter {
 
     @Override
     public void filter(ContainerRequestContext requestContext) throws IOException {
-        String clientIp = extractClientIp(requestContext);
-        AtomicInteger counter = requestCounts.computeIfAbsent(clientIp, k -> new AtomicInteger(0));
+        String clientKey = extractClientKey(requestContext);
+        AtomicInteger counter = requestCounts.computeIfAbsent(clientKey, k -> new AtomicInteger(0));
         int current = counter.incrementAndGet();
 
         int remaining = Math.max(0, maxRequestsPerMinute - current);
 
         if (current > maxRequestsPerMinute) {
-            log.warn("Rate limit superato per IP: {}", clientIp);
+            log.warn("Rate limit superato per client: {}", clientKey);
             requestContext.abortWith(
                     Response.status(429)
                             .header("X-RateLimit-Remaining", "0")
@@ -58,10 +58,34 @@ public class RateLimitFilter implements ContainerRequestFilter {
         log.debug("Rate limit counters azzerati");
     }
 
+    /**
+     * Chiave del bucket: l'utente autenticato (sub JWT) se presente, altrimenti l'IP.
+     * Keyare per-utente evita che più utenti legittimi dietro lo stesso IP/NAT (es. l'ufficio
+     * dell'agriturismo su un'unica connessione) condividano e saturino lo stesso bucket.
+     * Prefissi "u:"/"ip:" così un IP non può impersonare il bucket di un sub.
+     */
+    String extractClientKey(ContainerRequestContext ctx) {
+        if (ctx.getSecurityContext() != null && ctx.getSecurityContext().getUserPrincipal() != null) {
+            return "u:" + ctx.getSecurityContext().getUserPrincipal().getName();
+        }
+        return "ip:" + extractClientIp(ctx);
+    }
+
     private String extractClientIp(ContainerRequestContext ctx) {
+        // security: topologia reale = Cloudflare → Traefik → backend. Cloudflare imposta
+        // CF-Connecting-IP con il vero IP client e NON è appendibile dal client (a patto che
+        // l'origine accetti traffico solo da Cloudflare — vedi hardening firewall). È quindi
+        // la sorgente corretta e non falsificabile per il bucket del rate limit per-utente.
+        String cf = ctx.getHeaderString("CF-Connecting-IP");
+        if (cf != null && !cf.isBlank()) {
+            return cf.trim();
+        }
+        // Fallback (hit diretto su Traefik, senza Cloudflare): l'ultimo hop di X-Forwarded-For
+        // è quello aggiunto dal proxy, non il valore forgiato dal client (che finisce a sinistra).
         String forwarded = ctx.getHeaderString("X-Forwarded-For");
         if (forwarded != null && !forwarded.isBlank()) {
-            return forwarded.split(",")[0].trim();
+            String[] hops = forwarded.split(",");
+            return hops[hops.length - 1].trim();
         }
         return ctx.getHeaderString("X-Real-IP") != null
                 ? ctx.getHeaderString("X-Real-IP")

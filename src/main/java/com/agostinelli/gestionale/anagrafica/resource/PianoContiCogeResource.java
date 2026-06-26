@@ -43,4 +43,12 @@ public class PianoContiCogeResource {
     public PianoContiCogeDTO update(@PathParam("id") Integer id, @Valid PianoContiCogeUpsertRequest req) {
         return repo.update(id, req);
     }
+
+    @DELETE
+    @Path("/{id}")
+    @RolesAllowed("ADMIN")
+    public Response delete(@PathParam("id") Integer id) {
+        repo.softDelete(id);
+        return Response.noContent().build();
+    }
 }

@@ -236,10 +236,21 @@ public class EventiService {
                     "Su un evento annullato è consentita solo la registrazione di una PENALE");
         }
 
-        // Importo > 0
+        // Importo > 0. Difesa in profondità su percorso-soldi: la REST API ha già @Positive
+        // su PagamentoRequest.importo, ma il controllo resta a protezione di eventuali altri
+        // chiamatori del service (scheduler/import) che bypassino la bean-validation.
+        // ponytail: guardia money intenzionale, non rimuovere.
         if (req.importo().compareTo(BigDecimal.ZERO) <= 0) {
             throw new ApiException(Response.Status.BAD_REQUEST, "IMPORTO_NON_VALIDO",
                     "L'importo deve essere maggiore di zero");
+        }
+
+        // RIMBORSO non può superare quanto effettivamente incassato: altrimenti importoIncassato
+        // diventerebbe negativo (ricalcolaIncassi somma il movimento negativo) corrompendo i KPI.
+        if ("RIMBORSO".equals(req.tipo()) && e.importoIncassato != null
+                && req.importo().compareTo(e.importoIncassato) > 0) {
+            throw new ApiException(Response.Status.CONFLICT, "RIMBORSO_SUPERA_INCASSATO",
+                    "Il rimborso EUR " + req.importo() + " supera l'incassato EUR " + e.importoIncassato);
         }
 
         // Vincolo unicità: max 1 CAPARRA, 1 ACCONTO, 1 SALDO
@@ -296,9 +307,12 @@ public class EventiService {
 
         // ── Auto-transizioni di stato ──────────────────────────────────────────
 
-        // PREVENTIVATO → CONFERMATO alla prima caparra o acconto
+        // PREVENTIVATO → CONFERMATO alla prima caparra/acconto/saldo. Anche un pagamento
+        // in un'unica soluzione (SALDO) conferma l'evento: senza, un SALDO pieno su un
+        // PREVENTIVATO lo lasciava bloccato pur essendo incassato al 100% (il blocco
+        // SALDATO sotto scatta solo da CONFERMATO).
         if ("PREVENTIVATO".equals(e.stato)
-                && List.of("CAPARRA", "ACCONTO").contains(req.tipo())) {
+                && List.of("CAPARRA", "ACCONTO", "SALDO").contains(req.tipo())) {
             e.stato = "CONFERMATO";
         }
 

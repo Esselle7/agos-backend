@@ -835,6 +835,47 @@ class SpeseRicorrentiIntegrationTest {
                 "BUG 4: quotaInteressi deve essere null dopo updateImporto su FINANZIAMENTO");
     }
 
+    @Test
+    @Order(107)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testFinanziamento_rataEccessiva_overAmmortamento_400() {
+        // BUG 5: importoRata troppo alta per numeroRate → il debito si estingue PRIMA
+        // dell'ultima rata. Oggi non c'è guardia: le rate eccedenti producono
+        // quotaCapitale NEGATIVA e quotaInteressi fantasma (l'ultima rata incassa come
+        // "interessi" tutto il residuo dell'importo), gonfiando gli oneriFinanziari nel
+        // P&L e corrompendo EBT/UtileNetto. Speculare a RATA_INSUFFICIENTE (BUG 3): va
+        // rifiutato a create con 400.
+        Assumptions.assumeTrue(validContoCoge != null);
+        Assumptions.assumeTrue(validContoCogeInteressi != null);
+
+        // debito 3000 @ 1% annuo, 10 rate da 1000 → il debito si azzera intorno alla 3ª
+        // rata; le rate 4..10 over-ammortizzano (debitoResiduo negativo).
+        String body = """
+            {
+              "descrizione": "Mutuo rata eccessiva (over-ammortamento)",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 1000.00,
+              "variazionePct": 0,
+              "giornoDelMese": 1,
+              "frequenza": "MENSILE",
+              "numeroRate": 10,
+              "dataInizio": "2026-06-01",
+              "tipoPiano": "FINANZIAMENTO",
+              "importoDebitoIniziale": 3000.00,
+              "tassoInteresseAnnuo": 1.0,
+              "contoCogeInteressiId": %d
+            }
+            """.formatted(validContoCoge, validContoCogeInteressi);
+
+        given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then()
+                .statusCode(400)
+                .body("code", equalTo("RATA_ECCESSIVA"));
+    }
+
     // ── Invarianti matematici ammortamento alla francese ──────────────────────
 
     private static String finanziamentoMathPlanId;

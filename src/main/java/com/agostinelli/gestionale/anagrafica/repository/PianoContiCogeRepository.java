@@ -114,6 +114,36 @@ public class PianoContiCogeRepository implements PanacheRepositoryBase<PianoCont
         return toDTO(id, nuovoCodice, req.descrizione().trim(), req.tipo(), req.parentId());
     }
 
+    @Transactional
+    @CacheInvalidateAll(cacheName = "piano-dei-conti")
+    public void softDelete(Integer id) {
+        PianoContiCoge esistente = findById(id);
+        if (esistente == null) {
+            throw new ApiException(Response.Status.NOT_FOUND, "CONTO_NON_TROVATO",
+                    "Conto COGE non trovato: " + id);
+        }
+        // Cancellazione logica: i movimenti storici referenziano conto_coge_id (FK NOT NULL),
+        // quindi una hard-delete è impossibile. is_active=false toglie il conto dai picker/liste
+        // senza orfanizzare lo storico. Si blocca però se ci sono dipendenze ancora "vive":
+        // sotto-conti o regole di classificazione che lo userebbero ancora dopo la sparizione.
+        long figli = count("parentId = ?1 and isActive = true", id);
+        if (figli > 0) {
+            throw new ApiException(Response.Status.CONFLICT, "CONTO_CON_FIGLI",
+                    "Il conto ha " + figli + " sotto-conti attivi: eliminali o riassegnali prima.");
+        }
+        long regole = ((Number) em.createNativeQuery(
+                "SELECT (SELECT count(*) FROM keyword_firma WHERE coge_codice = :c) " +
+                "     + (SELECT count(*) FROM regole_classificazione WHERE coge_codice = :c)")
+                .setParameter("c", esistente.codice).getSingleResult()).longValue();
+        if (regole > 0) {
+            throw new ApiException(Response.Status.CONFLICT, "CONTO_REFERENZIATO",
+                    "Il conto è usato da " + regole + " regole/keyword di classificazione: rimuovile prima.");
+        }
+        em.createNativeQuery("UPDATE piano_dei_conti_coge SET is_active = false WHERE id = :id")
+                .setParameter("id", id).executeUpdate();
+        em.detach(esistente);
+    }
+
     // ── Validazioni ───────────────────────────────────────────────────────────
 
     private boolean esisteCodice(String codice, Integer exceptId) {

@@ -18,7 +18,9 @@ import jakarta.ws.rs.core.Response;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -151,6 +153,10 @@ public class KeywordLearningService {
                 .setParameter("natura", natura)
                 .setParameter("stato", stato)
                 .getResultList();
+        if (rows.isEmpty()) return List.of();
+        // Token in UNA query per tutte le firme (era N+1: una SELECT per ogni riga).
+        Map<UUID, List<String>> tokenByFirma = tokenDelleFirme(
+                rows.stream().map(r -> (UUID) r[0]).toList());
         List<KeywordFirmaDTO> out = new ArrayList<>(rows.size());
         for (Object[] r : rows) {
             UUID id = (UUID) r[0];
@@ -158,7 +164,7 @@ public class KeywordLearningService {
                     r[5] == null ? null : ((Number) r[5]).shortValue(), (String) r[6],
                     r[7] == null ? null : (UUID) r[7], (String) r[8], (String) r[9],
                     (BigDecimal) r[10], (String) r[11], (String) r[12], (String) r[13],
-                    tokenDiFirma(id), r[14] == null ? null : r[14].toString()));
+                    tokenByFirma.getOrDefault(id, List.of()), r[14] == null ? null : r[14].toString()));
         }
         return out;
     }
@@ -359,12 +365,14 @@ public class KeywordLearningService {
                 .executeUpdate();
     }
 
+    /** Token di piu' firme in una sola query (firma_id, token) ORDER BY token, raggruppati in mappa. */
     @SuppressWarnings("unchecked")
-    private List<String> tokenDiFirma(UUID firmaId) {
-        List<String> out = new ArrayList<>();
-        for (Object t : em.createNativeQuery("SELECT token FROM keyword_token WHERE firma_id = :id ORDER BY token")
-                .setParameter("id", firmaId).getResultList()) {
-            out.add((String) t);
+    private Map<UUID, List<String>> tokenDelleFirme(List<UUID> firmaIds) {
+        Map<UUID, List<String>> out = new HashMap<>();
+        for (Object[] r : (List<Object[]>) em.createNativeQuery(
+                "SELECT firma_id, token FROM keyword_token WHERE firma_id IN (:ids) ORDER BY token")
+                .setParameter("ids", firmaIds).getResultList()) {
+            out.computeIfAbsent((UUID) r[0], k -> new ArrayList<>()).add((String) r[1]);
         }
         return out;
     }

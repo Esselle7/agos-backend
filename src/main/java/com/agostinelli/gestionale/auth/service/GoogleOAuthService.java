@@ -131,6 +131,23 @@ public class GoogleOAuthService {
         if (Instant.now().getEpochSecond() > exp) {
             throw new UnauthorizedException("Google ID token scaduto");
         }
+
+        requireVerifiedEmail(payload);
+    }
+
+    /**
+     * security: l'email del token Google diventa l'identità dell'utente (allowlist
+     * di registrazione + binding su account esistente via {@code findByEmail}).
+     * Senza questo controllo un account Google che asserisce un'email NON verificata
+     * potrebbe legarsi a un utente esistente o entrare in allowlist. Google marca
+     * {@code email_verified} (boolean, talvolta stringa "true") → lo esigiamo true.
+     */
+    static void requireVerifiedEmail(JsonNode payload) {
+        JsonNode ev = payload.path("email_verified");
+        boolean verified = ev.isBoolean() ? ev.asBoolean() : "true".equalsIgnoreCase(ev.asText(""));
+        if (!verified) {
+            throw new UnauthorizedException("Email Google non verificata");
+        }
     }
 
     private RSAPublicKey resolvePublicKey(String kid) throws Exception {

@@ -168,12 +168,15 @@ public class EventiService {
         repo.delete(e);
     }
 
-    // ── MENU PDF ──────────────────────────────────────────────────────────────
+    // ── MENU (PDF / Word) ─────────────────────────────────────────────────────
+
+    /** Risultato di {@link #getMenuStream}: stream + metadati HTTP per la risposta. */
+    public record MenuResult(InputStream stream, String mimeType, String filename) {}
 
     /**
-     * Carica il menu PDF su R2 e salva l'URL pubblica sull'evento.
+     * Carica il menu (PDF o Word) su R2 e salva l'URL pubblica sull'evento.
      * Lancia 404 se l'evento non esiste, 400 (da {@link R2StorageService})
-     * se il file non è un PDF valido o supera 10 MB.
+     * se il tipo file non è supportato o la size supera 10 MB.
      */
     @Transactional
     public String uploadMenuPdf(UUID eventoId, java.io.InputStream content, long size, String mimeType) {
@@ -184,24 +187,34 @@ public class EventiService {
     }
 
     /**
-     * Apre un InputStream sul menu PDF dell'evento letto direttamente da R2.
-     * Lancia 404 se l'evento non esiste o non ha un PDF caricato.
+     * Apre un InputStream sul menu dell'evento letto direttamente da R2.
+     * Ritorna anche il mimeType e il filename corretti per l'header HTTP.
+     * Lancia 404 se l'evento non esiste o non ha un file caricato.
      */
     @Transactional(Transactional.TxType.REQUIRED)
-    public InputStream getMenuPdfStream(UUID eventoId) {
+    public MenuResult getMenuStream(UUID eventoId) {
         Evento e = findOrThrow(eventoId);
         if (e.menuPdfUrl == null) {
-            throw new ApiException(Response.Status.NOT_FOUND, "MENU_PDF_NON_TROVATO",
-                    "Nessun menu PDF per questo evento");
+            throw new ApiException(Response.Status.NOT_FOUND, "MENU_NON_TROVATO",
+                    "Nessun menu caricato per questo evento");
         }
-        return r2Storage.getMenuPdf(eventoId);
+        InputStream stream = r2Storage.getMenuPdf(e.menuPdfUrl);
+        String ext      = e.menuPdfUrl.substring(e.menuPdfUrl.lastIndexOf('.') + 1);
+        String mimeType = switch (ext) {
+            case "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+            case "doc"  -> "application/msword";
+            default     -> "application/pdf";
+        };
+        return new MenuResult(stream, mimeType, "menu." + ext);
     }
 
-    /** Rimuove il menu PDF da R2 e azzera l'URL sull'evento (404 se non esiste). */
+    /** Rimuove il menu da R2 e azzera l'URL sull'evento (404 se l'evento non esiste). */
     @Transactional
     public void deleteMenuPdf(UUID eventoId) {
         Evento e = findOrThrow(eventoId);
-        r2Storage.deleteMenuPdf(eventoId);
+        if (e.menuPdfUrl != null) {
+            r2Storage.deleteMenuPdf(e.menuPdfUrl);
+        }
         e.menuPdfUrl = null;
     }
 
@@ -223,10 +236,21 @@ public class EventiService {
                     "Su un evento annullato è consentita solo la registrazione di una PENALE");
         }
 
-        // Importo > 0
+        // Importo > 0. Difesa in profondità su percorso-soldi: la REST API ha già @Positive
+        // su PagamentoRequest.importo, ma il controllo resta a protezione di eventuali altri
+        // chiamatori del service (scheduler/import) che bypassino la bean-validation.
+        // ponytail: guardia money intenzionale, non rimuovere.
         if (req.importo().compareTo(BigDecimal.ZERO) <= 0) {
             throw new ApiException(Response.Status.BAD_REQUEST, "IMPORTO_NON_VALIDO",
                     "L'importo deve essere maggiore di zero");
+        }
+
+        // RIMBORSO non può superare quanto effettivamente incassato: altrimenti importoIncassato
+        // diventerebbe negativo (ricalcolaIncassi somma il movimento negativo) corrompendo i KPI.
+        if ("RIMBORSO".equals(req.tipo()) && e.importoIncassato != null
+                && req.importo().compareTo(e.importoIncassato) > 0) {
+            throw new ApiException(Response.Status.CONFLICT, "RIMBORSO_SUPERA_INCASSATO",
+                    "Il rimborso EUR " + req.importo() + " supera l'incassato EUR " + e.importoIncassato);
         }
 
         // Vincolo unicità: max 1 CAPARRA, 1 ACCONTO, 1 SALDO
@@ -283,9 +307,12 @@ public class EventiService {
 
         // ── Auto-transizioni di stato ──────────────────────────────────────────
 
-        // PREVENTIVATO → CONFERMATO alla prima caparra o acconto
+        // PREVENTIVATO → CONFERMATO alla prima caparra/acconto/saldo. Anche un pagamento
+        // in un'unica soluzione (SALDO) conferma l'evento: senza, un SALDO pieno su un
+        // PREVENTIVATO lo lasciava bloccato pur essendo incassato al 100% (il blocco
+        // SALDATO sotto scatta solo da CONFERMATO).
         if ("PREVENTIVATO".equals(e.stato)
-                && List.of("CAPARRA", "ACCONTO").contains(req.tipo())) {
+                && List.of("CAPARRA", "ACCONTO", "SALDO").contains(req.tipo())) {
             e.stato = "CONFERMATO";
         }
 

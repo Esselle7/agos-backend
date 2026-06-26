@@ -42,7 +42,6 @@ class ForecastingIntegrationTest {
     void refreshMvs() throws Exception {
         if (mvRefreshed) return;
         tx.begin();
-        em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_kpi_mensili").executeUpdate();
         em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_saldi_conti").executeUpdate();
         em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_conto_economico_mensile").executeUpdate();
         em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_cash_flow_statement").executeUpdate();

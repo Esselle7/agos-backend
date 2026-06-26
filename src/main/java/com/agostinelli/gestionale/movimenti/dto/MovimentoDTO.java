@@ -34,5 +34,14 @@ public record MovimentoDTO(
         String riferimentoEsterno,
         String allegatoPath,
         Instant createdAt,
-        UUID createdBy
+        UUID createdBy,
+        /** Campo derivato (non persistito): giorni mancanti alla scadenza (dataLiquidita - oggi).
+         *  Valorizzato solo per movimenti in stato DA_LIQUIDARE con dataLiquidita != null.
+         *  > 0  → giorni alla scadenza (non ancora in ritardo);
+         *  == 0 → scade oggi;
+         *  < 0  → ritardo: per USCITA "sei in ritardo di |n| giorni sul pagamento",
+         *         per ENTRATA "qualcuno è in ritardo di |n| giorni sul pagarmi".
+         *  Le rate generate in automatico dai piani di spesa ricorrente sono sempre REGISTRATE,
+         *  quindi questo campo resta null per loro (lo scheduler le liquida alla scadenza). */
+        Long giorniAllaScadenza
 ) {}

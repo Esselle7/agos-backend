@@ -63,6 +63,34 @@ public class MovimentiService {
     }
 
     /**
+     * Crea un movimento proveniente dall'ETL (Billy / BPM / CA). I movimenti import
+     * sono SEMPRE liquidati (dataFinanziaria valorizzata = dataMovimento, stato REGISTRATO).
+     *
+     * Differenze rispetto a {@link #createMovimento}:
+     *  - NESSUN @CacheInvalidateAll: l'invalidazione cache e il refresh MV vengono fatti
+     *    una sola volta dal MovimentoImportService al termine del loop (non per riga);
+     *  - collega il movimento all'import_log tramite fonteImportazioneId.
+     *
+     * Riusa la stessa validateCrossFields e il mapper di createMovimento.
+     */
+    @Transactional
+    public MovimentoDTO createMovimentoImport(MovimentoCreateRequest req, UUID userId, UUID importLogId) {
+        validateCrossFields(req);
+
+        Movimento m = mapper.fromRequest(req);
+        m.createdBy = userId;
+        m.fonte = req.fonte() != null ? req.fonte() : "MANUALE";
+        m.fonteImportazioneId = importLogId;
+        m.stato = "REGISTRATO";
+        m.dataLiquidita = req.dataFinanziaria();
+
+        applyDerivedAmounts(m, req.importoLordo(), req.aliquotaIva());
+
+        repo.persist(m);
+        return mapper.toDTO(m);
+    }
+
+    /**
      * Aggiorna parzialmente un movimento (PATCH semantics).
      * Solo l'autore originale o un ADMIN possono modificare.
      *
@@ -105,10 +133,10 @@ public class MovimentiService {
         validateConsistency(m);
 
         // Sincronizza stato e scadenzaFinanziaria in base alla presenza di dataFinanziaria
-        if (m.dataFinanziaria != null && !"ANNULLATO".equals(m.stato) && !"RICONCILIATO".equals(m.stato)) {
+        if (m.dataFinanziaria != null && !"ANNULLATO".equals(m.stato)) {
             m.stato = "REGISTRATO";
             m.dataLiquidita = m.dataFinanziaria;
-        } else if (m.dataFinanziaria == null && !"ANNULLATO".equals(m.stato) && !"RICONCILIATO".equals(m.stato)) {
+        } else if (m.dataFinanziaria == null && !"ANNULLATO".equals(m.stato)) {
             m.stato = "DA_LIQUIDARE";
         }
 
@@ -168,6 +196,21 @@ public class MovimentiService {
         long total = repo.countWithFilters(tipo, buId, categoriaId, metodoPagamentoId,
                 stato, fornitoreId, eventoId, from, to, search);
 
+        return PagedResponse.of(content, page, size, total);
+    }
+
+    // ── Feature 1: movimenti "Da liquidare" in ritardo ──────────────────────────
+    //
+    // Movimenti con stato DA_LIQUIDARE, dataFinanziaria IS NULL e dataLiquidita < oggi.
+    // La Mapper.toDTO calcola automaticamente giorniAllaScadenza (negativo = ritardo).
+    // Per le USCITE: "sei in ritardo di |gg| giorni sul pagamento";
+    // per le ENTRATE: "qualcuno è in ritardo di |gg| giorni nel pagarmi".
+    // Le rate ricorrenti NON compaiono qui perché lo scheduler le liquida alla scadenza.
+    public PagedResponse<MovimentoDTO> findDaLiquidareInRitardo(String tipo, int page, int size, String sort) {
+        LocalDate oggi = LocalDate.now();
+        List<MovimentoDTO> content = repo.findDaLiquidareInRitardo(tipo, oggi, page, size, sort)
+                .stream().map(mapper::toDTO).toList();
+        long total = repo.countDaLiquidareInRitardo(tipo, oggi);
         return PagedResponse.of(content, page, size, total);
     }
 

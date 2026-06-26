@@ -25,6 +25,7 @@ public class SecurityHeadersFilter implements ContainerResponseFilter {
         responseContext.getHeaders().add("X-Content-Type-Options", "nosniff");
         responseContext.getHeaders().add("X-Frame-Options", "DENY");
         responseContext.getHeaders().add("Content-Security-Policy", "default-src 'self'");
-        responseContext.getHeaders().add("Strict-Transport-Security", "max-age=31536000");
+        // security: includeSubDomains estende HSTS ai sottodomini (es. api.*)
+        responseContext.getHeaders().add("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     }
 }

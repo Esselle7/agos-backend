@@ -406,6 +406,15 @@ public class RecurringExpenseService {
                 BigDecimal capitale  = importo.subtract(interessi)
                         .setScale(2, RoundingMode.HALF_UP);
 
+                // Speculare a RATA_INSUFFICIENTE (BUG 3): se il debito si estingue prima
+                // dell'ultima rata, le rate successive over-ammortizzano (capitale negativo
+                // + interessi fantasma sull'ultima rata). ponytail: guardia money, non rimuovere.
+                if (i < plan.numeroRate && debitoResiduo.subtract(capitale).signum() <= 0) {
+                    throw new ApiException(Response.Status.BAD_REQUEST, "RATA_ECCESSIVA",
+                            "L'importo rata (€" + importo + ") estingue il debito prima dell'ultima rata ("
+                            + plan.numeroRate + "): ridurre l'importo rata o il numero di rate.");
+                }
+
                 if (i == plan.numeroRate) {
                     capitale  = debitoResiduo;
                     interessi = importo.subtract(capitale).max(BigDecimal.ZERO)

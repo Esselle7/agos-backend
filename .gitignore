@@ -17,3 +17,6 @@ src/main/resources/application-local.properties
 # Maven wrapper: ignora tutto tranne maven-wrapper.properties
 .mvn/**
 !.mvn/wrapper/maven-wrapper.properties
+
+# Log per-import ETL (un .txt per import)
+logs/

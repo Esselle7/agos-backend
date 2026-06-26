@@ -1,18 +1,22 @@
 package com.agostinelli.gestionale.movimenti.importlayer;
 
-import com.agostinelli.gestionale.movimenti.importlayer.model.ImportResult;
-
-import java.io.InputStream;
-
-/*
- * IMPORT FEATURE DISABLED (FUTURE RELEASE)
- * This interface is intentionally left as a placeholder.
- * Full ETL processing will be introduced in a dedicated phase
- * to avoid coupling domain logic with file parsing logic.
+/**
+ * Strategia di importazione per fonte. Espone il parser corretto (per chiave fonte)
+ * e il normalizzatore condiviso; l'orchestrazione vive in {@link MovimentoImportService}.
+ *
+ * Chiavi fonte (fonteStr): IMPORT_BILLY | IMPORT_BANCA_BPM | IMPORT_BANCA_CA.
+ * Fonte DB ({@link #fonte()}): IMPORT_BILLY | IMPORT_BANCA.
  */
 public interface ImportStrategy {
-    /** La fonte di importazione supportata da questa strategia (IMPORT_BILLY, IMPORT_BANCA, …). */
-    String supports();
 
-    ImportResult process(InputStream file);
+    /** true se questa strategia gestisce la chiave fonte richiesta. */
+    boolean supports(String fonteStr);
+
+    /** Fonte persistita su DB (lk_fonti_movimento). */
+    String fonte();
+
+    /** Parser adeguato alla chiave fonte (BPM vs CA condividono la strategia). */
+    MovimentoParser parserFor(String fonteStr);
+
+    MovimentoNormalizer getNormalizer();
 }

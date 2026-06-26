@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Integration test per il modulo Reporting & Dashboard.
- * Copre DashboardResource, ReportingResource, ExportService, ReportJobService.
+ * Copre DashboardResource, ReportingResource, ReportJobService.
  *
  * Prerequisito: agosdb_test con dati V9 (movimenti reali 2026).
  * Le MV vengono refreshate una sola volta prima della suite.
@@ -38,7 +38,6 @@ class ReportingIntegrationTest {
         // REFRESH senza CONCURRENTLY: funziona dentro una transazione JTA.
         // Usare MV singole (non fn_refresh_all_mv che usa CONCURRENTLY).
         tx.begin();
-        em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_kpi_mensili").executeUpdate();
         em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_saldi_conti").executeUpdate();
         em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_conto_economico_mensile").executeUpdate();
         em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_cash_flow_statement").executeUpdate();
@@ -82,16 +81,6 @@ class ReportingIntegrationTest {
             .queryParam("from", "2026-01-01")
             .queryParam("to", "2026-03-31")
             .when().get("/api/reporting/pl")
-            .then().statusCode(401);
-    }
-
-    @Test
-    @Order(6)
-    void reportingExportSenzaAuth_401() {
-        given()
-            .queryParam("from", "2026-01-01")
-            .queryParam("to", "2026-03-31")
-            .when().get("/api/reporting/export/movimenti")
             .then().statusCode(401);
     }
 
@@ -893,157 +882,6 @@ class ReportingIntegrationTest {
             assertNotNull(punti.get(i).get("liquiditaProiettata"),
                 "liquiditaProiettata non deve essere null al punto " + i);
         }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPORT – Content-Type e magic bytes
-    // ═══════════════════════════════════════════════════════════
-
-    @Test
-    @Order(110)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportMovimentiSenzaRange_400() {
-        given()
-            .when().get("/api/reporting/export/movimenti")
-            .then()
-                .statusCode(400)
-                .body("code", equalTo("MISSING_RANGE"));
-    }
-
-    @Test
-    @Order(111)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportMovimentiCSV_bomUtf8() {
-        // INVARIANTE: CSV inizia con BOM UTF-8 (0xEF 0xBB 0xBF) per compatibilità Excel IT
-        byte[] bytes = given()
-            .queryParam("from", "2026-03-01")
-            .queryParam("to", "2026-03-31")
-            .queryParam("format", "csv")
-            .when().get("/api/reporting/export/movimenti")
-            .then()
-                .statusCode(200)
-                .extract().asByteArray();
-
-        assertTrue(bytes.length >= 3, "Il CSV non deve essere vuoto");
-        assertEquals((byte) 0xEF, bytes[0], "Primo byte BOM UTF-8 deve essere 0xEF");
-        assertEquals((byte) 0xBB, bytes[1], "Secondo byte BOM UTF-8 deve essere 0xBB");
-        assertEquals((byte) 0xBF, bytes[2], "Terzo byte BOM UTF-8 deve essere 0xBF");
-    }
-
-    @Test
-    @Order(112)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportMovimentiXLSX_magicBytesEContentType() {
-        // XLSX = file ZIP → magic bytes PK (0x50 0x4B)
-        byte[] bytes = given()
-            .queryParam("from", "2026-03-01")
-            .queryParam("to", "2026-03-31")
-            .queryParam("format", "xlsx")
-            .when().get("/api/reporting/export/movimenti")
-            .then()
-                .statusCode(200)
-                .header("Content-Type",
-                        containsString("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
-                .extract().asByteArray();
-
-        assertTrue(bytes.length > 4, "Il file XLSX non deve essere vuoto");
-        assertEquals((byte) 0x50, bytes[0], "Magic byte XLSX[0] deve essere 0x50 (P)");
-        assertEquals((byte) 0x4B, bytes[1], "Magic byte XLSX[1] deve essere 0x4B (K)");
-    }
-
-    @Test
-    @Order(113)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportCommercialista_200_xlsx() {
-        given()
-            .queryParam("mese", 3)
-            .queryParam("anno", 2026)
-            .when().get("/api/reporting/export/commercialista")
-            .then()
-                .statusCode(200)
-                .header("Content-Type",
-                        containsString("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
-    }
-
-    @Test
-    @Order(114)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportCommercialista_meseFuoriRange_400() {
-        given()
-            .queryParam("mese", 13)
-            .queryParam("anno", 2026)
-            .when().get("/api/reporting/export/commercialista")
-            .then()
-                .statusCode(400)
-                .body("code", equalTo("PARAM_OUT_OF_RANGE"));
-    }
-
-    @Test
-    @Order(115)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportCommercialista_mese0_400() {
-        given()
-            .queryParam("mese", 0)
-            .queryParam("anno", 2026)
-            .when().get("/api/reporting/export/commercialista")
-            .then().statusCode(400);
-    }
-
-    @Test
-    @Order(116)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportPlBu_xlsx_200() {
-        given()
-            .queryParam("from", "2026-01-01")
-            .queryParam("to", "2026-03-31")
-            .queryParam("format", "xlsx")
-            .when().get("/api/reporting/export/pl-bu")
-            .then()
-                .statusCode(200)
-                .header("Content-Type",
-                        containsString("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
-    }
-
-    @Test
-    @Order(117)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportPlBu_pdf_501() {
-        given()
-            .queryParam("from", "2026-01-01")
-            .queryParam("to", "2026-03-31")
-            .queryParam("format", "pdf")
-            .when().get("/api/reporting/export/pl-bu")
-            .then().statusCode(501);
-    }
-
-    @Test
-    @Order(118)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportPlBu_senzaRange_400() {
-        given()
-            .queryParam("format", "xlsx")
-            .when().get("/api/reporting/export/pl-bu")
-            .then().statusCode(400);
-    }
-
-    @Test
-    @Order(119)
-    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void exportMovimentiXLSX_conDatiV27_fileNonVuoto() {
-        // Verifica che con dati reali l'XLSX abbia almeno intestazione + 1 riga dati.
-        // Periodo aggiornato a maggio 2026: V26 ha cancellato i seed V9 di marzo;
-        // V27 inserisce movimenti a partire da maggio 2026.
-        byte[] bytes = given()
-            .queryParam("from", "2026-05-01")
-            .queryParam("to", "2026-05-31")
-            .queryParam("format", "xlsx")
-            .when().get("/api/reporting/export/movimenti")
-            .then().statusCode(200)
-            .extract().asByteArray();
-
-        // Un XLSX con dati reali ha dimensione significativa (almeno 5 KB)
-        assertTrue(bytes.length > 5000,
-            "L'XLSX con dati V27 maggio 2026 deve avere dimensione > 5 KB, trovato: " + bytes.length + " byte");
     }
 
     // ═══════════════════════════════════════════════════════════

@@ -5,6 +5,8 @@ import java.time.LocalDate;
 
 /**
  * Punto della timeline finanziaria aggregata per bucket (settimana o mese).
+ * entratePreviste = certo; entrateStimate = ricavi cash stimati (additivo, layer STIMATO).
+ * saldoLiquiditaFine resta sul solo CERTO; il combinato lo deriva il frontend.
  */
 public record ForecastingTimelineDTO(
         String bucket,
@@ -13,4 +15,5 @@ public record ForecastingTimelineDTO(
         BigDecimal entratePreviste,
         BigDecimal uscitePreviste,
         BigDecimal ebitdaPeriodo,
-        BigDecimal saldoLiquiditaFine) {}
+        BigDecimal saldoLiquiditaFine,
+        BigDecimal entrateStimate) {}

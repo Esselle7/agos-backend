@@ -246,11 +246,10 @@ public class EventiResource {
     @GET
     @Path("/{id}/menu-pdf")
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
-    @Produces("application/pdf")
     public Response getMenuPdf(@PathParam("id") UUID id) {
-        InputStream stream = service.getMenuPdfStream(id);
-        return Response.ok(stream, "application/pdf")
-                .header("Content-Disposition", "inline; filename=\"menu.pdf\"")
+        EventiService.MenuResult result = service.getMenuStream(id);
+        return Response.ok(result.stream(), result.mimeType())
+                .header("Content-Disposition", "inline; filename=\"" + result.filename() + "\"")
                 .build();
     }
 

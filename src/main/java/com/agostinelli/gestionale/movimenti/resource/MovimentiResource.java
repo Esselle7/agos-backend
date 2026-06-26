@@ -81,6 +81,15 @@ public class MovimentiResource {
                 stato, fornitoreId, eventoId, from, to, search);
     }
 
+    // Movimenti attivi senza conto/cassa: da attribuire a mano (popup "Situazione Finanziaria").
+    // Path literale prima di /{id} per non farlo intercettare dal template.
+    @GET
+    @Path("/senza-banca")
+    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    public java.util.List<MovimentoDTO> senzaBanca() {
+        return service.listSenzaBanca();
+    }
+
     @GET
     @Path("/{id}")
     @RolesAllowed({"ADMIN", "DIPENDENTE"})

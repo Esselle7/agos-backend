@@ -184,6 +184,11 @@ public class MovimentiService {
         return mapper.toDTO(m);
     }
 
+    /** Movimenti attivi non ancora attribuiti a un conto/cassa, da catalogare a mano. */
+    public List<MovimentoDTO> listSenzaBanca() {
+        return repo.findSenzaBanca().stream().map(mapper::toDTO).toList();
+    }
+
     public PagedResponse<MovimentoDTO> findWithFilters(
             String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
             String stato, UUID fornitoreId, UUID eventoId,

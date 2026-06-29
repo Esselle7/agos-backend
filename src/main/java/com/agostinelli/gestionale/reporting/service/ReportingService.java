@@ -301,14 +301,45 @@ public class ReportingService {
         );
     }
 
+    /**
+     * Ammortamento di competenza nel periodo [from, to], a quote costanti (straight-line).
+     * Per ogni cespite l'ammortamento corre da {@code data_acquisto} per
+     * {@code vita_mesi = round(1200 / aliquota%)} mesi e poi SI FERMA: si contano solo i mesi
+     * del periodo che cadono dentro la finestra di vita del bene. Così un bene già esaurito
+     * non genera più costo (niente manutenzione manuale di is_active), e un bene comprato
+     * prima del 2026 ammortizza nel 2026 solo per la sua vita residua.
+     */
+    @SuppressWarnings("unchecked")
     private BigDecimal computeAmmortamenti(LocalDate from, LocalDate to) {
-        long mesi = ChronoUnit.MONTHS.between(from.withDayOfMonth(1), to.withDayOfMonth(1)) + 1;
-        Object result = em.createNativeQuery(
-                "SELECT COALESCE(SUM(costo_storico * aliquota_ammortamento / 100.0 / 12.0), 0) " +
-                "FROM cespiti WHERE is_active = true")
-                .getSingleResult();
-        BigDecimal ammortamentoMensile = result instanceof BigDecimal bd ? bd : new BigDecimal(result.toString());
-        return ammortamentoMensile.multiply(BigDecimal.valueOf(mesi)).setScale(2, RoundingMode.HALF_UP);
+        LocalDate pFrom = from.withDayOfMonth(1);
+        LocalDate pToExcl = to.withDayOfMonth(1).plusMonths(1);   // primo mese DOPO il periodo
+
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT costo_storico, aliquota_ammortamento, data_acquisto " +
+                "FROM cespiti WHERE is_active = true AND aliquota_ammortamento > 0").getResultList();
+
+        BigDecimal tot = BigDecimal.ZERO;
+        for (Object[] r : rows) {
+            BigDecimal costo = toBD(r[0]);
+            BigDecimal aliq  = toBD(r[1]);
+            LocalDate acquisto = (r[2] instanceof java.sql.Date d) ? d.toLocalDate() : (LocalDate) r[2];
+
+            BigDecimal mensile = costo.multiply(aliq)
+                    .divide(BigDecimal.valueOf(1200), 6, RoundingMode.HALF_UP);
+            int vitaMesi = BigDecimal.valueOf(1200)
+                    .divide(aliq, 0, RoundingMode.HALF_UP).intValue();
+
+            LocalDate inizio = acquisto.withDayOfMonth(1);
+            LocalDate fineEscl = inizio.plusMonths(vitaMesi);     // primo mese NON ammortizzato
+
+            LocalDate ovStart = pFrom.isAfter(inizio) ? pFrom : inizio;
+            LocalDate ovEnd   = pToExcl.isBefore(fineEscl) ? pToExcl : fineEscl;
+            long mesi = ChronoUnit.MONTHS.between(ovStart, ovEnd);
+            if (mesi > 0) {
+                tot = tot.add(mensile.multiply(BigDecimal.valueOf(mesi)));
+            }
+        }
+        return tot.setScale(2, RoundingMode.HALF_UP);
     }
 
     private List<CashFlowPeriodoDTO> getCashFlowMensile(LocalDate from, LocalDate to) {

@@ -25,7 +25,9 @@ public class ContiBancariRepository implements PanacheRepositoryBase<ContoBancar
                        cb.nome,
                        cb.tipo,
                        cb.iban,
-                       COALESCE(ms.saldo_calcolato, cb.saldo_iniziale) AS saldo_calcolato
+                       COALESCE(ms.saldo_calcolato, cb.saldo_iniziale) AS saldo_calcolato,
+                       cb.saldo_iniziale,
+                       cb.data_saldo_iniziale
                 FROM conti_bancari cb
                 LEFT JOIN mv_saldi_conti ms ON ms.conto_id = cb.id
                 WHERE cb.is_active = true
@@ -38,7 +40,9 @@ public class ContiBancariRepository implements PanacheRepositoryBase<ContoBancar
                         (String) r[1],
                         (String) r[2],
                         (String) r[3],
-                        r[4] != null ? new BigDecimal(r[4].toString()) : BigDecimal.ZERO
+                        r[4] != null ? new BigDecimal(r[4].toString()) : BigDecimal.ZERO,
+                        r[5] != null ? new BigDecimal(r[5].toString()) : BigDecimal.ZERO,
+                        r[6] != null ? ((java.sql.Date) r[6]).toLocalDate() : null
                 ))
                 .toList();
     }

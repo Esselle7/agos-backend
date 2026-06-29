@@ -122,6 +122,11 @@ public class MovimentiRepository implements PanacheRepositoryBase<Movimento, UUI
         return list("contoBancarioId IS NULL AND stato != 'ANNULLATO' ORDER BY dataMovimento DESC");
     }
 
+    /** Partite di apertura: crediti/debiti pregressi (fonte APERTURA) ancora da liquidare. */
+    public List<Movimento> findPartiteApertura(String tipo) {
+        return list("fonte = 'APERTURA' AND stato = 'DA_LIQUIDARE' AND tipo = ?1 ORDER BY dataLiquidita", tipo);
+    }
+
     public boolean existsByRifEsterno(String fonte, String rifEsterno, LocalDate dataMovimento) {
         return count("fonte = ?1 AND riferimentoEsterno = ?2 AND dataMovimento = ?3",
                 fonte, rifEsterno, dataMovimento) > 0;

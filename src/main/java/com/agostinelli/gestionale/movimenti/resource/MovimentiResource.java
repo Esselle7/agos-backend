@@ -81,6 +81,23 @@ public class MovimentiResource {
                 stato, fornitoreId, eventoId, from, to, search);
     }
 
+    // Movimenti attivi senza conto/cassa: da attribuire a mano (popup "Situazione Finanziaria").
+    // Path literale prima di /{id} per non farlo intercettare dal template.
+    @GET
+    @Path("/senza-banca")
+    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    public java.util.List<MovimentoDTO> senzaBanca() {
+        return service.listSenzaBanca();
+    }
+
+    // Partite di apertura (crediti ENTRATA / debiti USCITA pre-2026 da liquidare). Literal prima di /{id}.
+    @GET
+    @Path("/partite-apertura")
+    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    public java.util.List<MovimentoDTO> partiteApertura(@QueryParam("tipo") String tipo) {
+        return service.listPartiteApertura(tipo);
+    }
+
     @GET
     @Path("/{id}")
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
@@ -132,6 +149,15 @@ public class MovimentiResource {
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
     public MovimentoDTO liquida(@PathParam("id") UUID id, @Valid LiquidaRequest req) {
         return service.liquidaMovimento(id, req);
+    }
+
+    // Attribuzione mirata del conto/cassa (popup "Senza banca"): tocca solo conto_bancario_id,
+    // senza il full-overwrite del PUT (che de-liquiderebbe il movimento).
+    @PATCH
+    @Path("/{id}/conto-bancario")
+    @RolesAllowed({"ADMIN", "DIPENDENTE"})
+    public MovimentoDTO assegnaConto(@PathParam("id") UUID id, @Valid AssegnaContoRequest req) {
+        return service.assegnaContoBancario(id, req.contoBancarioId());
     }
 
     @DELETE

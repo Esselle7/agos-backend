@@ -184,6 +184,29 @@ public class MovimentiService {
         return mapper.toDTO(m);
     }
 
+    /** Movimenti attivi non ancora attribuiti a un conto/cassa, da catalogare a mano. */
+    public List<MovimentoDTO> listSenzaBanca() {
+        return repo.findSenzaBanca().stream().map(mapper::toDTO).toList();
+    }
+
+    /** Crediti (ENTRATA) / debiti (USCITA) di apertura pre-2026 ancora da liquidare. */
+    public List<MovimentoDTO> listPartiteApertura(String tipo) {
+        return repo.findPartiteApertura(tipo).stream().map(mapper::toDTO).toList();
+    }
+
+    /**
+     * Attribuisce SOLO il conto/cassa al movimento, senza toccare gli altri campi.
+     * L'update generale è full-overwrite (azzererebbe dataFinanziaria e de-liquiderebbe il
+     * movimento): per il popup "Senza banca" serve questo percorso mirato.
+     */
+    @Transactional
+    public MovimentoDTO assegnaContoBancario(UUID id, Short contoBancarioId) {
+        Movimento m = findActiveOrThrow(id);
+        m.contoBancarioId = contoBancarioId;
+        mvRefresh.requestRefreshAfterCommit();
+        return mapper.toDTO(m);
+    }
+
     public PagedResponse<MovimentoDTO> findWithFilters(
             String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
             String stato, UUID fornitoreId, UUID eventoId,

@@ -121,9 +121,11 @@ public class DashboardService {
                 "SELECT CAST(EXTRACT(YEAR  FROM m.data_movimento) AS INTEGER), " +
                 "CAST(EXTRACT(MONTH FROM m.data_movimento) AS INTEGER), " +
                 "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE 0 END),0), " +
-                "COALESCE(SUM(CASE WHEN m.tipo='USCITA'  THEN m.importo_lordo ELSE 0 END),0), " +
-                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE -m.importo_lordo END),0) " +
+                "COALESCE(SUM(CASE WHEN m.tipo='USCITA' AND NOT COALESCE(pc.is_capex,false) THEN m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo " +
+                "              WHEN NOT COALESCE(pc.is_capex,false) THEN -m.importo_lordo ELSE 0 END),0) " +
                 "FROM movimenti m " +
+                "LEFT JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
                 "WHERE m.stato != 'ANNULLATO' " +
                 "AND EXTRACT(YEAR FROM m.data_movimento) >= :startYear " +
                 "GROUP BY 1, 2 ORDER BY 1 ASC, 2 ASC")
@@ -146,9 +148,11 @@ public class DashboardService {
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT m.business_unit_id, bu.nome, " +
                 "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE 0 END),0), " +
-                "COALESCE(SUM(CASE WHEN m.tipo='USCITA'  THEN m.importo_lordo ELSE 0 END),0), " +
-                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE -m.importo_lordo END),0) " +
+                "COALESCE(SUM(CASE WHEN m.tipo='USCITA' AND NOT COALESCE(pc.is_capex,false) THEN m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo " +
+                "              WHEN NOT COALESCE(pc.is_capex,false) THEN -m.importo_lordo ELSE 0 END),0) " +
                 "FROM movimenti m " +
+                "LEFT JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
                 "JOIN business_units bu ON bu.id = m.business_unit_id " +
                 "WHERE m.stato != 'ANNULLATO' " +
                 "AND m.data_movimento >= :from AND m.data_movimento <= :to " +
@@ -245,9 +249,11 @@ public class DashboardService {
         }).toList();
 
         // ── Query 2: rate ricorrenti PENDING e PAID nel periodo ───────────
+        // referenceId = piano (rep.id): è la pagina di dettaglio navigabile (/spese-ricorrenti/:id),
+        // la singola rata non ha rotta propria. Lo Scadenzario ci naviga al click.
         @SuppressWarnings("unchecked")
         List<Object[]> rateRows = em.createNativeQuery(
-                "SELECT rei.id, rep.descrizione, rei.data_scadenza, rei.importo, rei.stato " +
+                "SELECT rep.id, rep.descrizione, rei.data_scadenza, rei.importo, rei.stato " +
                 "FROM recurring_expense_installment rei " +
                 "JOIN recurring_expense_plan rep ON rep.id = rei.piano_id " +
                 "WHERE rei.stato IN ('PENDING', 'PAID') " +
@@ -364,16 +370,21 @@ public class DashboardService {
 
     // ── helpers privati ───────────────────────────────────────────────────────
 
+    // WHY esclusione capex: la sezione è "Performance Economica" (competenza) — l'acquisto di un
+    // cespite è un investimento patrimoniale, il suo impatto economico è solo l'ammortamento nel
+    // P&L. L'impatto di cassa resta visibile nei saldi (Situazione Finanziaria).
     private Object[] queryKpiDirect(LocalDate from, LocalDate to) {
         return (Object[]) em.createNativeQuery(
                 "SELECT " +
-                "COALESCE(SUM(CASE WHEN tipo='ENTRATA' THEN importo_lordo ELSE 0 END),0), " +
-                "COALESCE(SUM(CASE WHEN tipo='USCITA'  THEN importo_lordo ELSE 0 END),0), " +
-                "COALESCE(SUM(CASE WHEN tipo='ENTRATA' THEN importo_lordo ELSE -importo_lordo END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='USCITA' AND NOT COALESCE(pc.is_capex,false) THEN m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo " +
+                "              WHEN NOT COALESCE(pc.is_capex,false) THEN -m.importo_lordo ELSE 0 END),0), " +
                 "COUNT(*) " +
-                "FROM movimenti " +
-                "WHERE stato != 'ANNULLATO' " +
-                "AND data_movimento >= :from AND data_movimento <= :to")
+                "FROM movimenti m " +
+                "LEFT JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
+                "WHERE m.stato != 'ANNULLATO' " +
+                "AND m.data_movimento >= :from AND m.data_movimento <= :to")
                 .setParameter("from", from)
                 .setParameter("to", to)
                 .getSingleResult();

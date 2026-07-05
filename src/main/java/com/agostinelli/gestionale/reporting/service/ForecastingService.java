@@ -59,7 +59,7 @@ public class ForecastingService {
             ForecastingAsIsDTO asIs = buildAsIs(oggi);
             ForecastingEconomicoDTO economico = new ForecastingEconomicoDTO(
                     BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO,
-                    BigDecimal.ZERO, BigDecimal.ZERO, List.of());
+                    BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, List.of());
             ForecastingFinanziarioDTO finanziario = new ForecastingFinanziarioDTO(
                     asIs.saldoLiquidita(), BigDecimal.ZERO, BigDecimal.ZERO,
                     asIs.saldoLiquidita(), List.of());
@@ -156,7 +156,12 @@ public class ForecastingService {
         // 4. Stipendi
         dettaglio.addAll(buildStipendi(start, end));
 
-        // 5. Ricavi cash STIMATI (layer non-certo, aggregati per conto). Mostrati nel dettaglio con
+        // 5. Quote ammortamento cespiti (competenza economica, non cassa): una riga per cespite
+        //    nel dettaglio, così l'utente vede DA DOVE arriva il totale ammortamenti.
+        List<ForecastingDettaglioDTO> ammRighe = buildAmmortamenti(start, end);
+        dettaglio.addAll(ammRighe);
+
+        // 6. Ricavi cash STIMATI (layer non-certo, aggregati per conto). Mostrati nel dettaglio con
         //    flag affidabilita=STIMATO, ma esclusi dai subtotali P&L "certi" sotto.
         dettaglio.addAll(righeStimate);
 
@@ -170,11 +175,13 @@ public class ForecastingService {
                 .map(ForecastingDettaglioDTO::importoEntrata)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        // costiPrevisti: solo costi operativi (esclude quota capitale, interessi FINANZIAMENTO e movimenti finanziari-only)
+        // costiPrevisti: solo costi operativi (esclude quota capitale, interessi FINANZIAMENTO,
+        // movimenti finanziari-only e ammortamenti — questi ultimi stanno tra EBITDA ed EBIT)
         BigDecimal costiOperativi = dettaglio.stream()
                 .filter(d -> !"FINANZIARIA".equals(d.vista()))
                 .filter(d -> !"RATA_RICORRENTE_CAPITALE".equals(d.categoria())
-                          && !"RATA_RICORRENTE_INTERESSI".equals(d.categoria()))
+                          && !"RATA_RICORRENTE_INTERESSI".equals(d.categoria())
+                          && !"AMMORTAMENTO".equals(d.categoria()))
                 .map(ForecastingDettaglioDTO::importoUscita)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
@@ -184,21 +191,62 @@ public class ForecastingService {
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
         BigDecimal ebitda = ricavi.subtract(costiOperativi);
-        BigDecimal ammortamenti = computeAmmortamentiPrevisione(start, end);
+        BigDecimal ammortamenti = ammRighe.stream()
+                .map(ForecastingDettaglioDTO::importoUscita)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
         BigDecimal ebit = ebitda.subtract(ammortamenti);
 
-        return new ForecastingEconomicoDTO(ricavi, costiOperativi, ebitda, oneriFinanziari, ebit, dettaglio);
+        return new ForecastingEconomicoDTO(ricavi, costiOperativi, ebitda, ammortamenti, oneriFinanziari, ebit, dettaglio);
     }
 
-    private BigDecimal computeAmmortamentiPrevisione(LocalDate from, LocalDate to) {
-        long mesi = java.time.temporal.ChronoUnit.MONTHS.between(
-                from.withDayOfMonth(1), to.withDayOfMonth(1)) + 1;
-        Object result = em.createNativeQuery(
-                "SELECT COALESCE(SUM(costo_storico * aliquota_ammortamento / 100.0 / 12.0), 0) " +
-                "FROM cespiti WHERE is_active = true")
-                .getSingleResult();
-        BigDecimal ammMensile = result instanceof BigDecimal bd ? bd : new BigDecimal(result.toString());
-        return ammMensile.multiply(BigDecimal.valueOf(mesi)).setScale(2, java.math.RoundingMode.HALF_UP);
+    /**
+     * Quote di ammortamento di competenza nel periodo: UNA riga per cespite PER MESE, allineata
+     * alla convenzione contabile del P&L (ReportingService.computeAmmortamenti, fonte di verità):
+     * quota mensile fissa = costo × aliquota% / 1200, mese intero (nessun pro-rata sui giorni), la
+     * quota matura all'ULTIMO GIORNO del mese. Una riga è emessa se quella data cade in [from, to]
+     * e il mese rientra nella finestra di vita [mese di data_acquisto, mese di fine vita =
+     * data_acquisto + 1200/aliquota mesi).
+     *
+     * Nota quadratura: la quota per riga è arrotondata a 2 decimali → su 6 mesi Σ = 1.000,02 mentre
+     * il P&L (che arrotonda il TOTALE a fine calcolo) dà 1.000,00. Il delta di centesimi è atteso e
+     * accettabile: entrambe le viste usano la stessa base mensile 166,67; il P&L resta la verità.
+     * Vista ECONOMICA: entra nel dettaglio e nel P&L previsto, NON nella timeline di cassa.
+     */
+    @SuppressWarnings("unchecked")
+    private List<ForecastingDettaglioDTO> buildAmmortamenti(LocalDate from, LocalDate to) {
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT descrizione, costo_storico, aliquota_ammortamento, data_acquisto " +
+                "FROM cespiti WHERE is_active = true AND aliquota_ammortamento > 0")
+                .getResultList();
+
+        List<ForecastingDettaglioDTO> result = new ArrayList<>();
+        YearMonth ymFrom = YearMonth.from(from);
+        YearMonth ymTo   = YearMonth.from(to);
+        for (Object[] r : rows) {
+            BigDecimal costo = toBD(r[1]);
+            BigDecimal aliq  = toBD(r[2]);
+            LocalDate acquisto = toLocalDate(r[3]);
+
+            // Quota mensile del P&L, arrotondata a 2 dec (una riga = una quota di competenza).
+            BigDecimal quota = costo.multiply(aliq)
+                    .divide(BigDecimal.valueOf(1200), 2, java.math.RoundingMode.HALF_UP);
+            if (quota.signum() <= 0) continue;
+
+            int vitaMesi = BigDecimal.valueOf(1200)
+                    .divide(aliq, 0, java.math.RoundingMode.HALF_UP).intValue();
+            YearMonth inizio   = YearMonth.from(acquisto);
+            YearMonth fineEscl = inizio.plusMonths(vitaMesi);  // primo mese NON ammortizzato
+
+            for (YearMonth ym = ymFrom; !ym.isAfter(ymTo); ym = ym.plusMonths(1)) {
+                if (ym.isBefore(inizio) || !ym.isBefore(fineEscl)) continue;   // fuori vita
+                LocalDate ultimoGiorno = ym.atEndOfMonth();
+                if (ultimoGiorno.isBefore(from) || ultimoGiorno.isAfter(to)) continue; // fine mese fuori orizzonte
+                result.add(new ForecastingDettaglioDTO(
+                        ultimoGiorno, "AMMORTAMENTO", "Ammortamento " + r[0] + " (quota mese)",
+                        BigDecimal.ZERO, quota, "ECONOMICA", "CERTO"));
+            }
+        }
+        return result;
     }
 
     // ── FINANZIARIO ───────────────────────────────────────────────────────────

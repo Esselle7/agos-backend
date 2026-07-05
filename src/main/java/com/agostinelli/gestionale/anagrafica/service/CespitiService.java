@@ -1,10 +1,14 @@
 package com.agostinelli.gestionale.anagrafica.service;
 
 import com.agostinelli.gestionale.anagrafica.domain.Cespite;
+import com.agostinelli.gestionale.anagrafica.dto.CespiteAcquistoRequest;
 import com.agostinelli.gestionale.anagrafica.dto.CespiteDTO;
 import com.agostinelli.gestionale.anagrafica.dto.CespiteRequest;
 import com.agostinelli.gestionale.anagrafica.repository.CespitiRepository;
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
+import com.agostinelli.gestionale.movimenti.domain.Movimento;
+import com.agostinelli.gestionale.movimenti.repository.MovimentiRepository;
+import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
@@ -24,6 +28,8 @@ import java.util.stream.Collectors;
 public class CespitiService {
 
     @Inject CespitiRepository repo;
+    @Inject MovimentiRepository movimentiRepo;
+    @Inject MvRefreshService mvRefresh;
     @Inject EntityManager em;
 
     public List<CespiteDTO> listAll() {
@@ -35,7 +41,17 @@ public class CespitiService {
                 r -> ((Number) r[0]).intValue(),
                 r -> new String[]{(String) r[1], (String) r[2]}));
 
-        return repo.findAllOrdered().stream().map(c -> toDTO(c, contoMap)).toList();
+        // mappa cespite_id -> [movimento_id, stato] del movimento di acquisto (una sola query)
+        @SuppressWarnings("unchecked")
+        List<Object[]> movs = em.createNativeQuery(
+                "SELECT CAST(cespite_id AS text), CAST(id AS text), stato FROM movimenti " +
+                "WHERE cespite_id IS NOT NULL AND stato <> 'ANNULLATO'").getResultList();
+        Map<UUID, String[]> movMap = movs.stream().collect(Collectors.toMap(
+                r -> UUID.fromString((String) r[0]),
+                r -> new String[]{(String) r[1], (String) r[2]},
+                (a, b) -> a));
+
+        return repo.findAllOrdered().stream().map(c -> toDTO(c, contoMap, movMap.get(c.id))).toList();
     }
 
     @Transactional
@@ -43,7 +59,7 @@ public class CespitiService {
         Cespite c = new Cespite();
         apply(c, req);
         repo.persist(c);
-        return toDTO(c, null);
+        return toDTO(c, null, null);
     }
 
     @Transactional
@@ -51,14 +67,197 @@ public class CespitiService {
         Cespite c = repo.findByIdOptional(id)
                 .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND", "Cespite non trovato"));
         apply(c, req);
-        return toDTO(c, null);
+        return toDTO(c, null, null);
     }
 
+    /**
+     * Acquisto operativo: crea il cespite E il movimento di acquisto CAPEX collegato, in una
+     * sola transazione. L'acquisto è capex (immobilizzazione), NON un costo operativo: l'unico
+     * impatto P&L è l'ammortamento nel tempo (computeAmmortamenti). Nessun doppio conteggio.
+     */
     @Transactional
-    public void delete(UUID id) {
-        if (!repo.deleteById(id)) {
-            throw new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND", "Cespite non trovato");
+    @io.quarkus.cache.CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @io.quarkus.cache.CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @io.quarkus.cache.CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    public CespiteDTO registraAcquisto(CespiteAcquistoRequest req, UUID userId) {
+        // I1: l'acquisto deve capitalizzarsi su un conto CAPEX, altrimenti diventerebbe un costo
+        // operativo (doppio conteggio con l'ammortamento).
+        Boolean isCapex = (Boolean) em.createNativeQuery(
+                "SELECT is_capex FROM piano_dei_conti_coge WHERE id = :id")
+                .setParameter("id", req.contoCogeId())
+                .getResultStream().findFirst().orElse(null);
+        if (isCapex == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "CONTO_NON_TROVATO",
+                    "Conto COGE non trovato: " + req.contoCogeId());
         }
+        if (!isCapex) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "CONTO_NON_CAPEX",
+                    "Il conto dell'acquisto deve essere di investimento (CAPEX), non un costo operativo");
+        }
+
+        // Durata (anni) → aliquota a quote costanti
+        BigDecimal aliquota = BigDecimal.valueOf(100)
+                .divide(BigDecimal.valueOf(req.vitaAnni()), 2, RoundingMode.HALF_UP);
+
+        Cespite c = new Cespite();
+        c.descrizione          = req.descrizione();
+        c.contoCogeId          = req.contoCogeId();
+        c.costoStorico         = req.costoStorico();
+        c.aliquotaAmmortamento = aliquota;
+        c.dataAcquisto         = req.dataAcquisto();
+        c.isActive             = true;
+        repo.persist(c);
+        em.flush();
+
+        boolean pagato = req.dataPagamento() != null;
+        Integer metodoId = req.metodoPagamentoId();
+        if (pagato) {
+            if (req.contoBancarioId() == null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "CONTO_PAGAMENTO_MANCANTE",
+                        "Indica con quale conto/cassa è stato pagato l'acquisto");
+            }
+            metodoId = verificaFondiEDerivaMetodo(req.contoBancarioId(), req.costoStorico(), metodoId);
+        }
+
+        Movimento m = new Movimento();
+        m.tipo               = "USCITA";
+        m.importo            = req.costoStorico();
+        m.importoCommissione = BigDecimal.ZERO;
+        m.dataMovimento      = req.dataAcquisto();           // competenza = acquisto
+        m.contoCoge          = req.contoCogeId();            // conto CAPEX
+        m.businessUnitId     = req.businessUnitId();
+        m.cespiteId          = c.id;
+        m.fonte              = "MANUALE";
+        m.descrizione        = "[CESPITE] " + req.descrizione();
+        m.createdBy          = userId;
+        if (pagato) {
+            m.stato           = "REGISTRATO";
+            m.dataFinanziaria = req.dataPagamento();
+            m.dataLiquidita   = req.dataPagamento();
+            m.contoBancarioId = req.contoBancarioId();
+            m.metodoPagamentoId = metodoId;
+        } else {
+            m.stato           = "DA_LIQUIDARE";
+            m.dataFinanziaria = null;
+            m.dataLiquidita   = req.dataScadenza() != null ? req.dataScadenza() : req.dataAcquisto();
+        }
+        movimentiRepo.persist(m);
+        em.flush();
+
+        mvRefresh.requestRefreshAfterCommit();
+        return toDTO(c, null, new String[]{m.id.toString(), m.stato});
+    }
+
+    /**
+     * Liquidazione differita di un acquisto rimasto DA_LIQUIDARE (R13): paga ora il movimento di
+     * acquisto collegato al cespite, portandolo a REGISTRATO. Stessa guardia fondi di registraAcquisto
+     * (fail closed) e stesse invalidazioni cache + refresh MV, così il KPI si aggiorna subito.
+     */
+    @Transactional
+    @io.quarkus.cache.CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @io.quarkus.cache.CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @io.quarkus.cache.CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    public CespiteDTO liquidaAcquisto(UUID cespiteId, com.agostinelli.gestionale.anagrafica.dto.CespiteLiquidazioneRequest req) {
+        Cespite c = repo.findByIdOptional(cespiteId)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND", "Cespite non trovato"));
+
+        // Movimento di acquisto collegato ancora attivo (cespite_id, non annullato).
+        List<Movimento> attivi = movimentiRepo.list("cespiteId = ?1 AND stato <> ?2", cespiteId, "ANNULLATO");
+        if (attivi.isEmpty()) {
+            throw new ApiException(Response.Status.NOT_FOUND, "MOVIMENTO_ACQUISTO_ASSENTE",
+                    "Nessun movimento di acquisto da liquidare per questo cespite");
+        }
+        Movimento m = attivi.get(0);
+        if ("REGISTRATO".equals(m.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "ACQUISTO_GIA_LIQUIDATO",
+                    "L'acquisto di questo cespite è già stato liquidato");
+        }
+        if (!"DA_LIQUIDARE".equals(m.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "STATO_NON_LIQUIDABILE",
+                    "Il movimento di acquisto non è in stato DA_LIQUIDARE");
+        }
+        if (req.contoBancarioId() == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "CONTO_PAGAMENTO_MANCANTE",
+                    "Indica con quale conto/cassa liquidare l'acquisto");
+        }
+
+        int metodoId = verificaFondiEDerivaMetodo(req.contoBancarioId(), m.importo, req.metodoPagamentoId());
+        LocalDate dataPagamento = req.dataPagamento() != null ? req.dataPagamento() : LocalDate.now();
+
+        m.stato             = "REGISTRATO";
+        m.dataFinanziaria   = dataPagamento;
+        m.dataLiquidita     = dataPagamento;
+        m.contoBancarioId   = req.contoBancarioId();
+        m.metodoPagamentoId = metodoId;
+        em.flush();
+
+        mvRefresh.requestRefreshAfterCommit();
+        return toDTO(c, null, new String[]{m.id.toString(), m.stato});
+    }
+
+    /**
+     * Guardia fondi condivisa (registraAcquisto + liquidaAcquisto, DRY): verifica che il conto esista
+     * e abbia saldo live ≥ importo — fail closed, calcolato al volo con la stessa formula di
+     * mv_saldi_conti perché la MV è async e non vede le scritture recenti — poi deriva il metodo dal
+     * tipo conto se non indicato (CASSA → CONTANTI, altrimenti BONIFICO). Ritorna il metodo risolto.
+     */
+    private int verificaFondiEDerivaMetodo(Short contoBancarioId, BigDecimal importo, Integer metodoId) {
+        List<?> saldoRows = em.createNativeQuery("""
+                SELECT cb.tipo,
+                       cb.saldo_iniziale + COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo
+                                                             WHEN m.tipo='USCITA'  THEN -m.importo_lordo
+                                                             ELSE 0 END), 0)
+                FROM conti_bancari cb
+                LEFT JOIN movimenti m ON m.conto_bancario_id = cb.id AND m.stato <> 'ANNULLATO'
+                WHERE cb.id = :id
+                GROUP BY cb.tipo, cb.saldo_iniziale
+                """).setParameter("id", contoBancarioId).getResultList();
+        if (saldoRows.isEmpty()) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "CONTO_NON_TROVATO",
+                    "Conto di pagamento non trovato: " + contoBancarioId);
+        }
+        Object[] saldoRow = (Object[]) saldoRows.get(0);
+        BigDecimal saldo = (BigDecimal) saldoRow[1];
+        if (saldo.compareTo(importo) < 0) {
+            throw new ApiException(Response.Status.CONFLICT, "FONDI_INSUFFICIENTI",
+                    "Fondi insufficienti sul conto selezionato: saldo EUR " + saldo
+                            + ", richiesto EUR " + importo);
+        }
+        if (metodoId != null) return metodoId;
+        String codiceMetodo = "CASSA".equals(saldoRow[0]) ? "CONTANTI" : "BONIFICO";
+        return ((Number) em.createNativeQuery(
+                "SELECT id FROM metodi_pagamento WHERE codice = :c")
+                .setParameter("c", codiceMetodo).getSingleResult()).intValue();
+    }
+
+    /**
+     * Elimina un cespite gestendo il movimento di acquisto collegato (I5):
+     * - acquisto già liquidato (REGISTRATO) → 409, va disattivato non eliminato;
+     * - acquisto DA_LIQUIDARE → annullato (audit preservato) e sganciato, poi elimina;
+     * - cespite legacy senza movimento → elimina.
+     */
+    @Transactional
+    @io.quarkus.cache.CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @io.quarkus.cache.CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @io.quarkus.cache.CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    public void delete(UUID id) {
+        Cespite c = repo.findByIdOptional(id)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND", "Cespite non trovato"));
+
+        List<Movimento> attivi = movimentiRepo.list("cespiteId = ?1 AND stato <> ?2", id, "ANNULLATO");
+        boolean liquidato = attivi.stream().anyMatch(m -> "REGISTRATO".equals(m.stato));
+        if (liquidato) {
+            throw new ApiException(Response.Status.CONFLICT, "CESPITE_ACQUISTO_LIQUIDATO",
+                    "Acquisto già liquidato: disattiva il cespite invece di eliminarlo");
+        }
+        // Annulla gli acquisti pendenti (DA_LIQUIDARE)
+        attivi.forEach(m -> m.stato = "ANNULLATO");
+        em.flush();
+        // Sgancia la FK (RESTRICT) su tutti i movimenti collegati, inclusi quelli già annullati
+        movimentiRepo.update("cespiteId = null WHERE cespiteId = ?1", id);
+
+        repo.delete(c);
+        if (!attivi.isEmpty()) mvRefresh.requestRefreshAfterCommit();
     }
 
     /**
@@ -110,7 +309,8 @@ public class CespitiService {
         if (req.isActive() != null) c.isActive = req.isActive();
     }
 
-    private CespiteDTO toDTO(Cespite c, Map<Integer, String[]> contoMap) {
+    /** {@code mov} = [movimentoId, stato] del movimento di acquisto, o null se assente. */
+    private CespiteDTO toDTO(Cespite c, Map<Integer, String[]> contoMap, String[] mov) {
         String[] conto = contoMap != null ? contoMap.get(c.contoCogeId) : lookupConto(c.contoCogeId);
 
         BigDecimal mensile = c.costoStorico.multiply(c.aliquotaAmmortamento)
@@ -129,7 +329,9 @@ public class CespitiService {
                 conto != null ? conto[0] : null,
                 conto != null ? conto[1] : null,
                 c.costoStorico, c.aliquotaAmmortamento, c.dataAcquisto, c.isActive,
-                mensile, annuo, gia, residuo);
+                mensile, annuo, gia, residuo,
+                mov != null ? UUID.fromString(mov[0]) : null,
+                mov != null ? mov[1] : null);
     }
 
     private String[] lookupConto(Integer contoId) {

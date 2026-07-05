@@ -100,7 +100,8 @@ public class ReportingService {
         for (Object[] r : rows) {
             short buId              = toShort(r[0]);
             BigDecimal ric          = toBD(r[2]);
-            BigDecimal cos          = toBD(r[3]).add(toBD(r[4]));
+            // Solo costi operativi: il capex (r[4]) è investimento, non costo economico
+            BigDecimal cos          = toBD(r[3]);
             BigDecimal ebitdaBu     = toBD(r[5]);
             BigDecimal oneriBu      = toBD(r[6]);
             BigDecimal imposteBu    = toBD(r[7]);
@@ -260,23 +261,24 @@ public class ReportingService {
         }
 
         BigDecimal baseRicavi = totRicavi.compareTo(BigDecimal.ZERO) > 0 ? totRicavi : BigDecimal.ONE;
-        BigDecimal baseCosti  = totCosti.add(totCapex).compareTo(BigDecimal.ZERO) > 0
-                ? totCosti.add(totCapex) : BigDecimal.ONE;
+        BigDecimal baseCosti  = totCosti.compareTo(BigDecimal.ZERO) > 0 ? totCosti : BigDecimal.ONE;
 
         for (Object[] r : rows) {
             String codice = (String) r[0];
             String desc   = (String) r[1];
             BigDecimal ric = toBD(r[4]);
             BigDecimal cos = toBD(r[5]);
-            BigDecimal cap = toBD(r[6]);
 
             if (ric.compareTo(BigDecimal.ZERO) > 0) {
                 vociRicavi.add(new VoceDTO(codice, desc, ric,
                         ric.divide(baseRicavi, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))));
             }
-            if (cos.add(cap).compareTo(BigDecimal.ZERO) > 0) {
-                vociCosti.add(new VoceDTO(codice, desc, cos.add(cap),
-                        cos.add(cap).divide(baseCosti, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))));
+            // Solo costi OPERATIVI: il capex è un investimento (patrimoniale), non un costo
+            // economico — il suo unico impatto P&L è l'ammortamento. Mostrarlo tra i costi
+            // renderebbe incoerente il waterfall (ricavi − costi ≠ EBITDA) e doppio-conteggerebbe.
+            if (cos.compareTo(BigDecimal.ZERO) > 0) {
+                vociCosti.add(new VoceDTO(codice, desc, cos,
+                        cos.divide(baseCosti, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))));
             }
         }
 
@@ -294,7 +296,8 @@ public class ReportingService {
         return new PlDTO(
                 buRef, from, to,
                 new PlDTO.RicaviDTO(totRicavi, vociRicavi),
-                new PlDTO.CostiDTO(totCosti.add(totCapex), totCapex, vociCosti),
+                // totale = costi OPERATIVI (economici); capex esposto a parte come investimento
+                new PlDTO.CostiDTO(totCosti, totCapex, vociCosti),
                 totEbitda, ammortamenti, ebit,
                 totOneriFinanziari, ebt, totImposte, utileNetto,
                 marginePct

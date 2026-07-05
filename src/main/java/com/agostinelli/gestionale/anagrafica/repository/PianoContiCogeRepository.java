@@ -175,6 +175,22 @@ public class PianoContiCogeRepository implements PanacheRepositoryBase<PianoCont
             throw new ApiException(Response.Status.BAD_REQUEST, "PARENT_NON_VALIDO",
                     "Conto padre inesistente: " + parentId);
         }
+        // Anti-ciclo: risalgo la catena dei parent del nuovo padre; se incontro selfId, il padre è un
+        // mio discendente e la gerarchia diventerebbe ciclica. L'albero esistente è aciclico (invariante
+        // difesa qui), quindi la risalita termina sempre. Solo in update (selfId != null).
+        if (selfId != null) {
+            Integer cur = parentId;
+            while (cur != null) {
+                if (cur.equals(selfId)) {
+                    throw new ApiException(Response.Status.BAD_REQUEST, "PARENT_NON_VALIDO",
+                            "Il conto padre è un discendente: creerebbe un ciclo nella gerarchia");
+                }
+                List<?> res = em.createNativeQuery("SELECT parent_id FROM piano_dei_conti_coge WHERE id = :id")
+                        .setParameter("id", cur).getResultList();
+                Object pid = res.isEmpty() ? null : res.get(0);
+                cur = pid == null ? null : ((Number) pid).intValue();
+            }
+        }
     }
 
     // ── Mapping ───────────────────────────────────────────────────────────────

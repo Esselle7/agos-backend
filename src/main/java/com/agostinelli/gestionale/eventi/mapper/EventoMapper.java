@@ -19,8 +19,10 @@ public interface EventoMapper {
     @Mapping(target = "noteAnnullamento",           ignore = true)
     @Mapping(target = "nOspiti",                    ignore = true)
     @Mapping(target = "menuPdfUrl",                 ignore = true)
+    // importoTotalePreviventivato è calcolato come Σ voci (ricalcolaPreventivato) — non dal request
+    @Mapping(target = "importoTotalePreviventivato", ignore = true)
     // personaleIds è gestito direttamente dal service — non mappato sull'entità
-    @BeanMapping(ignoreUnmappedSourceProperties = {"personaleIds"})
+    @BeanMapping(ignoreUnmappedSourceProperties = {"personaleIds", "importoTotalePreviventivato"})
     Evento fromRequest(EventoCreateRequest req);
 
     /**
@@ -30,7 +32,7 @@ public interface EventoMapper {
      */
     @BeanMapping(
         nullValuePropertyMappingStrategy = NullValuePropertyMappingStrategy.IGNORE,
-        ignoreUnmappedSourceProperties = {"personaleIds"}
+        ignoreUnmappedSourceProperties = {"personaleIds", "importoTotalePreviventivato"}
     )
     @Mapping(target = "id",                   ignore = true)
     @Mapping(target = "createdAt",            ignore = true)
@@ -39,6 +41,8 @@ public interface EventoMapper {
     @Mapping(target = "importoIncassato",     ignore = true)
     @Mapping(target = "caparreIncassate",     ignore = true)
     @Mapping(target = "costiDirettiImputati", ignore = true)
+    // importoTotalePreviventivato è calcolato come Σ voci — mai sovrascritto dal PUT
+    @Mapping(target = "importoTotalePreviventivato", ignore = true)
     @Mapping(target = "stato",               ignore = true)
     @Mapping(target = "noteAnnullamento",    ignore = true)
     @Mapping(target = "nOspiti",             ignore = true)

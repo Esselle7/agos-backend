@@ -21,5 +21,10 @@ public record CespiteDTO(
         BigDecimal ammortamentoMensile,
         BigDecimal ammortamentoAnnuo,
         BigDecimal giaAmmortizzato,
-        BigDecimal valoreResiduo
+        BigDecimal valoreResiduo,
+
+        /** Movimento di acquisto CAPEX collegato (null per i cespiti del libro iniziale). */
+        UUID movimentoAcquistoId,
+        /** Stato del movimento di acquisto: REGISTRATO | DA_LIQUIDARE | null. */
+        String statoPagamentoAcquisto
 ) {}

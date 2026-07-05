@@ -1,6 +1,7 @@
 package com.agostinelli.gestionale.eventi.dto;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Positive;
 import java.math.BigDecimal;
 
 /**
@@ -22,6 +23,17 @@ public record EventoCostoDirettoRequest(
 
         /** Importo del costo. */
         BigDecimal importo,
+
+        /** BU a cui imputare il movimento di costo. Se null, la BU dell'evento. */
+        Short businessUnitId,
+
+        /**
+         * Opzionale: importo addebitato al cliente (ricarico). Se valorizzato, crea una
+         * voce di preventivo collegata (origine COSTO_DIRETTO) che alza il preventivato
+         * senza generare movimenti. Es. DJ pagato 200 → addebitato 250.
+         */
+        @Positive
+        BigDecimal importoAddebitoCliente,
 
         String note
 ) {}

@@ -472,6 +472,7 @@ public class RecurringExpenseService {
             case "MENSILE"     -> 1;
             case "BIMESTRALE"  -> 2;
             case "TRIMESTRALE" -> 3;
+            case "ANNUALE"     -> 12;
             default -> throw new ApiException(Response.Status.BAD_REQUEST, "FREQUENZA_INVALIDA",
                     "Frequenza non valida: " + frequenza);
         };

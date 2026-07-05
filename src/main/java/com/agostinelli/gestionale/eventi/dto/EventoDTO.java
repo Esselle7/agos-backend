@@ -83,6 +83,17 @@ public record EventoDTO(
          */
         List<PagamentoEventoDTO> pagamenti,
 
+        // ── Voci preventivo/consuntivo (ADMIN-only) ─────────────────────────────
+
+        /** Voci che compongono il preventivo/consuntivo. ADMIN-only (null per DIPENDENTE). */
+        List<EventoVoceDTO> voci,
+
+        /** ADMIN-only. Σ COALESCE(consuntivo, preventivo) delle voci. */
+        BigDecimal totaleConsuntivato,
+
+        /** ADMIN-only. totaleConsuntivato − importoTotalePreviventivato. */
+        BigDecimal scostamentoConsuntivo,
+
         Instant createdAt,
         UUID createdBy
 ) {}

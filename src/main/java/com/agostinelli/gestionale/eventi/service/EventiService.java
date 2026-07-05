@@ -10,12 +10,16 @@ import com.agostinelli.gestionale.eventi.domain.Evento;
 import com.agostinelli.gestionale.eventi.domain.EventoCostoDiretto;
 import com.agostinelli.gestionale.eventi.domain.EventoPartecipante;
 import com.agostinelli.gestionale.eventi.domain.EventoPreventivoTracking;
+import com.agostinelli.gestionale.eventi.domain.EventoVoce;
+import com.agostinelli.gestionale.eventi.domain.EventoVoceCatalogo;
 import com.agostinelli.gestionale.eventi.dto.*;
 import com.agostinelli.gestionale.eventi.mapper.EventoMapper;
 import com.agostinelli.gestionale.eventi.repository.EventiRepository;
 import com.agostinelli.gestionale.eventi.repository.EventoCostiDirettiRepository;
 import com.agostinelli.gestionale.eventi.repository.EventoPartecipantiRepository;
 import com.agostinelli.gestionale.eventi.repository.EventoPreventivoTrackingRepository;
+import com.agostinelli.gestionale.eventi.repository.EventoVoceCatalogoRepository;
+import com.agostinelli.gestionale.eventi.repository.EventoVociRepository;
 import com.agostinelli.gestionale.personale.domain.Personale;
 import com.agostinelli.gestionale.personale.repository.PersonaleRepository;
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
@@ -57,6 +61,8 @@ public class EventiService {
     @Inject EventoPartecipantiRepository partecipantiRepo;
     @Inject EventoCostiDirettiRepository costiRepo;
     @Inject EventoPreventivoTrackingRepository trackingRepo;
+    @Inject EventoVociRepository vociRepo;
+    @Inject EventoVoceCatalogoRepository catalogoRepo;
     @Inject PersonaleRepository personaleRepo;
     @Inject MovimentiRepository movimentiRepo;
     @Inject PianoContiCogeRepository pianoContiRepo;
@@ -87,6 +93,24 @@ public class EventiService {
         repo.persist(e);
         salvaAllergie(e.id, req.allergie());
         bulkAssegnaPersonale(e.id, req.personaleIds());
+
+        // Se in creazione è indicato un totale previsto, lo materializzo come voce iniziale:
+        // mantiene l'invariante totale = Σ voci e permette la conferma immediata. Il frontend
+        // voci-first non lo invia (compone le voci nel dettaglio) → nessun doppio conteggio.
+        if (req.importoTotalePreviventivato() != null
+                && req.importoTotalePreviventivato().compareTo(BigDecimal.ZERO) > 0) {
+            EventoVoce v = new EventoVoce();
+            v.eventoId           = e.id;
+            v.label              = "Preventivo iniziale";
+            v.prezzoUnitario     = req.importoTotalePreviventivato();
+            v.quantitaPreventivo = BigDecimal.ONE;
+            v.origine            = "MANUALE";
+            v.createdBy          = userId;
+            ricalcolaImporti(v);
+            vociRepo.persist(v);
+            em.flush();
+            ricalcolaPreventivato(e);
+        }
         return buildEventoDTO(e, true);
     }
 
@@ -644,7 +668,11 @@ public class EventiService {
         m.eventoId            = e.id;
         m.tipoEventoMovimento = null;
         m.contoCoge           = conto.id;
-        m.businessUnitId      = e.businessUnitId != null ? e.businessUnitId : 2;
+        // BU del costo: quella indicata nel request (può differire dalla BU evento),
+        // altrimenti la BU dell'evento. Il profitto dell'evento netta comunque il costo
+        // (vedi calcolaCostiReali su eventoId); la BU instrada solo il movimento nel P&L.
+        m.businessUnitId      = req.businessUnitId() != null ? req.businessUnitId()
+                : (e.businessUnitId != null ? e.businessUnitId : 2);
         m.descrizione         = "[COSTO EVENTO] " + etichetta + " – " + e.nome;
         m.note                = req.note();
         m.createdBy           = userId;
@@ -668,6 +696,25 @@ public class EventiService {
         costo.createdBy       = userId;
         costiRepo.persist(costo);
         em.flush();
+
+        // Ricarico opzionale verso cliente → voce di preventivo collegata (NON genera movimento).
+        // Es. DJ pagato 200 (movimento USCITA) e addebitato 250 al cliente (voce di ricavo).
+        if (req.importoAddebitoCliente() != null
+                && req.importoAddebitoCliente().compareTo(BigDecimal.ZERO) > 0) {
+            EventoVoce voce = new EventoVoce();
+            voce.eventoId           = e.id;
+            voce.catalogoId         = null;
+            voce.label              = etichetta;
+            voce.prezzoUnitario     = req.importoAddebitoCliente();
+            voce.quantitaPreventivo = BigDecimal.ONE;
+            voce.origine            = "COSTO_DIRETTO";
+            voce.costoDirettoId     = costo.id;
+            voce.createdBy          = userId;
+            ricalcolaImporti(voce);
+            vociRepo.persist(voce);
+            em.flush();
+            ricalcolaPreventivato(e);
+        }
 
         ricalcolaIncassi(e);
         mvRefresh.requestRefreshAfterCommit();
@@ -696,9 +743,13 @@ public class EventiService {
             em.flush();
         }
 
+        // Rimuove l'eventuale voce di ricarico collegata (evita il residuo del ON DELETE CASCADE
+        // nella sessione Hibernate) e ricalcola il preventivato.
+        vociRepo.deleteByCostoDirettoId(costo.id);
         costiRepo.delete(costo);
         em.flush();
 
+        ricalcolaPreventivato(e);
         ricalcolaIncassi(e);
         mvRefresh.requestRefreshAfterCommit();
     }
@@ -827,6 +878,185 @@ public class EventiService {
                 costoTotale, ricavo, margine, marginePerc, t.note);
     }
 
+    // ── VOCI PREVENTIVO / CONSUNTIVO (no contabilità) ────────────────────────────
+
+    /** Listino delle voci riutilizzabili (default guidati per primi). */
+    public List<EventoVoceCatalogoDTO> getCatalogoVoci() {
+        return catalogoRepo.findAttivi().stream()
+                .map(c -> new EventoVoceCatalogoDTO(c.id, c.label, c.isDefault, c.prezzoDefault, c.unita))
+                .toList();
+    }
+
+    /** Voci di preventivo/consuntivo di un evento. */
+    public List<EventoVoceDTO> getVoci(UUID eventoId) {
+        findOrThrow(eventoId);
+        return vociRepo.findByEventoId(eventoId).stream().map(this::toVoceDTO).toList();
+    }
+
+    /**
+     * Aggiunge una voce di preventivo (riga quantità × prezzo unitario). Fornire catalogoId
+     * (voce di listino, prezzo precompilato) OPPURE label (voce nuova → registrata nel listino).
+     * NON genera movimenti.
+     */
+    @Transactional
+    public EventoVoceDTO aggiungiVoce(UUID eventoId, EventoVoceRequest req, UUID userId) {
+        Evento e = findOrThrow(eventoId);
+        assertVociModificabili(e);
+
+        EventoVoceCatalogo cat = risolviCatalogo(req);
+
+        EventoVoce v = new EventoVoce();
+        v.eventoId           = e.id;
+        v.catalogoId         = cat.id;
+        v.label              = cat.label;
+        v.prezzoUnitario     = req.prezzoUnitario() != null ? req.prezzoUnitario()
+                : (cat.prezzoDefault != null ? cat.prezzoDefault : BigDecimal.ZERO);
+        v.quantitaPreventivo = req.quantitaPreventivo() != null ? req.quantitaPreventivo() : BigDecimal.ONE;
+        v.origine            = "MANUALE";
+        v.note               = req.note();
+        v.createdBy          = userId;
+        if (req.quantitaConsuntivo() != null) {
+            assertConsuntivabile(e);
+            v.quantitaConsuntivo = req.quantitaConsuntivo();
+        }
+        ricalcolaImporti(v);
+        vociRepo.persist(v);
+        em.flush();
+
+        ricalcolaPreventivato(e);
+        mvRefresh.requestRefreshAfterCommit();
+        return toVoceDTO(v);
+    }
+
+    /** Aggiorna prezzo/quantità/note di una voce (PATCH: null = invariato). */
+    @Transactional
+    public EventoVoceDTO updateVoce(Long voceId, EventoVoceRequest req) {
+        EventoVoce v = vociRepo.findByIdOptional(voceId)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
+                        "Voce non trovata: " + voceId));
+        Evento e = findOrThrow(v.eventoId);
+        assertVociModificabili(e);
+
+        if (req.prezzoUnitario() != null)     v.prezzoUnitario     = req.prezzoUnitario();
+        if (req.quantitaPreventivo() != null) v.quantitaPreventivo = req.quantitaPreventivo();
+        if (req.quantitaConsuntivo() != null) {
+            assertConsuntivabile(e);
+            v.quantitaConsuntivo = req.quantitaConsuntivo();
+        }
+        if (req.note() != null) v.note = req.note();
+        ricalcolaImporti(v);
+        em.flush();
+
+        ricalcolaPreventivato(e);
+        mvRefresh.requestRefreshAfterCommit();
+        return toVoceDTO(v);
+    }
+
+    /** Rimuove una voce MANUALE. Le voci COSTO_DIRETTO si rimuovono col relativo costo. */
+    @Transactional
+    public void rimuoviVoce(Long voceId) {
+        EventoVoce v = vociRepo.findByIdOptional(voceId)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
+                        "Voce non trovata: " + voceId));
+        Evento e = findOrThrow(v.eventoId);
+        assertVociModificabili(e);
+        if ("COSTO_DIRETTO".equals(v.origine)) {
+            throw new ApiException(Response.Status.CONFLICT, "VOCE_DA_COSTO_DIRETTO",
+                    "Questa voce deriva da un costo diretto: rimuovi il costo diretto collegato");
+        }
+        vociRepo.delete(v);
+        em.flush();
+
+        ricalcolaPreventivato(e);
+        mvRefresh.requestRefreshAfterCommit();
+    }
+
+    /** Risolve/crea la voce di catalogo per una richiesta MANUALE (upsert per label). */
+    private EventoVoceCatalogo risolviCatalogo(EventoVoceRequest req) {
+        if (req.catalogoId() != null) {
+            EventoVoceCatalogo c = catalogoRepo.findById(req.catalogoId());
+            if (c == null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "CATALOGO_NON_TROVATO",
+                        "Voce di catalogo non trovata: " + req.catalogoId());
+            }
+            return c;
+        }
+        String label = req.label() != null ? req.label().trim() : null;
+        if (label == null || label.isBlank()) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "LABEL_MANCANTE",
+                    "Fornire catalogoId di una voce esistente o una label nuova");
+        }
+        return catalogoRepo.findByLabelIgnoreCase(label).orElseGet(() -> {
+            EventoVoceCatalogo nuovo = new EventoVoceCatalogo();
+            nuovo.label         = label;
+            nuovo.isDefault     = false;
+            nuovo.ordine        = 100;                 // in coda ai default guidati
+            nuovo.attivo        = true;
+            // Salva il prezzo della voce custom nel listino → riutilizzabile con prezzo precompilato
+            nuovo.prezzoDefault = req.prezzoUnitario();
+            catalogoRepo.persist(nuovo);
+            em.flush();
+            return nuovo;
+        });
+    }
+
+    private void assertVociModificabili(Evento e) {
+        if ("SALDATO".equals(e.stato)) {
+            throw new ForbiddenException("Evento saldato: voci non modificabili");
+        }
+        if ("ANNULLATO".equals(e.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "EVENTO_ANNULLATO",
+                    "Impossibile modificare le voci di un evento annullato");
+        }
+    }
+
+    private void assertConsuntivabile(Evento e) {
+        if (e.dataEvento != null && LocalDate.now(ITALY).isBefore(e.dataEvento)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "CONSUNTIVO_NON_ANCORA",
+                    "Il consuntivo è compilabile solo dalla data dell'evento (" + e.dataEvento + ")");
+        }
+    }
+
+    /**
+     * Ricalcola importoTotalePreviventivato come Σ importoPreventivo delle voci.
+     * Denormalizzazione coerente col pattern {@link #ricalcolaIncassi} (nessun trigger DB):
+     * la colonna resta la fonte per MV, dashboard, forecasting, scadenzario, scheduler e
+     * macchina a stati. Da chiamare dopo ogni mutazione di voce (incl. ricarico costo diretto).
+     */
+    private void ricalcolaPreventivato(Evento e) {
+        BigDecimal tot = (BigDecimal) em.createQuery(
+                "SELECT COALESCE(SUM(v.importoPreventivo), 0) FROM EventoVoce v WHERE v.eventoId = :eid")
+                .setParameter("eid", e.id)
+                .getSingleResult();
+        e.importoTotalePreviventivato = tot;
+    }
+
+    private BigDecimal calcolaTotaleConsuntivato(UUID eventoId) {
+        return (BigDecimal) em.createQuery(
+                "SELECT COALESCE(SUM(COALESCE(v.importoConsuntivo, v.importoPreventivo)), 0) " +
+                "FROM EventoVoce v WHERE v.eventoId = :eid")
+                .setParameter("eid", eventoId)
+                .getSingleResult();
+    }
+
+    /** importo = quantità × prezzo unitario, per preventivo e (se presente) consuntivo. */
+    private void ricalcolaImporti(EventoVoce v) {
+        v.importoPreventivo = v.prezzoUnitario.multiply(v.quantitaPreventivo);
+        v.importoConsuntivo = v.quantitaConsuntivo != null
+                ? v.prezzoUnitario.multiply(v.quantitaConsuntivo)
+                : null;
+    }
+
+    private EventoVoceDTO toVoceDTO(EventoVoce v) {
+        BigDecimal scostamento = v.importoConsuntivo != null
+                ? v.importoConsuntivo.subtract(v.importoPreventivo)
+                : null;
+        return new EventoVoceDTO(v.id, v.catalogoId, v.label,
+                v.prezzoUnitario, v.quantitaPreventivo, v.quantitaConsuntivo,
+                v.importoPreventivo, v.importoConsuntivo, scostamento,
+                v.origine, v.costoDirettoId, v.note);
+    }
+
     // ── HELPERS PRIVATI ───────────────────────────────────────────────────────
 
     private Evento findOrThrow(UUID id) {
@@ -908,6 +1138,15 @@ public class EventiService {
         BigDecimal costiReali = isAdmin ? calcolaCostiReali(e.id) : null;
         BigDecimal profitto   = isAdmin ? safeProfitto(e, costiReali) : null;
 
+        List<EventoVoceDTO> voci = isAdmin
+                ? vociRepo.findByEventoId(e.id).stream().map(this::toVoceDTO).toList()
+                : null;
+        BigDecimal totaleConsuntivato = isAdmin ? calcolaTotaleConsuntivato(e.id) : null;
+        BigDecimal scostamentoConsuntivo = isAdmin
+                ? totaleConsuntivato.subtract(
+                        e.importoTotalePreviventivato != null ? e.importoTotalePreviventivato : BigDecimal.ZERO)
+                : null;
+
         return new EventoDTO(
                 e.id, e.nome, e.tipo, e.dataEvento, e.dataPreventivo,
                 isAdmin ? e.importoTotalePreviventivato : null,
@@ -923,6 +1162,7 @@ public class EventiService {
                 residuo, perc, costiReali, profitto,
                 dataConferma, dataSaldo,
                 pagamenti,
+                voci, totaleConsuntivato, scostamentoConsuntivo,
                 e.createdAt, e.createdBy);
     }
 

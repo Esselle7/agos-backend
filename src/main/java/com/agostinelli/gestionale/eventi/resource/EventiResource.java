@@ -220,6 +220,52 @@ public class EventiResource {
         return Response.noContent().build();
     }
 
+    // ── VOCI PREVENTIVO / CONSUNTIVO ────────────────────────────────────────────
+
+    /** Catalogo delle label riutilizzabili (default guidati per primi). Segmento statico. */
+    @GET
+    @Path("/voci-catalogo")
+    @RolesAllowed(ROLE_ADMIN)
+    public List<EventoVoceCatalogoDTO> getVociCatalogo() {
+        return service.getCatalogoVoci();
+    }
+
+    @GET
+    @Path("/{id}/voci")
+    @RolesAllowed(ROLE_ADMIN)
+    public List<EventoVoceDTO> getVoci(@PathParam("id") UUID id) {
+        return service.getVoci(id);
+    }
+
+    @POST
+    @Path("/{id}/voci")
+    @RolesAllowed(ROLE_ADMIN)
+    public Response aggiungiVoce(
+            @PathParam("id") UUID id,
+            @Valid EventoVoceRequest req,
+            @Context SecurityContext ctx) {
+
+        EventoVoceDTO dto = service.aggiungiVoce(id, req, currentUserId(ctx));
+        return Response.status(Response.Status.CREATED).entity(dto).build();
+    }
+
+    @PUT
+    @Path("/voci/{voceId}")
+    @RolesAllowed(ROLE_ADMIN)
+    public EventoVoceDTO updateVoce(
+            @PathParam("voceId") Long voceId,
+            @Valid EventoVoceRequest req) {
+        return service.updateVoce(voceId, req);
+    }
+
+    @DELETE
+    @Path("/voci/{voceId}")
+    @RolesAllowed(ROLE_ADMIN)
+    public Response rimuoviVoce(@PathParam("voceId") Long voceId) {
+        service.rimuoviVoce(voceId);
+        return Response.noContent().build();
+    }
+
     // ── MENU PDF ──────────────────────────────────────────────────────────────
 
     @POST

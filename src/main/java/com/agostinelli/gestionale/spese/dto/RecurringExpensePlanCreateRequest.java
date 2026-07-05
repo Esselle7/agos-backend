@@ -27,7 +27,7 @@ public record RecurringExpensePlanCreateRequest(
     Short giornoDelMese,
 
     @NotNull
-    @Pattern(regexp = "MENSILE|BIMESTRALE|TRIMESTRALE")
+    @Pattern(regexp = "MENSILE|BIMESTRALE|TRIMESTRALE|ANNUALE")
     String frequenza,
 
     @NotNull

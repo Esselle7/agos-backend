@@ -314,6 +314,33 @@ public class RecurringExpenseService {
         return buildDetail(plan, installmentRepo.findByPianoOrdered(planId));
     }
 
+    // ── DELETE PLAN (fisica) ───────────────────────────────────────────────────
+
+    /**
+     * Elimina fisicamente un piano e le sue rate. Consentito SOLO se il piano è
+     * ATTIVO e nessuna rata ha un movimento contabile collegato: così non si
+     * orfanano mai scritture (USCITA fonte=RICORRENTE) né penali. Se c'è anche una
+     * sola rata pagata/liquidata → 409, si usa 'annulla' che preserva la contabilità.
+     * La guardia è ATOMICA: la delete condizionata elimina solo rate senza movimenti;
+     * se il conteggio non torna (es. lo scheduler ha appena pagato una rata scaduta,
+     * cron 06:00) la transazione fa rollback — nessuna finestra count-then-delete.
+     * Le rate cascatano (FK ON DELETE CASCADE); ricorrenti_da_riconciliare → SET NULL.
+     */
+    @Transactional
+    public void deletePlan(UUID planId) {
+        RecurringExpensePlan plan = findActivePlanOrThrow(planId);
+
+        long totale    = installmentRepo.count("pianoId = ?1", planId);
+        long eliminate = installmentRepo.delete(
+                "pianoId = ?1 AND movimentoId IS NULL AND movimentoInteressiId IS NULL", planId);
+        if (eliminate != totale) {
+            throw new ApiException(Response.Status.CONFLICT, "PIANO_CON_MOVIMENTI",
+                    "Il piano ha " + (totale - eliminate) + " rata/e con movimenti contabili collegati: "
+                    + "usa 'annulla' invece di eliminare per non perdere le scritture.");
+        }
+        planRepo.delete(plan);
+    }
+
     // ── PROCESS SCHEDULED (chiamato dallo scheduler) ───────────────────────────
 
     @Transactional

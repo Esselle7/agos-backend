@@ -66,6 +66,13 @@ public class RecurringExpenseResource {
         return service.cancelPlan(id, req != null ? req : new CancelPlanRequest(null, null), userId);
     }
 
+    @DELETE
+    @Path("/piani/{id}")
+    public Response delete(@PathParam("id") UUID id) {
+        service.deletePlan(id);
+        return Response.noContent().build();
+    }
+
     // ── Rate ──────────────────────────────────────────────────────────────────
 
     @PUT

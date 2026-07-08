@@ -294,6 +294,10 @@ class SpeseRicorrentiIntegrationTest {
     void testPagaRata_setsPaidAndMovimentoId() {
         Assumptions.assumeTrue(createdPlanId != null);
 
+        // checkSaldo (guardia SALDO_INSUFFICIENTE) rifiuta il pagamento a saldo 0:
+        // nel profilo test conto 1 parte da 0 (nessun seed dev) → top-up esplicito.
+        txHelper.seedSaldoConto1(new java.math.BigDecimal("2000.00"));
+
         String rataId = given()
             .when().get(BASE + "/piani/" + createdPlanId)
             .then().statusCode(200)
@@ -387,6 +391,9 @@ class SpeseRicorrentiIntegrationTest {
     @Order(50)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void testLiquidaPiano() {
+        // liquida = maxi-rata da 600€: serve saldo (guardia SALDO_INSUFFICIENTE)
+        txHelper.seedSaldoConto1(new java.math.BigDecimal("2000.00"));
+
         // crea un piano fresco da liquidare
         String body = """
             {
@@ -473,6 +480,9 @@ class SpeseRicorrentiIntegrationTest {
     @Order(52)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void testAnnullaPiano_giaPagato_nonModificaRatePaid() {
+        // la liquidazione intermedia (200€) richiede saldo (guardia SALDO_INSUFFICIENTE)
+        txHelper.seedSaldoConto1(new java.math.BigDecimal("1000.00"));
+
         // crea e liquida piano, poi prova ad annullarlo (deve fallire con PIANO_NON_ATTIVO)
         String body = """
             {
@@ -504,6 +514,345 @@ class SpeseRicorrentiIntegrationTest {
             .contentType(ContentType.JSON).body("{}")
             .when().post(BASE + "/piani/" + planId + "/annulla")
             .then().statusCode(409);
+    }
+
+    // ── Eliminazione fisica piano ─────────────────────────────────────────────
+
+    @Test
+    @Order(53)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testDeletePiano_soloPending_cancellaPianoERate() {
+        String body = """
+            {
+              "descrizione": "Piano da eliminare fisicamente",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 250.00,
+              "variazionePct": 0,
+              "giornoDelMese": 12,
+              "frequenza": "MENSILE",
+              "numeroRate": 5,
+              "dataInizio": "2026-07-01"
+            }
+            """.formatted(validContoCoge);
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        // pre-condizione: 5 rate a DB
+        assertEquals(5, txHelper.countInstallments(UUID.fromString(planId)));
+
+        given()
+            .when().delete(BASE + "/piani/" + planId)
+            .then().statusCode(204);
+
+        // piano sparito
+        given().when().get(BASE + "/piani/" + planId).then().statusCode(404);
+        // rate cascatate via FK ON DELETE CASCADE
+        assertEquals(0, txHelper.countInstallments(UUID.fromString(planId)),
+                "Le rate devono essere eliminate in cascata con il piano");
+    }
+
+    @Test
+    @Order(54)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testDeletePiano_conRataPagata_409_eNonCancella() {
+        // Serve saldo per pagare la rata
+        txHelper.seedSaldoConto1(new java.math.BigDecimal("5000.00"));
+
+        String body = """
+            {
+              "descrizione": "Piano con rata pagata (non eliminabile)",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 120.00,
+              "variazionePct": 0,
+              "giornoDelMese": 3,
+              "frequenza": "MENSILE",
+              "numeroRate": 4,
+              "dataInizio": "2026-07-01"
+            }
+            """.formatted(validContoCoge);
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        String rataId = given()
+            .when().get(BASE + "/piani/" + planId)
+            .then().statusCode(200)
+            .extract().path("rate[0].id");
+
+        given()
+            .contentType(ContentType.JSON).body("{}")
+            .when().post(BASE + "/piani/" + planId + "/rate/" + rataId + "/paga")
+            .then().statusCode(200);
+
+        // delete deve fallire: c'è un movimento contabile collegato
+        given()
+            .when().delete(BASE + "/piani/" + planId)
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("PIANO_CON_MOVIMENTI"));
+
+        // piano e rate ancora presenti
+        given().when().get(BASE + "/piani/" + planId).then().statusCode(200);
+        assertEquals(4, txHelper.countInstallments(UUID.fromString(planId)));
+    }
+
+    @Test
+    @Order(55)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testDeletePiano_completato_409_pianoNonAttivo() {
+        String body = """
+            {
+              "descrizione": "Piano liquidato non eliminabile",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 90.00,
+              "variazionePct": 0,
+              "giornoDelMese": 1,
+              "frequenza": "MENSILE",
+              "numeroRate": 2,
+              "dataInizio": "2026-10-01"
+            }
+            """.formatted(validContoCoge);
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        given()
+            .contentType(ContentType.JSON).body("{}")
+            .when().post(BASE + "/piani/" + planId + "/liquida")
+            .then().statusCode(200);
+
+        given()
+            .when().delete(BASE + "/piani/" + planId)
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("PIANO_NON_ATTIVO"));
+    }
+
+    @Test
+    @Order(56)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testDeletePiano_notFound_404() {
+        given()
+            .when().delete(BASE + "/piani/00000000-0000-0000-0000-000000000001")
+            .then().statusCode(404);
+    }
+
+    @Test
+    @Order(57)
+    void testDeletePiano_senzaToken_401() {
+        given()
+            .when().delete(BASE + "/piani/00000000-0000-0000-0000-000000000001")
+            .then().statusCode(401);
+    }
+
+    // ── Delete: corner case ───────────────────────────────────────────────────
+
+    @Test
+    @Order(130)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testDeletePiano_conRateSkipped_ok_eDoppioDelete404() {
+        // Rate SKIPPED non hanno movimenti: non devono bloccare la delete.
+        String body = """
+            {
+              "descrizione": "QA-DELETE piano con skip",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 80.00,
+              "variazionePct": 0,
+              "giornoDelMese": 7,
+              "frequenza": "MENSILE",
+              "numeroRate": 4,
+              "dataInizio": "2026-11-01"
+            }
+            """.formatted(validContoCoge);
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        String rataId = given()
+            .when().get(BASE + "/piani/" + planId)
+            .then().statusCode(200).extract().path("rate[0].id");
+
+        // RIMANDA aggiunge una rata extra → 5 righe totali, di cui 1 SKIPPED
+        given()
+            .contentType(ContentType.JSON).body("""
+                {"modalita": "RIMANDA"}
+                """)
+            .when().post(BASE + "/piani/" + planId + "/rate/" + rataId + "/skip")
+            .then().statusCode(204);
+        assertEquals(5, txHelper.countInstallments(UUID.fromString(planId)));
+
+        given().when().delete(BASE + "/piani/" + planId).then().statusCode(204);
+        assertEquals(0, txHelper.countInstallments(UUID.fromString(planId)),
+                "Anche le rate SKIPPED devono sparire con il piano");
+
+        // doppia delete → 404, idempotenza lato client
+        given().when().delete(BASE + "/piani/" + planId).then().statusCode(404);
+    }
+
+    @Test
+    @Order(131)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testDeletePiano_finanziamentoSoloPending_ok() {
+        Assumptions.assumeTrue(validContoCogeInteressi != null);
+
+        String body = """
+            {
+              "descrizione": "QA-DELETE finanziamento pending",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 8490.67,
+              "variazionePct": 0,
+              "giornoDelMese": 1,
+              "frequenza": "MENSILE",
+              "numeroRate": 12,
+              "dataInizio": "2027-03-01",
+              "tipoPiano": "FINANZIAMENTO",
+              "importoDebitoIniziale": 100000.00,
+              "tassoInteresseAnnuo": 3.5,
+              "contoCogeInteressiId": %d
+            }
+            """.formatted(validContoCoge, validContoCogeInteressi);
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        given().when().delete(BASE + "/piani/" + planId).then().statusCode(204);
+        assertEquals(0, txHelper.countInstallments(UUID.fromString(planId)));
+    }
+
+    @Test
+    @Order(132)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testDeletePiano_ricorrenteRiconciliata_setNull_nonCancellaLaRiga() {
+        // Una riga di import collegata al piano (COLLEGA) non blocca la delete:
+        // la FK è ON DELETE SET NULL — la riga resta RICONCILIATA, perde solo il link.
+        String body = """
+            {
+              "descrizione": "QA-DELETE piano riconciliato",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 60.00,
+              "variazionePct": 0,
+              "giornoDelMese": 9,
+              "frequenza": "MENSILE",
+              "numeroRate": 3,
+              "dataInizio": "2026-12-01"
+            }
+            """.formatted(validContoCoge);
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        UUID rigaId = txHelper.seedRicorrenteCollegata(UUID.fromString(planId));
+
+        given().when().delete(BASE + "/piani/" + planId).then().statusCode(204);
+
+        Object[] riga = txHelper.getRicorrenteRow(rigaId);
+        assertEquals("RICONCILIATA", riga[0], "La riga di import non deve cambiare stato");
+        assertNull(riga[1], "recurring_plan_id deve essere NULL dopo la delete del piano (FK SET NULL)");
+    }
+
+    // ── Delete: side effects su scadenzario e forecasting ────────────────────
+
+    @Test
+    @Order(133)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testDeletePiano_sparisceDalloScadenzario() {
+        // Rata nel mese corrente → visibile in /api/dashboard/scadenze-imminenti;
+        // dopo la delete non deve più esserci (query live su recurring_expense_installment).
+        java.time.LocalDate oggi = java.time.LocalDate.now();
+        String body = """
+            {
+              "descrizione": "QA-DELETE scadenzario marker",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 42.00,
+              "variazionePct": 0,
+              "giornoDelMese": 28,
+              "frequenza": "MENSILE",
+              "numeroRate": 2,
+              "dataInizio": "%s"
+            }
+            """.formatted(validContoCoge, oggi.withDayOfMonth(1));
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        String range = "?period=CUSTOM&from=" + oggi.withDayOfMonth(1)
+                + "&to=" + oggi.plusMonths(3);
+
+        given()
+            .when().get("/api/dashboard/scadenze-imminenti" + range)
+            .then().statusCode(200)
+            .body("rateRicorrenti.referenceId", hasItem(planId));
+
+        given().when().delete(BASE + "/piani/" + planId).then().statusCode(204);
+
+        given()
+            .when().get("/api/dashboard/scadenze-imminenti" + range)
+            .then().statusCode(200)
+            .body("rateRicorrenti.referenceId", not(hasItem(planId)));
+    }
+
+    @Test
+    @Order(134)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testDeletePiano_sparisceDalForecasting() {
+        // Rata entro l'orizzonte 90gg → compare nel previsionale come uscita CERTA;
+        // dopo la delete il marker non deve più apparire nella risposta.
+        java.time.LocalDate oggi = java.time.LocalDate.now();
+        String marker = "QA-DELETE-FORECAST-" + UUID.randomUUID();
+        String body = """
+            {
+              "descrizione": "%s",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 77.00,
+              "variazionePct": 0,
+              "giornoDelMese": 28,
+              "frequenza": "MENSILE",
+              "numeroRate": 2,
+              "dataInizio": "%s"
+            }
+            """.formatted(marker, validContoCoge, oggi.withDayOfMonth(1));
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        String before = given()
+            .when().get("/api/reporting/forecasting?horizon=90")
+            .then().statusCode(200).extract().asString();
+        assertTrue(before.contains(marker),
+                "La rata PENDING entro 90gg deve comparire nel previsionale");
+
+        given().when().delete(BASE + "/piani/" + planId).then().statusCode(204);
+
+        String after = given()
+            .when().get("/api/reporting/forecasting?horizon=90")
+            .then().statusCode(200).extract().asString();
+        assertFalse(after.contains(marker),
+                "Dopo la delete il piano non deve più comparire nel previsionale");
     }
 
     // ── Invarianti matematici ─────────────────────────────────────────────────
@@ -1330,6 +1679,50 @@ class SpeseRicorrentiIntegrationTest {
                     .setParameter("rataId", rataId)
                     .getSingleResult();
             return n.longValue();
+        }
+
+        /** Conta le rate a DB per un piano: verifica il cascade dopo la delete fisica. */
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public long countInstallments(UUID pianoId) {
+            Number n = (Number) em.createNativeQuery(
+                    "SELECT COUNT(*) FROM recurring_expense_installment WHERE piano_id = :pid")
+                    .setParameter("pid", pianoId)
+                    .getSingleResult();
+            return n.longValue();
+        }
+
+        /**
+         * Simula una riga di import parcheggiata e riconciliata (COLLEGA) sul piano:
+         * import_log minimale + ricorrenti_da_riconciliare con recurring_plan_id valorizzato.
+         */
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public UUID seedRicorrenteCollegata(UUID planId) {
+            String fonte = (String) em.createNativeQuery(
+                    "SELECT codice FROM lk_fonti_movimento LIMIT 1").getSingleResult();
+            UUID logId = UUID.randomUUID();
+            em.createNativeQuery(
+                    "INSERT INTO import_log (id, fonte) VALUES (:id, :fonte)")
+                    .setParameter("id", logId).setParameter("fonte", fonte)
+                    .executeUpdate();
+            UUID rigaId = UUID.randomUUID();
+            em.createNativeQuery("""
+                    INSERT INTO ricorrenti_da_riconciliare
+                        (id, import_log_id, fonte, importo, stato, recurring_plan_id, raw_data)
+                    VALUES (:id, :log, :fonte, 123.45, 'RICONCILIATA', :pid, '{}'::jsonb)
+                    """)
+                    .setParameter("id", rigaId).setParameter("log", logId)
+                    .setParameter("fonte", fonte).setParameter("pid", planId)
+                    .executeUpdate();
+            return rigaId;
+        }
+
+        /** Ritorna [stato, recurring_plan_id] della riga parcheggiata. */
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public Object[] getRicorrenteRow(UUID id) {
+            return (Object[]) em.createNativeQuery(
+                    "SELECT stato, recurring_plan_id FROM ricorrenti_da_riconciliare WHERE id = :id")
+                    .setParameter("id", id)
+                    .getSingleResult();
         }
 
         @Transactional(Transactional.TxType.REQUIRES_NEW)

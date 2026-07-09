@@ -151,22 +151,12 @@ public class KeywordClassificazioneEngine {
      */
     static java.util.Optional<KeywordMatch> risolvi(Set<String> tokenRiga, Iterable<Firma> candidate,
                                                     String tipo, String sorgente) {
-        List<Firma> match = new ArrayList<>();
-        for (Firma f : candidate) {
-            if (!scopeOk(f.tipoMovimento(), tipo) || !scopeOk(f.sorgente(), sorgente)) continue;
-            if (tokenRiga.containsAll(f.token())) match.add(f);
-        }
-        if (match.isEmpty()) return java.util.Optional.empty();
-
-        // Precedenza: IDENTITÀ > DOMINIO.
-        boolean hasIdentita = match.stream().anyMatch(f -> f.natura() == KeywordExtractor.Natura.IDENTITA);
-        KeywordExtractor.Natura naturaVincente = hasIdentita
-                ? KeywordExtractor.Natura.IDENTITA : KeywordExtractor.Natura.DOMINIO;
+        List<Firma> vincenti = firmeVincenti(tokenRiga, candidate, tipo, sorgente);
+        if (vincenti.isEmpty()) return java.util.Optional.empty();
 
         // Target unico? (vince la più specifica = più token); target divergenti → conflitto.
         Firma vincente = null;
-        for (Firma f : match) {
-            if (f.natura() != naturaVincente) continue;
+        for (Firma f : vincenti) {
             if (vincente == null) { vincente = f; continue; }
             if (!stessoTarget(vincente, f)) {
                 return java.util.Optional.of(KeywordMatch.inConflitto(f.signatureHash()));
@@ -174,6 +164,60 @@ public class KeywordClassificazioneEngine {
             if (f.token().size() > vincente.token().size()) vincente = f; // più specifica
         }
         return java.util.Optional.of(KeywordMatch.target(vincente));
+    }
+
+    /**
+     * Firme candidate che matchano la riga (scope + AND) e appartengono alla <b>natura vincente</b>
+     * (IDENTITÀ&gt;DOMINIO). Base condivisa da {@link #risolvi} (che poi sceglie il target o rileva il
+     * conflitto) e da {@link #firmeCheMatchano} (che le mostra tutte). Statico → testabile senza DB.
+     */
+    static List<Firma> firmeVincenti(Set<String> tokenRiga, Iterable<Firma> candidate, String tipo, String sorgente) {
+        List<Firma> match = new ArrayList<>();
+        for (Firma f : candidate) {
+            if (!scopeOk(f.tipoMovimento(), tipo) || !scopeOk(f.sorgente(), sorgente)) continue;
+            if (tokenRiga.containsAll(f.token())) match.add(f);
+        }
+        if (match.isEmpty()) return List.of();
+        boolean hasIdentita = match.stream().anyMatch(f -> f.natura() == KeywordExtractor.Natura.IDENTITA);
+        KeywordExtractor.Natura naturaVincente = hasIdentita
+                ? KeywordExtractor.Natura.IDENTITA : KeywordExtractor.Natura.DOMINIO;
+        return match.stream().filter(f -> f.natura() == naturaVincente).toList();
+    }
+
+    /**
+     * Id delle firme BOOK attive che si contendono la riga (natura vincente): stesso scope + AND +
+     * precedenza IDENTITÀ&gt;DOMINIO di {@link #risolvi}, ma ritorna TUTTE le firme vincenti (non un
+     * target) — serve a mostrare i "colpevoli" di un conflitto MATCH. Ritorna anche il singolo match
+     * non-conflittuale (l'ambiguità può essere già stata sistemata): sta al chiamante decidere.
+     */
+    public List<UUID> firmeCheMatchano(String descrizione, String tipo, String sorgente) {
+        ensureLoaded();
+        if (descrizione == null) return List.of();
+        Set<String> tokenRiga = KeywordExtractor.tokenizza(descrizione, stopwords);
+        if (tokenRiga.isEmpty()) return List.of();
+        return firmeVincenti(tokenRiga, candidate(tokenRiga), tipo, sorgente).stream().map(Firma::id).toList();
+    }
+
+    /**
+     * Ri-valuta una descrizione col motore attuale: target unico (auto-catalogabile), conflitto
+     * (ancora ambiguo) o vuoto (nessuna firma). Serve a rivalutare i conflitti MATCH aperti dopo che
+     * l'utente ha sistemato le firme colpevoli — se l'ambiguità è sparita il conflitto va chiuso.
+     */
+    public java.util.Optional<KeywordMatch> valuta(String descrizione, String tipo, String sorgente) {
+        ensureLoaded();
+        if (descrizione == null) return java.util.Optional.empty();
+        Set<String> tokenRiga = KeywordExtractor.tokenizza(descrizione, stopwords);
+        if (tokenRiga.isEmpty()) return java.util.Optional.empty();
+        return risolvi(tokenRiga, candidate(tokenRiga), tipo, sorgente);
+    }
+
+    private Set<Firma> candidate(Set<String> tokenRiga) {
+        Set<Firma> candidate = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (String tk : tokenRiga) {
+            List<Firma> l = indiceInvertito.get(tk);
+            if (l != null) candidate.addAll(l);
+        }
+        return candidate;
     }
 
     // ── liste per il Gate B + dizionario per l'estrattore ───────────────────────────────

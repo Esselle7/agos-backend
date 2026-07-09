@@ -68,6 +68,25 @@ class KeywordClassificazioneEngineTest {
     }
 
     @Test
+    void firmeVincenti_ritornaTuttiIColpevoliDelConflitto() {
+        // due IDENTITÀ con target diversi su ROSSI → firmeVincenti le ritorna ENTRAMBE (per mostrarle).
+        Firma a = identita("40.04.001", (short) 3, UUID.randomUUID(), "USCITA", "ROSSI");
+        Firma b = identita("40.11.001", (short) 5, UUID.randomUUID(), "USCITA", "ROSSI");
+        List<Firma> v = KeywordClassificazioneEngine.firmeVincenti(Set.of("ROSSI"), List.of(a, b), "USCITA", "CA");
+        assertEquals(2, v.size(), "entrambe le firme in conflitto vanno mostrate");
+    }
+
+    @Test
+    void firmeVincenti_scartaLeDominioSeCiSonoIdentita() {
+        // precedenza: se c'è un'IDENTITÀ, le DOMINIO non sono "colpevoli" mostrabili.
+        Firma dom = dominio("30.01.001", (short) 1, "ENTRATA", "PRANZO");
+        Firma id = identita("30.03.001", (short) 3, UUID.randomUUID(), "ENTRATA", "PRANZO");
+        List<Firma> v = KeywordClassificazioneEngine.firmeVincenti(Set.of("PRANZO"), List.of(dom, id), "ENTRATA", "CA");
+        assertEquals(1, v.size());
+        assertEquals(Natura.IDENTITA, v.get(0).natura());
+    }
+
+    @Test
     void piuSpecifica_vinceLaFirmaConPiuToken() {
         // stesso target → nessun conflitto; vince la più specifica (più token).
         Firma corta = identita("40.04.001", (short) 3, null, "USCITA", "PASINI");

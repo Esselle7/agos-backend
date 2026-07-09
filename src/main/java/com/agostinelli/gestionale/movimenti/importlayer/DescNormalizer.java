@@ -33,13 +33,18 @@ public final class DescNormalizer {
     // Codice Stripe: PO + 8 cifre (data) + suffisso alfanumerico.
     private static final Pattern STRIPE_CODE = Pattern.compile("\\b(PO\\d{8}[A-Z0-9]*)");
 
-    // Ordinante CA: "ORD:<nome> DT.ORD"
-    private static final Pattern ORD_CA = Pattern.compile("ORD:\\s*(.+?)\\s*DT\\.ORD");
+    // Ordinante CA: "ORD:<nome> DT.ORD" — oppure il nome fino a fine stringa quando la descrizione
+    // è troncata subito dopo (nessun DT.ORD). Il lazy preferisce comunque DT.ORD se presente.
+    private static final Pattern ORD_CA = Pattern.compile("ORD:\\s*(.+?)(?:\\s*DT\\.ORD|$)");
     // Ordinante BPM: "BON.DA <nome>" fino al codice Stripe o fine stringa.
     private static final Pattern ORD_BPM = Pattern.compile("BON\\.?\\s*DA\\s+(.+?)(?:\\s+PO\\d{6,}|\\s+BONIFICO|$)");
-    // Beneficiario CA uscita: "...AGRICOLA AGO<num> <beneficiario> (RIF|V/ORDINE|DESCR)"
+    // Beneficiario CA uscita: "...AGRICOLA AGO<num> <beneficiario> (RIF|V/ORDINE|DESCR | fine stringa)".
+    // Il "| fine" copre le disposizioni troncate col nome in coda (es. "...AGOS0000007371 AIANI FLAVIO").
     private static final Pattern BENEF_CA = Pattern.compile(
-            "AGRICOLA\\s+AGO\\w*?\\d{6,}\\s+(.+?)\\s+(?:RIF\\.?|V/ORDINE|DESCR)");
+            "AGRICOLA\\s+AGO\\w*?\\d{6,}\\s+(.+?)(?:\\s+(?:RIF\\.?|V/ORDINE|DESCR)|$)");
+    // Pagamento F24/I24 (deleghe fiscali, anche "F24CBI ..."): la controparte è sempre l'Agenzia
+    // delle Entrate, pure quando il testo riporta solo codici. Titolo/keyword deterministici.
+    private static final Pattern F24 = Pattern.compile("\\b[FI]24(?:CBI)?\\b");
     // Esercente di un pagamento carta BPM (causale 118): "...CARTA <num>-[HH:MM-]<esercente> <indirizzo>".
     // L'esercente sta tra il numero carta e il primo marcatore di indirizzo / CAP / "-DA CONTAB" / fine.
     // Senza questa estrazione il nome esercente è solo testo "NORMALE" e non genera keyword apprendibili.
@@ -110,6 +115,7 @@ public final class DescNormalizer {
             ordinante = clean(firstGroup(ORD_CA, descSpaced));
             beneficiario = clean(firstGroup(BENEF_CA, descSpaced));
             if (beneficiario == null) beneficiario = clean(firstGroup(SDD_A_CA, descSpaced));
+            if (beneficiario == null) beneficiario = agenziaEntrate(descSpaced);
             if (beneficiario == null) beneficiario = finanziamento(descSpaced);
         } else if (Sorgente.BPM.equals(sorgente)) {
             ordinante = clean(firstGroup(ORD_BPM, descSpaced));
@@ -119,6 +125,7 @@ public final class DescNormalizer {
             if (beneficiario == null) beneficiario = clean(firstGroup(CREDITORE_CBILL, descSpaced));
             if (beneficiario == null) beneficiario = clean(firstGroup(VOSTRA_DISP_BPM, descSpaced));
             if (beneficiario == null) beneficiario = clean(firstGroup(SDD_BPM, descSpaced));
+            if (beneficiario == null) beneficiario = agenziaEntrate(descSpaced);
             if (beneficiario == null) beneficiario = finanziamento(descSpaced);
         }
 
@@ -140,5 +147,10 @@ public final class DescNormalizer {
     private static String finanziamento(String s) {
         String n = firstGroup(FINANZIAMENTO, s);
         return n == null ? null : "FINANZIAMENTO " + n.trim();
+    }
+
+    /** Controparte deterministica dei pagamenti fiscali F24/I24. */
+    private static String agenziaEntrate(String s) {
+        return F24.matcher(s).find() ? "AGENZIA DELLE ENTRATE" : null;
     }
 }

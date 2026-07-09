@@ -457,6 +457,23 @@ public class MovimentiResource {
         return keywordService.listConflitti(stato);
     }
 
+    /** Firme attive che si contendono la riga di un conflitto MATCH ("In import"); vuoto per APPRENDIMENTO. */
+    @GET
+    @Path("/keyword/conflitti/{id}/firme")
+    @RolesAllowed("ADMIN")
+    public List<KeywordFirmaDTO> firmeConflittoKeyword(@PathParam("id") UUID id) {
+        return keywordService.firmeConflittoMatch(id);
+    }
+
+    /** Chiude da soli i conflitti MATCH non più ambigui e ri-cataloga i movimenti incastrati. */
+    @POST
+    @Path("/keyword/conflitti/rivaluta")
+    @RolesAllowed("ADMIN")
+    public com.agostinelli.gestionale.movimenti.dto.RivalutazioneConflittiDTO rivalutaConflitti(@Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        return keywordService.rivalutaConflittiMatch(userId);
+    }
+
     @PUT
     @Path("/keyword/conflitti/{id}/risolvi")
     @RolesAllowed("ADMIN")

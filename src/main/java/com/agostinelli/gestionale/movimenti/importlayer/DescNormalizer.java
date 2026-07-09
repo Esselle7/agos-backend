@@ -50,6 +50,22 @@ public final class DescNormalizer {
     // Creditore di un'utenza CBILL BPM: "...BOLL.CBILL <creditore> [- R] CBILL <codice>".
     private static final Pattern CREDITORE_CBILL = Pattern.compile(
             "BOLL\\.?\\s*CBILL\\s+(.+?)\\s*(?:-\\s*R\\s+)?CBILL\\s+\\d");
+    // Beneficiario di un bonifico di pagamento BPM "vostra disposizione": "...VS.DISP. RIF. <rif>
+    // FAVORE <beneficiario> (NOTPROVIDE | - ADD.TOT | fine)". Àncora su VS.DISP per NON agganciare
+    // il "FAVORE" di un normale "BONIF. VS. FAVORE - BON.DA ..." (quello è ordinante, non beneficiario).
+    private static final Pattern VOSTRA_DISP_BPM = Pattern.compile(
+            "VS\\.?\\s*DISP\\..*?FAVORE\\s+(.+?)\\s*(?:NOTPROVIDE|-\\s*ADD|$)");
+    // Beneficiario di un addebito SDD BPM: "...SDD B2B|CORE : <mandato> <beneficiario>" (nome in coda).
+    private static final Pattern SDD_BPM = Pattern.compile(
+            "SDD\\s+(?:B2B|CORE)\\s*:\\s*\\S+\\s+(.+?)\\s*$");
+    // Beneficiario di un addebito SDD CA: "SDD A : <beneficiario> <SDD03|PV|FT|SALDO|RIF|ADDEBIT|numero>".
+    private static final Pattern SDD_A_CA = Pattern.compile(
+            "SDD\\s+A\\s*:\\s*(.+?)\\s+(?:SDD\\d|PV\\s|FT\\b|SALDO|RIF\\b|ADDEBIT|\\d{5,})");
+    // Rata di finanziamento (BPM causale 150): NON è una controparte anagrafica — il creditore è la
+    // banca, assente dal testo. Serve solo a dare un titolo leggibile al posto di "—" e una firma
+    // stabile per la rata ricorrente. Copre "MUTUO N.1273 5796807 RATA" e "PAG.RATE SU FIN.TO 1273/05...".
+    private static final Pattern FINANZIAMENTO = Pattern.compile(
+            "(?:MUTUO\\s+N\\.?|FIN\\.?TO)\\s*[:./]?\\s*(\\d[\\d/ ]*\\d)");
 
     /** Vista COMPACT: rimuove tutti gli spazi (ricongiunge le parole spezzate dal word-wrap). */
     public static String compact(String spaced) {
@@ -93,12 +109,17 @@ public final class DescNormalizer {
         if (Sorgente.CA.equals(sorgente)) {
             ordinante = clean(firstGroup(ORD_CA, descSpaced));
             beneficiario = clean(firstGroup(BENEF_CA, descSpaced));
+            if (beneficiario == null) beneficiario = clean(firstGroup(SDD_A_CA, descSpaced));
+            if (beneficiario == null) beneficiario = finanziamento(descSpaced);
         } else if (Sorgente.BPM.equals(sorgente)) {
             ordinante = clean(firstGroup(ORD_BPM, descSpaced));
             // Pagamenti carta / utenze CBILL: l'esercente/creditore è la controparte → beneficiario,
             // così l'estrattore keyword lo riconosce come IDENTITÀ (e non più testo NORMALE ignorato).
             beneficiario = clean(firstGroup(MERCHANT_CARTA, descSpaced));
             if (beneficiario == null) beneficiario = clean(firstGroup(CREDITORE_CBILL, descSpaced));
+            if (beneficiario == null) beneficiario = clean(firstGroup(VOSTRA_DISP_BPM, descSpaced));
+            if (beneficiario == null) beneficiario = clean(firstGroup(SDD_BPM, descSpaced));
+            if (beneficiario == null) beneficiario = finanziamento(descSpaced);
         }
 
         return new EntitaEstratte(iban, ordinante, beneficiario, stripe);
@@ -113,5 +134,11 @@ public final class DescNormalizer {
         if (s == null) return null;
         String t = s.trim();
         return t.isEmpty() ? null : t;
+    }
+
+    /** Titolo sintetico "FINANZIAMENTO <num>" per le rate mutuo (non è una controparte anagrafica). */
+    private static String finanziamento(String s) {
+        String n = firstGroup(FINANZIAMENTO, s);
+        return n == null ? null : "FINANZIAMENTO " + n.trim();
     }
 }

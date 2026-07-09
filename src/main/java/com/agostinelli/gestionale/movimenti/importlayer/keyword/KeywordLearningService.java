@@ -10,6 +10,8 @@ import com.agostinelli.gestionale.movimenti.importlayer.DescNormalizer;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordExtractor.FirmaCandidata;
 import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
 import com.agostinelli.gestionale.movimenti.importlayer.parser.Sorgente;
+import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
+import io.quarkus.cache.CacheInvalidateAll;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
@@ -38,6 +40,11 @@ public class KeywordLearningService {
 
     @Inject EntityManager em;
     @Inject KeywordClassificazioneEngine engine;
+    @Inject MvRefreshService mvRefresh;
+
+    /** Codici COGE transitori "Da catalogare" (ricavi/costi): l'auto-catalogazione tocca SOLO questi. */
+    private static final String COGE_RICAVI_DACLASS = "39.99.999";
+    private static final String COGE_COSTI_DACLASS = "49.99.999";
 
     // ── APPRENDIMENTO (hook del triage) ─────────────────────────────────────────────────
 
@@ -153,8 +160,49 @@ public class KeywordLearningService {
                 .setParameter("natura", natura)
                 .setParameter("stato", stato)
                 .getResultList();
+        return mapFirme(rows);
+    }
+
+    /**
+     * Firme colpevoli di un conflitto MATCH: le firme ATTIVE che si contendono la riga del movimento.
+     * Vuoto per APPRENDIMENTO (che porta già i suoi due target) e quando l'ambiguità è già stata
+     * sistemata / il movimento non c'è più. Read-only: la ricostruzione riusa il matcher del motore.
+     */
+    @SuppressWarnings("unchecked")
+    public List<KeywordFirmaDTO> firmeConflittoMatch(UUID conflittoId) {
+        List<Object[]> c = em.createNativeQuery(
+                "SELECT tipo, movimento_id FROM keyword_conflitto WHERE id = :id")
+                .setParameter("id", conflittoId).getResultList();
+        if (c.isEmpty()) throw new ApiException(Response.Status.NOT_FOUND, "CONFLITTO_NON_TROVATO", "Conflitto " + conflittoId);
+        Object[] cf = c.get(0);
+        if (!"MATCH".equals(cf[0]) || cf[1] == null) return List.of();
+
+        List<Object[]> m = em.createNativeQuery(
+                "SELECT descrizione, tipo FROM movimenti WHERE id = :id AND stato <> 'ANNULLATO'")
+                .setParameter("id", cf[1]).getResultList();
+        if (m.isEmpty()) return List.of();
+        // ponytail: sorgente=null → permissivo (oggi 100% firme hanno scope '*'); se nascono firme
+        // sorgente-specifiche va passata la fonte reale del movimento.
+        List<UUID> ids = engine.firmeCheMatchano((String) m.get(0)[0], (String) m.get(0)[1], null);
+        return firmeByIds(ids);
+    }
+
+    /** Firme per lista di id (per i conflitti MATCH). Stessa proiezione di listFirme. */
+    @SuppressWarnings("unchecked")
+    public List<KeywordFirmaDTO> firmeByIds(List<UUID> ids) {
+        if (ids == null || ids.isEmpty()) return List.of();
+        String csv = ids.stream().map(UUID::toString).collect(java.util.stream.Collectors.joining(","));
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT id, natura, azione, tipo_movimento, sorgente, bu_id, coge_codice, fornitore_id, " +
+                "evento_forza, tipo_evento, confidence, origine, stato, note, created_at FROM keyword_firma " +
+                "WHERE id = ANY(string_to_array(:ids, ',')::uuid[]) ORDER BY coge_codice NULLS FIRST")
+                .setParameter("ids", csv).getResultList();
+        return mapFirme(rows);
+    }
+
+    private List<KeywordFirmaDTO> mapFirme(List<Object[]> rows) {
         if (rows.isEmpty()) return List.of();
-        // Token in UNA query per tutte le firme (era N+1: una SELECT per ogni riga).
+        // Token in UNA query per tutte le firme (evita N+1: una SELECT per ogni riga).
         Map<UUID, List<String>> tokenByFirma = tokenDelleFirme(
                 rows.stream().map(r -> (UUID) r[0]).toList());
         List<KeywordFirmaDTO> out = new ArrayList<>(rows.size());
@@ -282,6 +330,49 @@ public class KeywordLearningService {
             }
         }
         engine.refresh();
+    }
+
+    /**
+     * Rivaluta i conflitti MATCH aperti col motore ATTUALE (dopo che l'utente ha sistemato le firme
+     * colpevoli): quelli non più ambigui vengono CHIUSI da soli e, se restano su un target unico, il
+     * movimento incastrato viene ri-catalogato — ma SOLO se è ancora sul transitorio DACLASS
+     * (invariante: mai sovrascrivere una catalogazione manuale). Idempotente.
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
+    @Transactional
+    @SuppressWarnings("unchecked")
+    public com.agostinelli.gestionale.movimenti.dto.RivalutazioneConflittiDTO rivalutaConflittiMatch(UUID userId) {
+        List<Object[]> aperti = em.createNativeQuery(
+                "SELECT c.id, m.id, m.descrizione, m.tipo FROM keyword_conflitto c " +
+                "LEFT JOIN movimenti m ON m.id = c.movimento_id AND m.stato <> 'ANNULLATO' " +
+                "WHERE c.tipo = 'MATCH' AND c.stato = 'APERTO'").getResultList();
+        int chiusi = 0, catalogati = 0;
+        boolean anyCatalog = false;
+        for (Object[] r : aperti) {
+            UUID confId = (UUID) r[0];
+            if (r[1] == null) { chiudiConflitto(confId, "RISOLTO", userId); chiusi++; continue; } // movimento sparito
+            var m = engine.valuta((String) r[2], (String) r[3], null);
+            if (m.isPresent() && m.get().conflitto()) continue; // ANCORA ambiguo → resta aperto
+            if (m.isPresent()) { // target unico → cataloga il movimento (solo se ancora sul transitorio)
+                var t = m.get();
+                int applied = em.createNativeQuery(
+                        "UPDATE movimenti SET conto_coge_id = (SELECT id FROM piano_dei_conti_coge WHERE codice = :coge), " +
+                        "business_unit_id = CAST(:bu AS smallint), fornitore_id = CAST(:forn AS uuid), updated_at = now() " +
+                        "WHERE id = :mov AND conto_coge_id IN (SELECT id FROM piano_dei_conti_coge WHERE codice IN (:dr, :dc))")
+                        .setParameter("coge", t.cogeCodice()).setParameter("bu", t.bu())
+                        .setParameter("forn", t.fornitoreId()).setParameter("mov", r[1])
+                        .setParameter("dr", COGE_RICAVI_DACLASS).setParameter("dc", COGE_COSTI_DACLASS)
+                        .executeUpdate();
+                if (applied > 0) { catalogati++; anyCatalog = true; }
+            }
+            chiudiConflitto(confId, "RISOLTO", userId); // target unico o nessuna firma → non più ambiguo
+            chiusi++;
+        }
+        if (anyCatalog) mvRefresh.requestRefreshAfterCommit();
+        return new com.agostinelli.gestionale.movimenti.dto.RivalutazioneConflittiDTO(chiusi, catalogati);
     }
 
     // ── helper persistenza ────────────────────────────────────────────────────────────────

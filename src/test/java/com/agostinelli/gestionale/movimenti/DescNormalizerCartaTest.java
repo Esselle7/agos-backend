@@ -113,4 +113,40 @@ class DescNormalizerCartaTest {
         assertEquals("FINANZIAMENTO 1273/05796807",
                 DescNormalizer.extract("RIMBORSO FINANZ. - PAG.RATE SU FIN.TO 1273/05796807 INT.: SOC", Sorgente.BPM).beneficiario());
     }
+
+    // ── Disposizioni CA troncate col nome in coda (nessun terminatore RIF/V-ORDINE/DT.ORD) ──────
+
+    @Test
+    void ca_disposizioneTroncata_nomeInCoda() {
+        assertEquals("AIANI FLAVIO",
+                DescNormalizer.extract("C7ZWE SOCIETA' AGRICOLA AGOS000000737189490 AIANI FLAVIO", Sorgente.CA).beneficiario());
+        assertEquals("CONSORZIO AGRARIO",
+                DescNormalizer.extract("C7ZWE SOCIETA' AGRICOLA AGOS000000739397718 CONSORZIO AGRARIO", Sorgente.CA).beneficiario());
+        assertEquals("IL TAPPETO ERBOSO SOCIETA",
+                DescNormalizer.extract("C7ZWE SOCIETA' AGRICOLA AGOS000000761143935 IL TAPPETO ERBOSO SOCIETA", Sorgente.CA).beneficiario());
+    }
+
+    @Test
+    void ca_ordinanteTroncato_nomeInCoda() {
+        assertEquals("GALLAZZI VALERIO FRANCESCHETTO",
+                DescNormalizer.extract("ORD:GALLAZZI VALERIO FRANCESCHETTO", Sorgente.CA).ordinante());
+    }
+
+    @Test
+    void ca_disposizioneLunga_nonRegredisce_siFermaAlTerminatore() {
+        // Formato lungo con V/ORDINE dopo il nome: il "| fine stringa" NON deve allungare la cattura.
+        assertEquals("SOGEGROSS SPA",
+                DescNormalizer.extract("C7ZWE SOCIETA' AGRICOLA AGOS000000767168179 SOGEGROSS SPA RIF. CRO: NROSUPCBI 37040005 V/ORDINE E CONTO", Sorgente.CA).beneficiario());
+        // Bonifico entrata con DT.ORD: l'ordinante si ferma a DT.ORD, non corre a fine stringa.
+        assertEquals("PASCHETTO DAVIDE",
+                DescNormalizer.extract("ORD:PASCHETTO DAVIDE DT.ORD:000000 DESCR.OPERAZIONE SCT:ACCONTO", Sorgente.CA).ordinante());
+    }
+
+    @Test
+    void f24_i24_controparteAgenziaEntrate() {
+        assertEquals("AGENZIA DELLE ENTRATE",
+                DescNormalizer.extract("I24 AGENZIA ENTRATE - PAG.TO TELEMATICO - DATA INCASSO 02/03/2026 2026-02-27-22.33.26.867010009981", Sorgente.CA).beneficiario());
+        assertEquals("AGENZIA DELLE ENTRATE",
+                DescNormalizer.extract("F24CBI CODICE SIA C7ZWE 0000003797890138 DELEGA NUMERO: 006076698000000001", Sorgente.BPM).beneficiario());
+    }
 }

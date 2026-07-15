@@ -32,7 +32,10 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
     // confronto preferita con lo scontrino Billy (REFACTOR-IMPORT-CONGIUNTO §FASE1).
     private static final Pattern POS_DEL_DATE = Pattern.compile("\\bDEL\\s+(\\d{1,2})/(\\d{1,2})/(\\d{2,4})\\b");
 
-    public static final String GIROCONTO_SKIP = "GIROCONTO_SKIP";
+    /** Trasferimento tra conti propri: il movimento nasce sul CoGe patrimoniale 10.03.x (non è più uno scarto). */
+    public static final String GIROCONTO_INTERNO = "GIROCONTO_INTERNO";
+    /** Versamento contante ATM (78A): entrata banca + contropartita uscita cassa su 10.03.003. */
+    public static final String VERSAMENTO_CONTANTI = "VERSAMENTO_CONTANTI";
 
     // Circuiti POS → banca di accredito (fact #2): il marcatore vive SOLO in descrizione banca.
     public static final String CIRCUITO_NUMIA = "NUMIA"; // POS fisico Numia → Banco BPM
@@ -127,13 +130,14 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
         boolean rimborsoCarta = descrizione != null && descrizione.contains("RIMBORSO CARTA");
         if (rimborsoCarta) metodo = "CARTA_DEBITO";
 
-        // Giroconti interni → scarto deterministico (non sono né incassi né costi reali).
+        // Giroconti interni → marcati: il mapping li contabilizza sul CoGe patrimoniale 10.03.x
+        // (entrambe le gambe, saldi per-conto corretti). Il payout Satispay ha la stessa firma
+        // del beneficiario: la precedenza SKIP_POS resta nel Gate A del mapping engine.
         String girosalto = null;
-        if ("480".equals(causale) && descrizione != null
-                && stripApostrophe(descrizione).contains("SOCIETA AGRICOLA AGOSTINELLI")) {
-            girosalto = GIROCONTO_SKIP; // trasferimento interno CA → BPM
+        if ("480".equals(causale) && beneficiarioProprio(descrizione)) {
+            girosalto = GIROCONTO_INTERNO; // trasferimento interno CA → BPM (gamba in entrata)
         } else if ("78A".equals(causale)) {
-            girosalto = GIROCONTO_SKIP; // versamento contante ATM (no doppio conteggio cassa→banca)
+            girosalto = VERSAMENTO_CONTANTI; // versamento contante ATM (coppia banca↔cassa)
         }
 
         LocalDate dataCompetenza = extractStripeDate(descrizione);
@@ -214,13 +218,12 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
 
         // Giroconto interno CA→BPM lato USCITA (simmetrico al lato BPM in entrata):
         // disposizione di pagamento il cui BENEFICIARIO è la stessa società (…AGOSTINELLI SRL).
-        // Il prefisso ordinante è sempre "AGRICOLA AGO<cifre>", mai "AGRICOLA AGOSTINELLI"
-        // contiguo: così un pagamento a "PIETRO AGOSTINELLI" (persona) NON viene scartato.
+        // Il prefisso ordinante è sempre "AGRICOLA AGO<cifre>" (le cifre attaccate impediscono
+        // il falso match); un pagamento a "PIETRO AGOSTINELLI" (persona) NON viene marcato.
         String girosalto = null;
         if ("USCITA".equals(tipo) && "DISPOSIZIONE DI PAGAMENTO".equals(causale)
-                && descrizione != null
-                && stripApostrophe(descrizione).contains("AGRICOLA AGOSTINELLI")) {
-            girosalto = GIROCONTO_SKIP;
+                && beneficiarioProprio(descrizione)) {
+            girosalto = GIROCONTO_INTERNO;
         }
 
         // Incasso POS (Nexi → CA): causale "INCASSO TRAMITE POS" (metodo POS_CA_NEXI).
@@ -337,6 +340,18 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
         return v == null ? null : v.abs();
     }
 
+    /**
+     * True se la descrizione contiene la società stessa come controparte ("AGRICOLA AGOSTINELLI").
+     * Match senza spazi: la banca a volte spezza/incolla il nome ("AGRICOLAA GOSTINELLI",
+     * "agricolaAgostinelli"). Le cifre NON vengono rimosse, così il prefisso ordinante
+     * "AGRICOLA AGO<cifre>" non può mai combaciare.
+     */
+    static boolean beneficiarioProprio(String descrizione) {
+        if (descrizione == null) return false;
+        return stripApostrophe(descrizione).toUpperCase().replaceAll("\\s+", "")
+                .contains("AGRICOLAAGOSTINELLI");
+    }
+
     private String clean(String raw) {
         if (raw == null) return null;
         String s = raw.trim().toUpperCase()
@@ -349,7 +364,7 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
         return s == null ? null : s.trim().toUpperCase();
     }
 
-    private String stripApostrophe(String s) {
+    private static String stripApostrophe(String s) {
         return s.replace("'", "").replace("`", "");
     }
 

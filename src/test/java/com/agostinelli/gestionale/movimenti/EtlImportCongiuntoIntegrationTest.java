@@ -98,8 +98,12 @@ class EtlImportCongiuntoIntegrationTest {
 
         // ── (5) Contanti Billy NON-agriturismo → Cassa (conto 3, metodo CONTANTI) ──
         // 18 scontrini contanti totali, di cui 5 agriturismo (eventi) → esclusi: restano 13.
-        assertEquals(13, movimentiMetodo(logId, "CONTANTI"), "13 contanti NON-agriturismo → metodo CONTANTI");
-        assertEquals(13, movimenti("WHERE m.fonte_importazione_id = :id AND m.metodo_pagamento_id = "
+        // (filtro su fonte IMPORT_BILLY: anche i versamenti ATM 78A usano metodo CONTANTI)
+        assertEquals(13, movimenti("WHERE m.fonte_importazione_id = :id AND m.fonte = 'IMPORT_BILLY' "
+                        + "AND m.metodo_pagamento_id = (SELECT id FROM metodi_pagamento WHERE codice='CONTANTI')", logId),
+                "13 contanti NON-agriturismo → metodo CONTANTI");
+        assertEquals(13, movimenti("WHERE m.fonte_importazione_id = :id AND m.fonte = 'IMPORT_BILLY' "
+                        + "AND m.metodo_pagamento_id = "
                         + "(SELECT id FROM metodi_pagamento WHERE codice='CONTANTI') AND m.conto_bancario_id = 3", logId),
                 "tutti i contanti devono stare su Cassa (conto 3)");
         // gli scontrini agriturismo (qualsiasi metodo) NON diventano movimenti: niente Cassa 30.01.001 da Billy
@@ -107,9 +111,25 @@ class EtlImportCongiuntoIntegrationTest {
                         + "AND m.conto_coge_id = (SELECT id FROM piano_dei_conti_coge WHERE codice='30.01.001')", logId),
                 "agriturismo (eventi) escluso: nessun ricavo ristorazione da Billy");
 
-        // ── (6) Versamento ATM (causale 78A) resta scartato (no doppio conteggio cassa→banca) ──
-        assertTrue(scartatiConMotivo(logId, "SKIP_GIROCONTO") >= 1,
-                "il versamento contante ATM (78A) deve restare scartato come giroconto");
+        // ── (6) Giroconti e versamenti ATM contabilizzati sul CoGe patrimoniale 10.03.x
+        //        (non più scartati: entrambe le gambe, saldi per-conto corretti) ──
+        assertEquals(0, scartatiConMotivo(logId, "SKIP_GIROCONTO"),
+                "nessuno scarto SKIP_GIROCONTO: giroconti e versamenti diventano movimenti");
+        // 5 trasferimenti CA→BPM: gamba entrata su BPM (causale 480) + gamba uscita su CA (DISPOSIZIONE —
+        // inclusi i beneficiari sporchi 'agricolaAgostinelli' incollato e 'SOCIET AGRICOLA')
+        assertEquals(5, movimenti("WHERE m.fonte_importazione_id = :id AND m.tipo='ENTRATA' AND m.conto_bancario_id = 1 "
+                + "AND m.conto_coge_id = (SELECT id FROM piano_dei_conti_coge WHERE codice='10.03.001')", logId),
+                "5 gambe entrata giroconto su BPM (10.03.001)");
+        assertEquals(5, movimenti("WHERE m.fonte_importazione_id = :id AND m.tipo='USCITA' AND m.conto_bancario_id = 2 "
+                + "AND m.conto_coge_id = (SELECT id FROM piano_dei_conti_coge WHERE codice='10.03.001')", logId),
+                "5 gambe uscita giroconto su CA (10.03.001), inclusi i beneficiari sporchi (simmetria con BPM)");
+        // 7 versamenti ATM (78A): entrata BPM + contropartita uscita Cassa, stesso CoGe 10.03.003
+        assertEquals(7, movimenti("WHERE m.fonte_importazione_id = :id AND m.tipo='ENTRATA' AND m.conto_bancario_id = 1 "
+                + "AND m.conto_coge_id = (SELECT id FROM piano_dei_conti_coge WHERE codice='10.03.003')", logId),
+                "7 versamenti contanti in entrata su BPM (10.03.003)");
+        assertEquals(7, movimenti("WHERE m.fonte_importazione_id = :id AND m.tipo='USCITA' AND m.conto_bancario_id = 3 "
+                + "AND m.conto_coge_id = (SELECT id FROM piano_dei_conti_coge WHERE codice='10.03.003')", logId),
+                "7 contropartite uscita dalla Cassa (10.03.003): liquidità totale invariata");
 
         // ── (7) QUADRATURA DI PERIODO persistita (V10) con i numeri reali §3 ──
         Object[] q = (Object[]) em.createNativeQuery(

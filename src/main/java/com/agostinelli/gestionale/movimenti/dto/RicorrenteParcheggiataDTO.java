@@ -18,5 +18,8 @@ public record RicorrenteParcheggiataDTO(
         String descrizione,
         String tipoPresunto,    // MUTUO | FINANZIAMENTO | LEASING | CANONE | CAMBIALE | ASSICURAZIONE | BOLLO | RATA | ALTRO
         UUID recurringPlanId,
-        String stato            // DA_RICONCILIARE | RICONCILIATA | IGNORATA
+        String stato,           // DA_RICONCILIARE | CONFERMATA | IGNORATA | RICONCILIATA(legacy)
+        // Suggerimento CoGe calcolato dal backend dalla descrizione (l'utente conferma o cambia).
+        Integer cogeSuggeritoId,
+        String cogeSuggeritoCodice
 ) {}

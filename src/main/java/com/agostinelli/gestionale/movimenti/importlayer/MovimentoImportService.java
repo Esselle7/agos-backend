@@ -133,6 +133,10 @@ public class MovimentoImportService {
                 }
 
                 movimentiService.createMovimentoImport(req, userId, importLogId);
+                if (MovimentoNormalizerImpl.VERSAMENTO_CONTANTI.equals(norm.girosalto())) {
+                    creaContropartitaCassaVersamento(req, userId, importLogId);
+                    importati++;
+                }
                 if (rif != null && !rif.isBlank()) rifEsistenti.add(rif);
                 importati++;
 
@@ -264,6 +268,10 @@ public class MovimentoImportService {
                 }
 
                 var creato = movimentiService.createMovimentoImport(req, userId, importLogId);
+                if (MovimentoNormalizerImpl.VERSAMENTO_CONTANTI.equals(n.girosalto())) {
+                    creaContropartitaCassaVersamento(req, userId, importLogId);
+                    importati++;
+                }
                 // Conflitto keyword di MATCH (§4.6): la riga è booked sul transitorio; registra il
                 // conflitto così l'utente lo risolve dalla pagina Gestione Keyword (mai catalog cieco).
                 if (mapped.keywordConflittoSig() != null) {
@@ -621,6 +629,32 @@ public class MovimentoImportService {
      * Persiste una riga esclusa dal Gate A in import_scartati (ETL v2 §4/§9.4):
      * tracciata e reversibile, conteggiata in import_log, mai un movimento.
      */
+    /**
+     * Contropartita cassa del versamento contante ATM (78A): la riga banca è l'ENTRATA sul
+     * conto corrente, qui esce lo stesso importo dalla Cassa contanti (stesso CoGe 10.03.003,
+     * liquidità totale invariata). Il rif ":CASSA" è solo tracciabilità: al re-import la riga
+     * banca viene deduplicata prima, quindi la contropartita non si rigenera.
+     */
+    private void creaContropartitaCassaVersamento(MovimentoCreateRequest bancario, UUID userId, UUID importLogId) {
+        Short contoCassa = ((Number) em.createNativeQuery(
+                "SELECT id FROM conti_bancari WHERE tipo = 'CASSA' AND is_active = true ORDER BY id LIMIT 1")
+                .getSingleResult()).shortValue();
+        Integer metodoContanti = ((Number) em.createNativeQuery(
+                "SELECT id FROM metodi_pagamento WHERE codice = 'CONTANTI'")
+                .getSingleResult()).intValue();
+        String descr = "PRELIEVO CASSA PER VERSAMENTO IN BANCA - " + bancario.descrizione();
+        MovimentoCreateRequest mirror = new MovimentoCreateRequest(
+                "USCITA", bancario.importo(), null, null,
+                bancario.dataMovimento(), bancario.dataCompetenza(), bancario.dataFinanziaria(), null,
+                contoCassa, metodoContanti, bancario.businessUnitId(), bancario.contoCoge(),
+                null, null, null, null,
+                descr.length() > 500 ? descr.substring(0, 500) : descr,
+                null,
+                bancario.riferimentoEsterno() == null ? null : bancario.riferimentoEsterno() + ":CASSA",
+                bancario.fonte(), null);
+        movimentiService.createMovimentoImport(mirror, userId, importLogId);
+    }
+
     private void salvaScartato(UUID importLogId, RawRow raw, RawMovimento norm, String motivo, String fonte) {
         em.createNativeQuery(
                         "INSERT INTO import_scartati (id, import_log_id, riga_numero, fonte, motivo, " +

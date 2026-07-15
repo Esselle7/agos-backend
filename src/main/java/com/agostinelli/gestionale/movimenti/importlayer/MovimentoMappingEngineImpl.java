@@ -126,16 +126,23 @@ public class MovimentoMappingEngineImpl {
             if (skip != null) {
                 return MappingResult.skip(skip, n).withTrace("GATE A → " + skip);
             }
-            // ── GATE B — parcheggio eventi (ETL v2 §5) ──
-            ParkEvento park = gateB(n, sorgente);
-            if (park != null) {
-                return MappingResult.parkEvento(park, n).withTrace(
-                        "GATE B → PARK_EVENTO (kw=" + park.keywordMatch()
-                        + ", tipo=" + park.tipoEventoPresunto() + ")");
+            // ── Giroconti / versamenti contanti → CoGe patrimoniale 10.03.x (dopo il Gate A:
+            // la precedenza SKIP_POS di Satispay resta intatta) ──
+            if (n.girosalto() != null) {
+                cl = classifyGirosalto(n, sorgente);
+                via = "GIROSALTO → " + n.girosalto();
+            } else {
+                // ── GATE B — parcheggio eventi (ETL v2 §5) ──
+                ParkEvento park = gateB(n, sorgente);
+                if (park != null) {
+                    return MappingResult.parkEvento(park, n).withTrace(
+                            "GATE B → PARK_EVENTO (kw=" + park.keywordMatch()
+                            + ", tipo=" + park.tipoEventoPresunto() + ")");
+                }
+                boolean entrata = "ENTRATA".equals(n.tipo());
+                cl = entrata ? classifyEntrata(n, sorgente) : classifyUscita(n, sorgente);
+                via = "GATE C → " + (entrata ? "classifyEntrata" : "classifyUscita");
             }
-            boolean entrata = "ENTRATA".equals(n.tipo());
-            cl = entrata ? classifyEntrata(n, sorgente) : classifyUscita(n, sorgente);
-            via = "GATE C → " + (entrata ? "classifyEntrata" : "classifyUscita");
         }
 
         if (cl.motivo != null) {
@@ -286,8 +293,8 @@ public class MovimentoMappingEngineImpl {
         // precedenza verrebbe scartato come SKIP_GIROCONTO invece che SKIP_POS.
         if (desc.contains("SATISPAY EUROPE")) return MappingResult.MappingOutcome.SKIP_POS;
 
-        // A2 — giroconto interno (rilevato dal normalizzatore, simmetrico CA↔BPM)
-        if (n.girosalto() != null) return MappingResult.MappingOutcome.SKIP_GIROCONTO;
+        // A2 — i giroconti NON sono più uno scarto: il normalizzatore li marca (girosalto)
+        // e map() li contabilizza sul CoGe patrimoniale 10.03.x (classifyGirosalto).
         if (Sorgente.CA.equals(sorgente)) {
             if ("INCASSO TRAMITE POS".equals(causale)
                     || desc.contains("INCASSO POS") || desc.contains("NUMIA")
@@ -310,6 +317,31 @@ public class MovimentoMappingEngineImpl {
         if (isRicorrente(desc)) return MappingResult.MappingOutcome.SKIP_RICORRENTE;
 
         return null;
+    }
+
+    /**
+     * Giroconti e versamenti contanti → CoGe patrimoniale 10.03.x, BU Overhead.
+     * Direzione del giroconto: la gamba vista da BPM in ENTRATA (o da CA in USCITA)
+     * è un CA→BPM (10.03.001); il caso opposto è un BPM→CA (10.03.002).
+     */
+    private Classify classifyGirosalto(RawMovimento n, String sorgente) {
+        Classify cl = new Classify();
+        String codice;
+        if (MovimentoNormalizerImpl.VERSAMENTO_CONTANTI.equals(n.girosalto())) {
+            codice = "10.03.003";
+            cl.metodoCodiceOverride = "CONTANTI";
+            cl.note = "Versamento contanti su banca (contropartita cassa creata dall'import)";
+        } else {
+            boolean versoBpm = (Sorgente.BPM.equals(sorgente) && "ENTRATA".equals(n.tipo()))
+                    || (Sorgente.CA.equals(sorgente) && "USCITA".equals(n.tipo()));
+            codice = versoBpm ? "10.03.001" : "10.03.002";
+            cl.metodoCodiceOverride = "BONIFICO";
+            cl.note = "Giroconto interno tra conti propri";
+        }
+        cl.cogeId = coge(codice);
+        cl.bu = BU_TRANSITORIO; // Overhead: partita patrimoniale, fuori P&L
+        if (cl.cogeId == null) cl.motivo = "COGE_GIROCONTO_MANCANTE"; // fail fast → ambiguità
+        return cl;
     }
 
     private static final Pattern RATA_WORD = Pattern.compile("\\bRATA\\b");

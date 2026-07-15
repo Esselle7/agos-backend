@@ -6,6 +6,7 @@ import com.agostinelli.gestionale.movimenti.dto.ClassificaTransitorioRequest;
 import com.agostinelli.gestionale.movimenti.dto.EventoParcheggiatoDTO;
 import com.agostinelli.gestionale.movimenti.dto.ImportKpiDTO;
 import com.agostinelli.gestionale.movimenti.dto.MovimentoCreateRequest;
+import com.agostinelli.gestionale.movimenti.service.MovimentiService;
 import com.agostinelli.gestionale.movimenti.dto.QuadraturaPeriodoDTO;
 import com.agostinelli.gestionale.movimenti.dto.RegolaClassificazioneDTO;
 import com.agostinelli.gestionale.movimenti.dto.RicorrenteParcheggiataDTO;
@@ -15,7 +16,6 @@ import com.agostinelli.gestionale.movimenti.dto.TransitorioDTO;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService;
 import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
 import com.agostinelli.gestionale.movimenti.importlayer.parser.Sorgente;
-import com.agostinelli.gestionale.movimenti.service.MovimentiService;
 import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
 import com.agostinelli.gestionale.movimenti.dto.AnalisiDuplicatiDTO;
 import com.agostinelli.gestionale.shared.dto.PagedResponse;
@@ -47,11 +47,15 @@ public class ImportTriageService {
     private static final String COGE_RICAVI_DACLASS = "39.99.999";
     private static final String COGE_COSTI_DACLASS = "49.99.999";
 
+    // BU 5 = Overhead (mutui/assicurazioni/ammortamenti): natura delle rate ricorrenti.
+    private static final short BU_OVERHEAD = 5;
+    private static final String COGE_FINANZIAMENTO_ENTRATA = "90.01.001"; // Finanziamenti ricevuti
+
     @Inject EntityManager em;
     @Inject RegoleClassificazioneEngine regoleEngine;
-    @Inject MovimentiService movimentiService;
     @Inject MvRefreshService mvRefresh;
     @Inject KeywordLearningService keywordLearning;
+    @Inject MovimentiService movimentiService;
     @Inject com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     // ── KPI (§13) ────────────────────────────────────────────────────────────────
@@ -345,9 +349,9 @@ public class ImportTriageService {
     }
 
     /**
-     * Risolve una voce-evento: SCARTA (non è un evento), CLASSIFICA (crea un movimento
-     * sul COGE/BU scelto) o RICONCILIA (collega a un evento dell'anagrafica). In tutti i
-     * casi la riga esce dalla coda DA_RICONCILIARE.
+     * Risolve una voce-evento: SCARTA (non è un evento) o RICONCILIA (collega a un evento
+     * dell'anagrafica). In entrambi i casi la riga esce dalla coda DA_RICONCILIARE.
+     * CLASSIFICA è bloccata: le voci evento non generano mai movimenti (invariante DACLASS).
      */
     @CacheInvalidateAll(cacheName = "dashboard-kpi")
     @CacheInvalidateAll(cacheName = "dashboard-andamento")
@@ -371,22 +375,12 @@ public class ImportTriageService {
         switch (azione) {
             case "SCARTA" -> aggiornaStatoEvento(eventoParkId, "SCARTATO", null, req.nota());
 
-            case "CLASSIFICA" -> {
-                if (req.cogeId() == null || req.businessUnitId() == null) {
-                    throw new ApiException(Response.Status.BAD_REQUEST, "CLASSIFICA_INCOMPLETA",
-                            "cogeId e businessUnitId sono obbligatori per classificare l'evento come movimento");
-                }
-                UUID importLogId = toUuid(e[0]);
-                LocalDate data = ((java.sql.Date) e[2]).toLocalDate();
-                Short conto = e[5] == null ? null : ((Number) e[5]).shortValue();
-                MovimentoCreateRequest createReq = new MovimentoCreateRequest(
-                        (String) e[4], (BigDecimal) e[3], null, null, data, data, data, null,
-                        conto, metodoBonificoId(), req.businessUnitId(), req.cogeId(), null,
-                        null, null, null, (String) e[6], req.nota(), null, (String) e[1], null);
-                movimentiService.createMovimentoImport(createReq, userId, importLogId);
-                aggiornaStatoEvento(eventoParkId, "RICONCILIATO", null, req.nota());
-                mvRefresh.requestRefreshAfterCommit();
-            }
+            // Invariante DACLASS: le voci evento parcheggiate NON generano MAI movimenti —
+            // il ricavo evento nasce solo dal modulo Eventi (registrazione pagamenti).
+            case "CLASSIFICA" -> throw new ApiException(Response.Status.CONFLICT,
+                    "EVENTO_NON_CONTABILIZZABILE",
+                    "Le voci evento parcheggiate non generano movimenti: il ricavo nasce dal "
+                    + "modulo Eventi (caparra/acconto/saldo). Usa SCARTA o RICONCILIA.");
 
             case "RICONCILIA" -> aggiornaStatoEvento(eventoParkId, "RICONCILIATO", req.eventoId(), req.nota());
 
@@ -407,11 +401,6 @@ public class ImportTriageService {
                 .executeUpdate();
     }
 
-    private Integer metodoBonificoId() {
-        List<?> r = em.createNativeQuery("SELECT id FROM metodi_pagamento WHERE codice = 'BONIFICO'").getResultList();
-        return r.isEmpty() ? null : ((Number) r.get(0)).intValue();
-    }
-
     // ── Parcheggio spese ricorrenti / finanziamenti (V9) ──────────────────────────
 
     /** Coda delle spese ricorrenti parcheggiate (non contabilizzate): da riconciliare a mano. */
@@ -424,15 +413,25 @@ public class ImportTriageService {
                 " ORDER BY data_movimento, id LIMIT :size OFFSET :offset")
                 .setParameter("stato", stato).setParameter("size", size).setParameter("offset", (long) page * size)
                 .getResultList();
+        // Suggerimento CoGe: calcolato in Java dalla descrizione, poi UNA sola query per risolvere
+        // i codici in id (no N+1 sul piano dei conti).
+        List<String> codiciSugg = new ArrayList<>(rows.size());
+        for (Object[] r : rows) codiciSugg.add(suggerisciCogeCodice((String) r[4] /* tipo */, (String) r[6] /* descr */));
+        java.util.Map<String, Integer> idByCodice = cogeIdByCodice(new java.util.HashSet<>(codiciSugg));
+
         List<RicorrenteParcheggiataDTO> content = new ArrayList<>(rows.size());
-        for (Object[] r : rows) {
+        for (int i = 0; i < rows.size(); i++) {
+            Object[] r = rows.get(i);
+            String codiceSugg = codiciSugg.get(i);
+            Integer idSugg = codiceSugg == null ? null : idByCodice.get(codiceSugg);
             content.add(new RicorrenteParcheggiataDTO(
                     toUuid(r[0]), (String) r[1],
                     r[2] == null ? null : ((java.sql.Date) r[2]).toLocalDate(),
                     (BigDecimal) r[3], (String) r[4],
                     r[5] == null ? null : ((Number) r[5]).shortValue(),
                     (String) r[6], (String) r[7],
-                    r[8] == null ? null : toUuid(r[8]), (String) r[9]));
+                    r[8] == null ? null : toUuid(r[8]), (String) r[9],
+                    idSugg, idSugg == null ? null : codiceSugg));
         }
         long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where)
                 .setParameter("stato", stato).getSingleResult()).longValue();
@@ -440,37 +439,160 @@ public class ImportTriageService {
     }
 
     /**
-     * Riconcilia una ricorrente parcheggiata: COLLEGA a un piano ricorrente (nessun effetto
-     * contabile, il modulo Spese Ricorrenti resta la fonte di verità) oppure IGNORA.
+     * Risolve una ricorrente parcheggiata (V22): CONFERMA crea il movimento contabile reale dalla
+     * riga (rata già addebitata in banca ma non ancora a libro dopo la ricreazione dei piani sul
+     * debito residuo), IGNORA la archivia. L'azione COLLEGA è rimossa (→ 400 AZIONE_NON_VALIDA).
+     *
+     * Invarianti (Design by Contract): la riga si conferma UNA sola volta (stato != DA_RICONCILIARE
+     * → 409); su USCITA il CoGe è obbligatorio (400); importo > 0 (400).
      */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
     @Transactional
     public void risolviRicorrente(UUID id, RisolviRicorrenteRequest req, UUID userId) {
-        List<?> found = em.createNativeQuery(
-                "SELECT stato FROM ricorrenti_da_riconciliare WHERE id = :id").setParameter("id", id).getResultList();
+        List<Object[]> found = em.createNativeQuery(
+                "SELECT stato, import_log_id, data_movimento, importo, tipo, conto_bancario_id, descrizione_norm " +
+                "FROM ricorrenti_da_riconciliare WHERE id = :id").setParameter("id", id).getResultList();
         if (found.isEmpty()) throw new ApiException(Response.Status.NOT_FOUND, "RICORRENTE_NON_TROVATA", "Ricorrente " + id);
-        if (!"DA_RICONCILIARE".equals(found.get(0))) {
+        Object[] r = found.get(0);
+        if (!"DA_RICONCILIARE".equals((String) r[0])) {
             throw new ApiException(Response.Status.CONFLICT, "RICORRENTE_GIA_RISOLTA", "La voce è già stata risolta");
         }
         String azione = req.azione() == null ? "" : req.azione().toUpperCase();
         switch (azione) {
-            case "COLLEGA" -> {
-                if (req.recurringPlanId() == null) {
-                    throw new ApiException(Response.Status.BAD_REQUEST, "PIANO_OBBLIGATORIO",
-                            "Seleziona il piano ricorrente a cui collegare la riga");
+            case "CONFERMA" -> confermaRicorrente(id, r, req, userId);
+            case "IGNORA" -> {
+                int claimed = em.createNativeQuery(
+                        "UPDATE ricorrenti_da_riconciliare SET stato = 'IGNORATA', note = :nota, " +
+                        "risolto_at = now(), risolto_by = :uid WHERE id = :id AND stato = 'DA_RICONCILIARE'")
+                        .setParameter("nota", req.nota()).setParameter("uid", userId).setParameter("id", id).executeUpdate();
+                if (claimed == 0) {
+                    throw new ApiException(Response.Status.CONFLICT, "RICORRENTE_GIA_RISOLTA",
+                            "La voce è già stata risolta");
                 }
-                em.createNativeQuery(
-                        "UPDATE ricorrenti_da_riconciliare SET stato = 'RICONCILIATA', recurring_plan_id = :pid, " +
-                        "note = :nota, risolto_at = now(), risolto_by = :uid WHERE id = :id")
-                        .setParameter("pid", req.recurringPlanId()).setParameter("nota", req.nota())
-                        .setParameter("uid", userId).setParameter("id", id).executeUpdate();
             }
-            case "IGNORA" -> em.createNativeQuery(
-                    "UPDATE ricorrenti_da_riconciliare SET stato = 'IGNORATA', note = :nota, " +
-                    "risolto_at = now(), risolto_by = :uid WHERE id = :id")
-                    .setParameter("nota", req.nota()).setParameter("uid", userId).setParameter("id", id).executeUpdate();
             default -> throw new ApiException(Response.Status.BAD_REQUEST, "AZIONE_NON_VALIDA",
-                    "Azione non valida: " + req.azione() + " (COLLEGA | IGNORA)");
+                    "Azione non valida: " + req.azione() + " (CONFERMA | IGNORA)");
         }
+    }
+
+    /** Crea il movimento contabile da una riga ricorrente confermata e la marca CONFERMATA. */
+    private void confermaRicorrente(UUID id, Object[] r, RisolviRicorrenteRequest req, UUID userId) {
+        UUID importLogId = toUuid(r[1]);
+        LocalDate data = r[2] == null ? null : ((java.sql.Date) r[2]).toLocalDate();
+        BigDecimal importo = (BigDecimal) r[3];
+        String tipo = (String) r[4];
+        Short conto = r[5] == null ? null : ((Number) r[5]).shortValue();
+        String descr = (String) r[6];
+
+        if (importo == null || importo.signum() <= 0) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "IMPORTO_NON_VALIDO",
+                    "L'importo della ricorrente deve essere maggiore di zero");
+        }
+        if (data == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "DATA_MANCANTE",
+                    "La riga ricorrente non ha una data movimento da usare per il movimento");
+        }
+
+        Integer cogeId;
+        String metodoCodice;
+        if ("ENTRATA".equals(tipo)) {
+            // Erogazione finanziamento: CoGe FISSO 90.01.001, cogeId del client ignorato.
+            cogeId = cogeIdByCodiceOrThrow(COGE_FINANZIAMENTO_ENTRATA);
+            metodoCodice = "BONIFICO";
+        } else {
+            if (req.cogeId() == null) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "COGE_OBBLIGATORIO",
+                        "Seleziona il conto CoGe per contabilizzare la rata");
+            }
+            cogeId = req.cogeId();
+            // Fail fast al boundary: il CoGe scelto deve esistere.
+            Long exists = ((Number) em.createNativeQuery(
+                    "SELECT COUNT(*) FROM piano_dei_conti_coge WHERE id = :id")
+                    .setParameter("id", cogeId).getSingleResult()).longValue();
+            if (exists == 0) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "COGE_NON_TROVATO",
+                        "Conto CoGe inesistente: " + cogeId);
+            }
+            // Addebito diretto SEPA (SDD) vs addebito generico sul conto.
+            metodoCodice = descr != null && descr.toUpperCase().contains("SDD") ? "RID_SDDMANDAT" : "ADDEBITO_CONTO";
+        }
+        Integer metodoId = metodoIdByCodiceOrThrow(metodoCodice);
+
+        // Claim ATOMICO anti doppia-conferma (TOCTOU): la transizione di stato con predicato è
+        // l'unico guard concorrenza-safe — due richieste sovrapposte si serializzano sul row-lock
+        // e la perdente vede 0 righe → 409. Se la creazione del movimento poi fallisce, il
+        // rollback della @Transactional rilascia anche il claim (niente righe bruciate).
+        int claimed = em.createNativeQuery(
+                "UPDATE ricorrenti_da_riconciliare SET stato = 'CONFERMATA', note = :nota, " +
+                "risolto_at = now(), risolto_by = :uid WHERE id = :id AND stato = 'DA_RICONCILIARE'")
+                .setParameter("nota", req.nota()).setParameter("uid", userId)
+                .setParameter("id", id).executeUpdate();
+        if (claimed == 0) {
+            throw new ApiException(Response.Status.CONFLICT, "RICORRENTE_GIA_RISOLTA",
+                    "La voce è già stata risolta");
+        }
+
+        MovimentoCreateRequest mreq = new MovimentoCreateRequest(
+                tipo, importo, null, null,
+                data, data, data, null,          // dataMovimento = dataCompetenza = dataFinanziaria = data riga
+                conto, metodoId, BU_OVERHEAD, cogeId,
+                null, null, null, null,
+                descr != null && !descr.isBlank() ? descr : "Rata ricorrente",
+                null, null, "IMPORT_BANCA", null);
+        UUID movimentoId = movimentiService.createMovimentoImport(mreq, userId, importLogId).id();
+
+        em.createNativeQuery(
+                "UPDATE ricorrenti_da_riconciliare SET movimento_id = :mid WHERE id = :id")
+                .setParameter("mid", movimentoId).setParameter("id", id).executeUpdate();
+
+        mvRefresh.requestRefreshAfterCommit();
+    }
+
+    /** Suggerisce il codice CoGe dalla descrizione (case-insensitive); null = l'utente sceglie. */
+    private String suggerisciCogeCodice(String tipo, String descrizione) {
+        if ("ENTRATA".equals(tipo)) return COGE_FINANZIAMENTO_ENTRATA;
+        if (descrizione == null) return null;
+        String d = descrizione.toUpperCase();
+        if (d.contains("MUTUO")) return "20.01.001";
+        if (d.contains("ASCONFIDI") || d.contains("CONFIDI")) return "20.01.006";
+        if (d.contains("LEASING")) return "20.01.005";
+        if (d.contains("PROTEZIONE VITA")) return "40.05.002";
+        if (d.contains("ASSICURAZ") || d.contains("POLIZZA")) return "40.05.002";
+        if (d.contains("BOLLO") || d.contains("CANONE")) return "40.02.002";
+        return null;
+    }
+
+    /** Risolve i codici CoGe in id con UNA query (no N+1). Codici null/ignoti scartati. */
+    @SuppressWarnings("unchecked")
+    private java.util.Map<String, Integer> cogeIdByCodice(java.util.Set<String> codici) {
+        codici.remove(null);
+        if (codici.isEmpty()) return java.util.Map.of();
+        java.util.Map<String, Integer> out = new java.util.HashMap<>();
+        for (Object[] row : (List<Object[]>) em.createNativeQuery(
+                "SELECT codice, id FROM piano_dei_conti_coge WHERE codice IN (:cc)")
+                .setParameter("cc", codici).getResultList()) {
+            out.put((String) row[0], ((Number) row[1]).intValue());
+        }
+        return out;
+    }
+
+    private Integer cogeIdByCodiceOrThrow(String codice) {
+        List<?> ids = em.createNativeQuery("SELECT id FROM piano_dei_conti_coge WHERE codice = :c")
+                .setParameter("c", codice).getResultList();
+        if (ids.isEmpty()) throw new ApiException(Response.Status.INTERNAL_SERVER_ERROR, "COGE_MANCANTE",
+                "Conto CoGe di sistema mancante: " + codice);
+        return ((Number) ids.get(0)).intValue();
+    }
+
+    private Integer metodoIdByCodiceOrThrow(String codice) {
+        List<?> ids = em.createNativeQuery("SELECT id FROM metodi_pagamento WHERE codice = :c")
+                .setParameter("c", codice).getResultList();
+        if (ids.isEmpty()) throw new ApiException(Response.Status.INTERNAL_SERVER_ERROR, "METODO_MANCANTE",
+                "Metodo di pagamento di sistema mancante: " + codice);
+        return ((Number) ids.get(0)).intValue();
     }
 
     /**

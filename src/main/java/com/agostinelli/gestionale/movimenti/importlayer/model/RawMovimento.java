@@ -27,7 +27,7 @@ public record RawMovimento(
 
         // Classificazione (valorizzata dal mapping, non dal parser)
         String riferimentoEsterno,    // per idempotenza
-        String girosalto,             // "GIROCONTO_SKIP" se da saltare, null altrimenti
+        String girosalto,             // GIROCONTO_INTERNO / VERSAMENTO_CONTANTI → movimento su 10.03.x, null altrimenti
 
         // Colonne raw Billy per il mapping engine
         BigDecimal billyAgriturismo,  // null per BPM/CA

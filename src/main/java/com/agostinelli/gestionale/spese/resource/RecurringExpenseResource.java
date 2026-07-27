@@ -73,6 +73,14 @@ public class RecurringExpenseResource {
         return Response.noContent().build();
     }
 
+    /** Cestina: purga fisica totale di un piano ANNULLATO (rate + tutti i movimenti, penale inclusa). */
+    @POST
+    @Path("/piani/{id}/cestina")
+    public Response cestina(@PathParam("id") UUID id) {
+        service.purgePlan(id);
+        return Response.noContent().build();
+    }
+
     // ── Rate ──────────────────────────────────────────────────────────────────
 
     @PUT

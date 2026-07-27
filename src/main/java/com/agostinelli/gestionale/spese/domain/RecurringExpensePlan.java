@@ -75,6 +75,10 @@ public class RecurringExpensePlan {
     @Column(name = "conto_coge_interessi_id")
     public Integer contoCogeInteressiId;
 
+    /** Movimento USCITA di penale creato all'annullamento (colonna debole, no FK: movimenti è partizionata). */
+    @Column(name = "movimento_penale_id", columnDefinition = "uuid")
+    public UUID movimentoPenaleId;
+
     @PrePersist
     void onCreate() {
         if (createdAt == null) createdAt = Instant.now();

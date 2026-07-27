@@ -655,6 +655,189 @@ class SpeseRicorrentiIntegrationTest {
             .then().statusCode(401);
     }
 
+    // ── Cestina (purga fisica totale di un piano ANNULLATO) ───────────────────
+
+    @Test
+    @Order(58)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testCestina_annullatoConRataPagataEPenale_purgaTutto_eRipristinaSaldo() {
+        // Invariante: dopo la cestina piano/rate/movimenti spariti + saldo conto ripristinato.
+        txHelper.seedSaldoConto1(new java.math.BigDecimal("5000.00"));
+        java.math.BigDecimal saldoBaseline = txHelper.getSaldoConto1();
+
+        String body = """
+            {
+              "descrizione": "Piano cestina con pagato+penale",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 100.00,
+              "variazionePct": 0,
+              "giornoDelMese": 5,
+              "frequenza": "MENSILE",
+              "numeroRate": 4,
+              "dataInizio": "2026-07-01"
+            }
+            """.formatted(validContoCoge);
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        // paga la prima rata → movimento USCITA reale (saldo scende)
+        String rataId = given()
+            .when().get(BASE + "/piani/" + planId)
+            .then().statusCode(200).extract().path("rate[0].id");
+        given()
+            .contentType(ContentType.JSON).body("{}")
+            .when().post(BASE + "/piani/" + planId + "/rate/" + rataId + "/paga")
+            .then().statusCode(200);
+        String movRataId = given()
+            .when().get(BASE + "/piani/" + planId)
+            .then().statusCode(200)
+            .extract().path("rate.find { it.stato == 'PAID' }.movimentoId");
+        assertNotNull(movRataId, "la rata pagata deve avere un movimento");
+
+        // annulla con penale → stato ANNULLATO + movimento penale tracciato
+        given()
+            .contentType(ContentType.JSON).body("{\"importoPenale\": 50.00}")
+            .when().post(BASE + "/piani/" + planId + "/annulla")
+            .then().statusCode(200).body("stato", equalTo("ANNULLATO"));
+        UUID penaleId = txHelper.getPlanMovimentoPenaleId(UUID.fromString(planId));
+        assertNotNull(penaleId, "il movimento penale deve essere tracciato su movimento_penale_id");
+
+        // saldo ora sotto la baseline (100 rata + 50 penale usciti)
+        assertTrue(txHelper.getSaldoConto1().compareTo(saldoBaseline) < 0,
+                "dopo pagamento+penale il saldo deve essere sceso");
+
+        // CESTINA
+        given()
+            .contentType(ContentType.JSON)
+            .when().post(BASE + "/piani/" + planId + "/cestina")
+            .then().statusCode(204);
+
+        // (a) piano e rate spariti
+        given().when().get(BASE + "/piani/" + planId).then().statusCode(404);
+        assertEquals(0, txHelper.countInstallments(UUID.fromString(planId)),
+                "le rate devono cascatare con il piano");
+        // (b) nessun movimento residuo (rata PAID + penale)
+        assertEquals(0, txHelper.countMovimentiByIds(
+                List.of(UUID.fromString(movRataId), penaleId)),
+                "movimento rata e penale devono essere cancellati");
+        // (c) saldo conto ripristinato al valore pre-piano
+        assertEquals(0, txHelper.getSaldoConto1().compareTo(saldoBaseline),
+                "il saldo deve tornare alla baseline: baseline=" + saldoBaseline +
+                " attuale=" + txHelper.getSaldoConto1());
+    }
+
+    @Test
+    @Order(59)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testCestina_pianoAttivo_409_nonAnnullato_eNienteCancellato() {
+        String body = """
+            {
+              "descrizione": "Piano attivo non cestinabile",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 70.00,
+              "variazionePct": 0,
+              "giornoDelMese": 8,
+              "frequenza": "MENSILE",
+              "numeroRate": 3,
+              "dataInizio": "2026-07-01"
+            }
+            """.formatted(validContoCoge);
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        given()
+            .contentType(ContentType.JSON)
+            .when().post(BASE + "/piani/" + planId + "/cestina")
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("PIANO_NON_ANNULLATO"));
+
+        // nulla cancellato: piano e rate ancora presenti
+        given().when().get(BASE + "/piani/" + planId).then().statusCode(200);
+        assertEquals(3, txHelper.countInstallments(UUID.fromString(planId)));
+    }
+
+    @Test
+    @Order(63)
+    void testCestina_senzaToken_401() {
+        given()
+            .contentType(ContentType.JSON)
+            .when().post(BASE + "/piani/00000000-0000-0000-0000-000000000001/cestina")
+            .then().statusCode(401);
+    }
+
+    @Test
+    @Order(135)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testCestina_finanziamento_cancellaAncheMovimentoInteressi() {
+        Assumptions.assumeTrue(validContoCogeInteressi != null);
+        txHelper.seedSaldoConto1(new java.math.BigDecimal("20000.00"));
+
+        String body = """
+            {
+              "descrizione": "Finanziamento cestina interessi",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 8490.67,
+              "variazionePct": 0,
+              "giornoDelMese": 1,
+              "frequenza": "MENSILE",
+              "numeroRate": 12,
+              "dataInizio": "2026-05-01",
+              "tipoPiano": "FINANZIAMENTO",
+              "importoDebitoIniziale": 100000.00,
+              "tassoInteresseAnnuo": 3.5,
+              "contoCogeInteressiId": %d
+            }
+            """.formatted(validContoCoge, validContoCogeInteressi);
+
+        String planId = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then().statusCode(201).extract().path("id");
+
+        String rataId = given()
+            .when().get(BASE + "/piani/" + planId)
+            .then().statusCode(200).extract().path("rate[0].id");
+        given()
+            .contentType(ContentType.JSON).body("{}")
+            .when().post(BASE + "/piani/" + planId + "/rate/" + rataId + "/paga")
+            .then().statusCode(200);
+
+        // cattura i due movimenti (capitale + interessi) PRIMA della cestina
+        String movCapId = given()
+            .when().get(BASE + "/piani/" + planId)
+            .then().statusCode(200)
+            .extract().path("rate.find { it.id == '" + rataId + "' }.movimentoId");
+        UUID movIntId = txHelper.getMovimentoInteressiId(UUID.fromString(rataId));
+        assertNotNull(movCapId, "capitale");
+        assertNotNull(movIntId, "interessi");
+
+        // annulla (no penale) poi cestina
+        given()
+            .contentType(ContentType.JSON).body("{\"importoPenale\": 0}")
+            .when().post(BASE + "/piani/" + planId + "/annulla")
+            .then().statusCode(200).body("stato", equalTo("ANNULLATO"));
+
+        given()
+            .contentType(ContentType.JSON)
+            .when().post(BASE + "/piani/" + planId + "/cestina")
+            .then().statusCode(204);
+
+        given().when().get(BASE + "/piani/" + planId).then().statusCode(404);
+        assertEquals(0, txHelper.countMovimentiByIds(
+                List.of(UUID.fromString(movCapId), movIntId)),
+                "sia il movimento capitale sia il movimento interessi devono sparire");
+    }
+
     // ── Delete: corner case ───────────────────────────────────────────────────
 
     @Test
@@ -1722,6 +1905,49 @@ class SpeseRicorrentiIntegrationTest {
             return (Object[]) em.createNativeQuery(
                     "SELECT stato, recurring_plan_id FROM ricorrenti_da_riconciliare WHERE id = :id")
                     .setParameter("id", id)
+                    .getSingleResult();
+        }
+
+        /** Saldo corrente del conto 1 (stessa formula di RecurringExpenseService#getContoBancarioSaldo). */
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public java.math.BigDecimal getSaldoConto1() {
+            Object r = em.createNativeQuery(
+                    "SELECT cb.saldo_iniziale + COALESCE(SUM(" +
+                    "  CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo" +
+                    "       WHEN m.tipo='USCITA'  THEN -m.importo_lordo ELSE 0 END),0)" +
+                    " FROM conti_bancari cb" +
+                    " LEFT JOIN movimenti m ON m.conto_bancario_id=cb.id AND m.data_finanziaria IS NOT NULL" +
+                    " WHERE cb.id=1 GROUP BY cb.saldo_iniziale")
+                    .getSingleResult();
+            return r instanceof java.math.BigDecimal bd ? bd : new java.math.BigDecimal(r.toString());
+        }
+
+        /** Quanti dei movimenti indicati esistono ancora a DB (per verificare la purga della cestina). */
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public long countMovimentiByIds(List<UUID> ids) {
+            if (ids.isEmpty()) return 0;
+            Number n = (Number) em.createNativeQuery(
+                    "SELECT COUNT(*) FROM movimenti WHERE id IN (:ids)")
+                    .setParameter("ids", ids)
+                    .getSingleResult();
+            return n.longValue();
+        }
+
+        /** movimento_penale_id tracciato sul piano (null se assente). */
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public UUID getPlanMovimentoPenaleId(UUID planId) {
+            return (UUID) em.createNativeQuery(
+                    "SELECT movimento_penale_id FROM recurring_expense_plan WHERE id = :pid")
+                    .setParameter("pid", planId)
+                    .getSingleResult();
+        }
+
+        /** movimento_interessi_id di una rata (null se FLAT o non pagata). */
+        @Transactional(Transactional.TxType.REQUIRES_NEW)
+        public UUID getMovimentoInteressiId(UUID rataId) {
+            return (UUID) em.createNativeQuery(
+                    "SELECT movimento_interessi_id FROM recurring_expense_installment WHERE id = :rid")
+                    .setParameter("rid", rataId)
                     .getSingleResult();
         }
 

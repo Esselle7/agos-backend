@@ -37,6 +37,7 @@ public class RecurringExpenseService {
 
     @Inject RecurringExpensePlanRepository planRepo;
     @Inject RecurringExpenseInstallmentRepository installmentRepo;
+    @Inject com.agostinelli.gestionale.movimenti.repository.MovimentiRepository movimentiRepo;
     @Inject EntityManager em;
     @Inject MvRefreshService mvRefresh;
 
@@ -305,6 +306,8 @@ public class RecurringExpenseService {
                     plan.descrizione + " – Penale cancellazione");
             if (req.note() != null) movPenale.note = req.note();
             em.persist(movPenale);
+            em.flush(); // serve l'id generato per tracciare la penale (la userà 'cestina')
+            plan.movimentoPenaleId = movPenale.id;
         }
 
         plan.stato = "ANNULLATO";
@@ -339,6 +342,45 @@ public class RecurringExpenseService {
                     + "usa 'annulla' invece di eliminare per non perdere le scritture.");
         }
         planRepo.delete(plan);
+    }
+
+    // ── CESTINA (purga fisica totale di un piano ANNULLATO) ────────────────────
+
+    /**
+     * Purga DEFINITIVA di un piano ANNULLATO e di TUTTA la sua contabilità: rate +
+     * ogni movimento collegato (rate PAID: movimentoId e movimentoInteressiId; più il
+     * movimento di penale creato all'annullamento). Cancellare i movimenti ripristina i
+     * saldi conto (gli USCITA spariscono → il saldo torna su). Irreversibile.
+     *
+     * Guardia: consentita SOLO su stato=ANNULLATO (409 PIANO_NON_ANNULLATO altrimenti) —
+     * la delete fisica normale (ATTIVO, nessun movimento) resta su deletePlan.
+     *
+     * I movimenti vanno cancellati ESPLICITAMENTE per id: la tabella movimenti è
+     * partizionata e non ha FK in ingresso, quindi non c'è cascade. Le rate invece
+     * cascatano dal piano (FK ON DELETE CASCADE). Tutto atomico in una @Transactional.
+     */
+    @Transactional
+    public void purgePlan(UUID planId) {
+        RecurringExpensePlan plan = findPlanOrThrow(planId);
+        if (!"ANNULLATO".equals(plan.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "PIANO_NON_ANNULLATO",
+                    "La cestina è consentita solo su un piano ANNULLATO: usa 'annulla' prima.");
+        }
+
+        // ponytail: raccolta id in lista (volumi piccoli); duplicati ok, 'id IN' è idempotente.
+        List<UUID> movIds = new ArrayList<>();
+        for (RecurringExpenseInstallment rata : installmentRepo.findByPianoOrdered(planId)) {
+            if (rata.movimentoId != null)          movIds.add(rata.movimentoId);
+            if (rata.movimentoInteressiId != null) movIds.add(rata.movimentoInteressiId);
+        }
+        if (plan.movimentoPenaleId != null) movIds.add(plan.movimentoPenaleId);
+
+        if (!movIds.isEmpty()) {
+            movimentiRepo.delete("id in ?1", movIds);
+        }
+        planRepo.delete(plan); // le rate cascatano via FK ON DELETE CASCADE
+
+        mvRefresh.requestRefreshAfterCommit();
     }
 
     // ── PROCESS SCHEDULED (chiamato dallo scheduler) ───────────────────────────

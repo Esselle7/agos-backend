@@ -40,45 +40,34 @@ public class MovimentiResource {
     @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService keywordService;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.MatchingDifferitiService matchingDifferitiService;
 
+    /**
+     * Filtri avanzati (docs/specs/movimenti-filtri-avanzati.md).
+     * Ogni dimensione accetta il parametro RIPETUTO (?stato=REGISTRATO&stato=DA_LIQUIDARE):
+     * valori della stessa dimensione in OR, dimensioni diverse in AND.
+     * {@code contoId=0} = movimenti senza banca. {@code dateField} sceglie a quale delle tre
+     * date del modello applicare from/to (default: data movimento).
+     */
     @GET
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
     public PagedResponse<MovimentoDTO> list(
-            @QueryParam("from")           LocalDate from,
-            @QueryParam("to")             LocalDate to,
-            @QueryParam("tipo")           String tipo,
-            @QueryParam("buId")           Short buId,
-            @QueryParam("categoriaId")    Long categoriaId,
-            @QueryParam("metodoPagamentoId") Integer metodoPagamentoId,
-            @QueryParam("stato")          String stato,
-            @QueryParam("fornitoreId")    UUID fornitoreId,
-            @QueryParam("eventoId")       UUID eventoId,
-            @QueryParam("search")         String search,
+            @BeanParam MovimentiFilterParams filtri,
             @QueryParam("page")  @DefaultValue("0")  int page,
             @QueryParam("size")  @DefaultValue("20") int size,
             @QueryParam("sort")           String sort
     ) {
         int safeSize = Math.min(Math.max(size, 1), MAX_SIZE);
-        return service.findWithFilters(tipo, buId, categoriaId, metodoPagamentoId,
-                stato, fornitoreId, eventoId, from, to, search, page, safeSize, sort);
+        return service.findWithFilters(filtri.toQuery(), page, safeSize, sort);
     }
 
+    /**
+     * Riepilogo per stato/tipo sullo STESSO insieme filtrato della lista: accetta gli stessi
+     * identici parametri (invariante di spec — un riepilogo che non rispecchia la lista è un bug).
+     */
     @GET
     @Path("/sommario")
     @RolesAllowed({"ADMIN", "DIPENDENTE"})
-    public MovimentiSommarioDTO sommario(
-            @QueryParam("from")              LocalDate from,
-            @QueryParam("to")                LocalDate to,
-            @QueryParam("tipo")              String tipo,
-            @QueryParam("buId")              Short buId,
-            @QueryParam("categoriaId")       Long categoriaId,
-            @QueryParam("metodoPagamentoId") Integer metodoPagamentoId,
-            @QueryParam("stato")             String stato,
-            @QueryParam("fornitoreId")       UUID fornitoreId,
-            @QueryParam("eventoId")          UUID eventoId,
-            @QueryParam("search")            String search
-    ) {
-        return service.getSommario(tipo, buId, categoriaId, metodoPagamentoId,
-                stato, fornitoreId, eventoId, from, to, search);
+    public MovimentiSommarioDTO sommario(@BeanParam MovimentiFilterParams filtri) {
+        return service.getSommario(filtri.toQuery());
     }
 
     // Movimenti attivi senza conto/cassa: da attribuire a mano (popup "Situazione Finanziaria").

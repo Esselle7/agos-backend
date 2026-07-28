@@ -208,16 +208,12 @@ public class MovimentiService {
     }
 
     public PagedResponse<MovimentoDTO> findWithFilters(
-            String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
-            String stato, UUID fornitoreId, UUID eventoId,
-            LocalDate from, LocalDate to, String search, int page, int size, String sort) {
+            MovimentiFilterQuery filter, int page, int size, String sort) {
 
-        List<MovimentoDTO> content = repo.findWithFilters(tipo, buId, categoriaId, metodoPagamentoId,
-                        stato, fornitoreId, eventoId, from, to, search, page, size, sort)
+        List<MovimentoDTO> content = repo.findWithFilters(filter, page, size, sort)
                 .stream().map(mapper::toDTO).toList();
 
-        long total = repo.countWithFilters(tipo, buId, categoriaId, metodoPagamentoId,
-                stato, fornitoreId, eventoId, from, to, search);
+        long total = repo.countWithFilters(filter);
 
         return PagedResponse.of(content, page, size, total);
     }
@@ -297,13 +293,9 @@ public class MovimentiService {
         return new BulkImportResponse(importati, duplicati, errori, dettaglioErrori);
     }
 
-    public MovimentiSommarioDTO getSommario(
-            String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
-            String stato, UUID fornitoreId, UUID eventoId,
-            LocalDate from, LocalDate to, String search) {
+    public MovimentiSommarioDTO getSommario(MovimentiFilterQuery filter) {
 
-        List<Object[]> rows = repo.sommarioByStatoTipo(tipo, buId, categoriaId, metodoPagamentoId,
-                stato, fornitoreId, eventoId, from, to, search);
+        List<Object[]> rows = repo.sommarioByStatoTipo(filter);
 
         Map<String, BigDecimal[]> byStato = new LinkedHashMap<>();
         Map<String, long[]> countByStato = new LinkedHashMap<>();

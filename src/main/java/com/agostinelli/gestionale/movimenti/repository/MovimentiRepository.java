@@ -1,6 +1,7 @@
 package com.agostinelli.gestionale.movimenti.repository;
 
 import com.agostinelli.gestionale.movimenti.domain.Movimento;
+import com.agostinelli.gestionale.movimenti.dto.MovimentiFilterQuery;
 import io.quarkus.hibernate.orm.panache.PanacheRepositoryBase;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -19,19 +20,13 @@ public class MovimentiRepository implements PanacheRepositoryBase<Movimento, UUI
 
     /**
      * Query dinamica con tutti i filtri opzionali.
-     * I parametri null vengono ignorati per non vincolare la query.
+     * I criteri assenti vengono ignorati per non vincolare la query.
      */
-    public List<Movimento> findWithFilters(
-            String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
-            String stato, UUID fornitoreId, UUID eventoId,
-            LocalDate from, LocalDate to, String search,
-            int page, int size, String sort) {
-
+    public List<Movimento> findWithFilters(MovimentiFilterQuery f, int page, int size, String sort) {
         StringBuilder jpql = new StringBuilder("FROM Movimento m WHERE 1=1");
         Map<String, Object> params = new LinkedHashMap<>();
 
-        appendFilters(jpql, params, tipo, buId, categoriaId, metodoPagamentoId,
-                stato, fornitoreId, eventoId, from, to, search);
+        appendFilters(jpql, params, f);
         jpql.append(buildSort(sort));
 
         TypedQuery<Movimento> q = em.createQuery(jpql.toString(), Movimento.class)
@@ -41,67 +36,96 @@ public class MovimentiRepository implements PanacheRepositoryBase<Movimento, UUI
         return q.getResultList();
     }
 
-    public long countWithFilters(
-            String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
-            String stato, UUID fornitoreId, UUID eventoId,
-            LocalDate from, LocalDate to, String search) {
-
+    public long countWithFilters(MovimentiFilterQuery f) {
         StringBuilder jpql = new StringBuilder("SELECT COUNT(m) FROM Movimento m WHERE 1=1");
         Map<String, Object> params = new LinkedHashMap<>();
 
-        appendFilters(jpql, params, tipo, buId, categoriaId, metodoPagamentoId,
-                stato, fornitoreId, eventoId, from, to, search);
+        appendFilters(jpql, params, f);
 
         TypedQuery<Long> q = em.createQuery(jpql.toString(), Long.class);
         params.forEach(q::setParameter);
         return q.getSingleResult();
     }
 
-    private void appendFilters(StringBuilder jpql, Map<String, Object> params,
-            String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
-            String stato, UUID fornitoreId, UUID eventoId,
-            LocalDate from, LocalDate to, String search) {
+    /**
+     * Unica fonte di verità dei predicati: la usano list, count e sommario, così il riepilogo
+     * non può mai descrivere un insieme diverso da quello elencato (invariante di spec).
+     *
+     * Semantica: OR dentro la stessa dimensione (IN), AND fra dimensioni diverse.
+     */
+    private void appendFilters(StringBuilder jpql, Map<String, Object> params, MovimentiFilterQuery f) {
+        in(jpql, params, "m.tipo",              "tipo",       f.tipo());
+        in(jpql, params, "m.stato",             "stato",      f.stato());
+        in(jpql, params, "m.fonte",             "fonte",      f.fonte());
+        in(jpql, params, "m.contoCoge",         "cogeId",     f.cogeId());
+        in(jpql, params, "m.businessUnitId",    "buId",       f.buId());
+        in(jpql, params, "m.categoriaId",       "categoriaId", f.categoriaId());
+        in(jpql, params, "m.metodoPagamentoId", "metodoPagamentoId", f.metodoPagamentoId());
+        in(jpql, params, "m.fornitoreId",       "fornitoreId", f.fornitoreId());
+        in(jpql, params, "m.eventoId",          "eventoId",   f.eventoId());
 
-        if (tipo != null) {
-            jpql.append(" AND m.tipo = :tipo");
-            params.put("tipo", tipo);
+        appendContoFilter(jpql, params, f.contoId());
+
+        // Range importo sul valore assoluto: l'utente ragiona per grandezza ("sopra 1.000 €"),
+        // non per segno — la direzione la sceglie con il filtro tipo.
+        if (f.importoMin() != null) {
+            jpql.append(" AND ABS(m.importo) >= :importoMin");
+            params.put("importoMin", f.importoMin());
         }
-        if (buId != null) {
-            jpql.append(" AND m.businessUnitId = :buId");
-            params.put("buId", buId);
+        if (f.importoMax() != null) {
+            jpql.append(" AND ABS(m.importo) <= :importoMax");
+            params.put("importoMax", f.importoMax());
         }
-        if (categoriaId != null) {
-            jpql.append(" AND m.categoriaId = :categoriaId");
-            params.put("categoriaId", categoriaId);
+
+        // Il campo data arriva dall'enum, mai dalla stringa di richiesta.
+        String dateField = f.dateField().field();
+        if (f.from() != null) {
+            jpql.append(" AND m.").append(dateField).append(" >= :from");
+            params.put("from", f.from());
         }
-        if (metodoPagamentoId != null) {
-            jpql.append(" AND m.metodoPagamentoId = :metodoPagamentoId");
-            params.put("metodoPagamentoId", metodoPagamentoId);
+        if (f.to() != null) {
+            jpql.append(" AND m.").append(dateField).append(" <= :to");
+            params.put("to", f.to());
         }
-        if (stato != null) {
-            jpql.append(" AND m.stato = :stato");
-            params.put("stato", stato);
-        }
-        if (fornitoreId != null) {
-            jpql.append(" AND m.fornitoreId = :fornitoreId");
-            params.put("fornitoreId", fornitoreId);
-        }
-        if (eventoId != null) {
-            jpql.append(" AND m.eventoId = :eventoId");
-            params.put("eventoId", eventoId);
-        }
-        if (from != null) {
-            jpql.append(" AND m.dataMovimento >= :from");
-            params.put("from", from);
-        }
-        if (to != null) {
-            jpql.append(" AND m.dataMovimento <= :to");
-            params.put("to", to);
-        }
-        if (search != null && !search.isBlank()) {
+
+        if (f.search() != null && !f.search().isBlank()) {
             jpql.append(" AND LOWER(m.descrizione) LIKE :search");
-            params.put("search", "%" + search.toLowerCase() + "%");
+            params.put("search", "%" + f.search().toLowerCase() + "%");
         }
+    }
+
+    /**
+     * Il conto ha una semantica in più rispetto alle altre dimensioni: la sentinella 0 significa
+     * «senza banca» (conto_bancario_id IS NULL), che in SQL non è esprimibile con una IN e va
+     * messa in OR. Selezionare «Cassa + senza banca» deve tornare l'unione dei due insiemi.
+     */
+    private void appendContoFilter(StringBuilder jpql, Map<String, Object> params, List<Short> contoIds) {
+        if (contoIds == null || contoIds.isEmpty()) return;
+
+        List<Short> reali = contoIds.stream()
+                .filter(id -> id != null && id != MovimentiFilterQuery.CONTO_SENZA_BANCA)
+                .toList();
+        boolean senzaBanca = contoIds.contains(MovimentiFilterQuery.CONTO_SENZA_BANCA);
+
+        if (!reali.isEmpty() && senzaBanca) {
+            jpql.append(" AND (m.contoBancarioId IN :contoId OR m.contoBancarioId IS NULL)");
+            params.put("contoId", reali);
+        } else if (!reali.isEmpty()) {
+            jpql.append(" AND m.contoBancarioId IN :contoId");
+            params.put("contoId", reali);
+        } else if (senzaBanca) {
+            jpql.append(" AND m.contoBancarioId IS NULL");
+        }
+    }
+
+    /** Predicato IN su una dimensione; lista assente o vuota = nessun vincolo. */
+    private void in(StringBuilder jpql, Map<String, Object> params,
+                    String field, String param, List<?> values) {
+        if (values == null || values.isEmpty()) return;
+        List<?> clean = values.stream().filter(Objects::nonNull).toList();
+        if (clean.isEmpty()) return;
+        jpql.append(" AND ").append(field).append(" IN :").append(param);
+        params.put(param, clean);
     }
 
     private String buildSort(String sort) {
@@ -158,17 +182,12 @@ public class MovimentiRepository implements PanacheRepositoryBase<Movimento, UUI
      * Restituisce righe [stato, tipo, SUM(importo), COUNT(*)].
      */
     @SuppressWarnings("unchecked")
-    public List<Object[]> sommarioByStatoTipo(
-            String tipo, Short buId, Long categoriaId, Integer metodoPagamentoId,
-            String stato, UUID fornitoreId, UUID eventoId,
-            LocalDate from, LocalDate to, String search) {
-
+    public List<Object[]> sommarioByStatoTipo(MovimentiFilterQuery f) {
         StringBuilder jpql = new StringBuilder(
                 "SELECT m.stato, m.tipo, SUM(m.importo), COUNT(m) FROM Movimento m WHERE 1=1");
         Map<String, Object> params = new LinkedHashMap<>();
 
-        appendFilters(jpql, params, tipo, buId, categoriaId, metodoPagamentoId,
-                stato, fornitoreId, eventoId, from, to, search);
+        appendFilters(jpql, params, f);
         jpql.append(" GROUP BY m.stato, m.tipo ORDER BY m.stato, m.tipo");
 
         jakarta.persistence.Query q = em.createQuery(jpql.toString());

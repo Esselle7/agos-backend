@@ -391,8 +391,11 @@ public class ForecastingService {
 
     @SuppressWarnings("unchecked")
     private List<ForecastingDettaglioDTO> buildRatePending(LocalDate start, LocalDate end) {
-        // data_scadenza <= end (includiamo anche le rate scadute non onorate: sono cassa
-        // ancora attesa, lo scheduler tenta di pagarle al prossimo tick utile).
+        // data_scadenza <= end: includiamo anche le rate GIÀ SCADUTE e ancora PENDING, perché sono
+        // cassa ancora attesa — la banca non le ha (ancora) addebitate. Dal 2026-08-05 non esiste più
+        // un job che le "paga" da solo alla scadenza: restano qui finché non le conferma l'estratto
+        // conto (COLLEGA dall'import) o l'utente a mano. Una rata scaduta che non sparisce da questo
+        // elenco è quindi un segnale da leggere, non un residuo da ignorare.
         // Filtriamo p.stato = 'ATTIVO' per evitare rate dimenticate su piani ANNULLATO/COMPLETATO
         // (caso teorico: cancelPlan e completePlan dovrebbero già spostarle, ma è una safeguard).
         List<Object[]> rows = em.createNativeQuery(

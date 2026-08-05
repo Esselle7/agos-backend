@@ -36,7 +36,12 @@ public class ContiResource {
         return repo.findAllAttiviConSaldo();
     }
 
-    /** Imposta il saldo di apertura del conto (es. al 31/12/2025). Invalida cache e rinfresca i saldi. */
+    /**
+     * Imposta il saldo di apertura del conto alla data scelta nella pagina Situazione iniziale.
+     * Invalida le cache e richiede il refresh delle MV DOPO il commit: il DTO restituito qui è
+     * costruito PRIMA, quindi il suo {@code saldoCalcolato} è ancora quello vecchio di un istante
+     * (si allinea alla lettura successiva). Non è un bug, ma non usarlo come conferma a video.
+     */
     @PUT
     @Path("/{id}/saldo-iniziale")
     @RolesAllowed("ADMIN")

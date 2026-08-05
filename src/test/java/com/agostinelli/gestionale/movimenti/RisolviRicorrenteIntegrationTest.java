@@ -36,6 +36,7 @@ class RisolviRicorrenteIntegrationTest {
     private static final UUID IMPORT_LOG = UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001");
     private static final String DESCR_PREFIX = "ZZTESTRIC";
     private static final LocalDate DATA = LocalDate.of(2026, 3, 15);
+    private static final UUID NIL_UUID = UUID.fromString("00000000-0000-0000-0000-000000000000");
 
     @Inject EntityManager em;
 
@@ -94,15 +95,38 @@ class RisolviRicorrenteIntegrationTest {
         assertEquals("DA_RICONCILIARE", statoEMovimento(ric)[0], "resta non risolta");
     }
 
-    // ── (d) azione COLLEGA (rimossa) → 400 ──
+    // ── (d) COLLEGA senza piano/rata → 400 (l'azione esiste di nuovo, ma vuole i suoi parametri) ──
     @Test
     @TestSecurity(user = USER, roles = {"ADMIN"})
-    void azioneCollega_400() {
+    void collegaSenzaPianoERata_400() {
         UUID ric = seedRicorrente("USCITA", DESCR_PREFIX + "_CANONE", (short) 1);
         given().contentType(ContentType.JSON)
             .body("{\"azione\":\"COLLEGA\"}")
             .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
+            .then().statusCode(400).body("code", equalTo("PIANO_O_RATA_MANCANTE"));
+        assertEquals("DA_RICONCILIARE", statoEMovimento(ric)[0], "resta non risolta");
+    }
+
+    // ── (d2) azione inesistente → 400 ──
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void azioneSconosciuta_400() {
+        UUID ric = seedRicorrente("USCITA", DESCR_PREFIX + "_BOLLO_X", (short) 1);
+        given().contentType(ContentType.JSON)
+            .body("{\"azione\":\"FONDI\"}")
+            .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
             .then().statusCode(400).body("code", equalTo("AZIONE_NON_VALIDA"));
+    }
+
+    // ── (d3) COLLEGA su ENTRATA → 400: un'erogazione non è una rata ──
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void collegaSuEntrata_400() {
+        UUID ric = seedRicorrente("ENTRATA", DESCR_PREFIX + "_EROGAZIONE_C", (short) 1);
+        given().contentType(ContentType.JSON)
+            .body("{\"azione\":\"COLLEGA\",\"pianoId\":\"" + NIL_UUID + "\",\"rataId\":\"" + NIL_UUID + "\"}")
+            .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
+            .then().statusCode(400).body("code", equalTo("COLLEGA_SOLO_USCITE"));
     }
 
     // ── (e) doppia conferma → 409 ──
@@ -190,6 +214,77 @@ class RisolviRicorrenteIntegrationTest {
                 "la riga parcheggiata deve sparire in cascata con l'import_log");
     }
 
+    // ── (k) COLLEGA su rata PENDING: paga la rata con la DATA REALE dell'addebito ──
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void collegaRataPending_pagaConDataAddebito() {
+        accreditaConto1("PENDING");
+        UUID piano = creaPianoMensile(DESCR_PREFIX + "_PIANO_PENDING", new BigDecimal("150.00"));
+        UUID rata  = primaRataPending(piano);
+        UUID ric   = seedRicorrente("USCITA", DESCR_PREFIX + "_CANONE PENDING", (short) 1);
+
+        given().contentType(ContentType.JSON)
+            .body("{\"azione\":\"COLLEGA\",\"pianoId\":\"" + piano + "\",\"rataId\":\"" + rata + "\"}")
+            .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
+            .then().statusCode(204);
+
+        Object[] row = statoEMovimento(ric);
+        assertEquals("RICONCILIATA", row[0]);
+        UUID movId = (UUID) row[1];
+        assertNotNull(movId, "la riga deve puntare al movimento della rata");
+
+        assertEquals("PAID", statoRata(rata), "la rata collegata risulta pagata");
+        assertEquals(movId, movimentoDiRata(rata), "riga e rata puntano allo STESSO movimento");
+        // la data del movimento è quella dell'addebito in banca, non la scadenza né oggi
+        assertEquals(DATA, dataMovimento(movId), "il movimento usa la data reale dell'addebito");
+    }
+
+    // ── (l) COLLEGA su rata GIÀ PAID: nessun movimento nuovo. È la chiusura del doppio conteggio ──
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void collegaRataGiaPagata_nonDuplicaIlMovimento() {
+        accreditaConto1("PAID");
+        UUID piano = creaPianoMensile(DESCR_PREFIX + "_PIANO_PAID", new BigDecimal("90.00"));
+        UUID rata  = primaRataPending(piano);
+
+        // lo scheduler (o l'utente) ha già pagato la rata: esiste un movimento
+        given().contentType(ContentType.JSON)
+            .when().post("/api/spese-ricorrenti/piani/" + piano + "/rate/" + rata + "/paga")
+            .then().statusCode(200);
+        UUID movPrima = movimentoDiRata(rata);
+        assertNotNull(movPrima);
+        long movimentiPrima = count("movimenti", "descrizione LIKE '" + DESCR_PREFIX + "_PIANO_PAID%'");
+
+        UUID ric = seedRicorrente("USCITA", DESCR_PREFIX + "_CANONE GIA PAGATO", (short) 1);
+        given().contentType(ContentType.JSON)
+            .body("{\"azione\":\"COLLEGA\",\"pianoId\":\"" + piano + "\",\"rataId\":\"" + rata + "\"}")
+            .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
+            .then().statusCode(204);
+
+        assertEquals(movimentiPrima, count("movimenti", "descrizione LIKE '" + DESCR_PREFIX + "_PIANO_PAID%'"),
+                "COLLEGA su rata già pagata NON deve creare un secondo movimento");
+        assertEquals(movPrima, movimentoDiRata(rata), "il movimento della rata resta lo stesso");
+        assertEquals(movPrima, statoEMovimento(ric)[1], "la riga si aggancia al movimento esistente");
+        assertEquals("RICONCILIATA", statoEMovimento(ric)[0]);
+    }
+
+    // ── (m) COLLEGA due volte sulla stessa riga → 409 ──
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void doppioCollega_409() {
+        accreditaConto1("DOPPIO");
+        UUID piano = creaPianoMensile(DESCR_PREFIX + "_PIANO_DOPPIO", new BigDecimal("70.00"));
+        UUID rata  = primaRataPending(piano);
+        UUID ric   = seedRicorrente("USCITA", DESCR_PREFIX + "_CANONE DOPPIO", (short) 1);
+        String body = "{\"azione\":\"COLLEGA\",\"pianoId\":\"" + piano + "\",\"rataId\":\"" + rata + "\"}";
+
+        given().contentType(ContentType.JSON).body(body)
+            .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi").then().statusCode(204);
+        given().contentType(ContentType.JSON).body(body)
+            .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
+            .then().statusCode(409).body("code", equalTo("RICORRENTE_GIA_RISOLTA"));
+    }
+
     // ── (j) invariante eventi: CLASSIFICA su evento parcheggiato → 409, mai movimenti ──
     @Test
     @TestSecurity(user = USER, roles = {"ADMIN"})
@@ -204,6 +299,66 @@ class RisolviRicorrenteIntegrationTest {
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Il pagamento di una rata passa da checkSaldo (saldo = saldo_iniziale + movimenti live) e nel DB
+     * di test tutti i conti sono a 0,00: senza fondi ogni pagamento darebbe 409 SALDO_INSUFFICIENTE.
+     * Si accredita il conto 1 con un'entrata marcata col prefisso, che il cleanup rimuove.
+     */
+    @Transactional
+    void accreditaConto1(String tag) {
+        // colonne NOT NULL senza default (lette da information_schema, non indovinate):
+        // data_movimento, tipo, importo_lordo, conto_coge_id, business_unit_id, fonte, created_by
+        em.createNativeQuery(
+                "INSERT INTO movimenti (id, tipo, importo_lordo, data_movimento, data_competenza, " +
+                "data_finanziaria, conto_bancario_id, conto_coge_id, business_unit_id, descrizione, " +
+                "stato, fonte, importo_commissione, created_by) " +
+                "VALUES (:id, 'ENTRATA', 10000.00, :d, :d, :d, 1, :coge, 2, :descr, 'REGISTRATO', 'MANUALE', 0, :uid)")
+                .setParameter("id", UUID.randomUUID()).setParameter("d", DATA)
+                .setParameter("coge", cogeId("30.01.001"))
+                .setParameter("descr", DESCR_PREFIX + "_FONDI_" + tag)
+                .setParameter("uid", UUID.fromString(USER))
+                .executeUpdate();
+    }
+
+    /** Piano MENSILE attivo con 3 rate, creato dall'API come lo farebbe l'utente. */
+    UUID creaPianoMensile(String descrizione, BigDecimal importoRata) {
+        String body = "{\"descrizione\":\"" + descrizione + "\",\"contoBancarioId\":1,"
+                // il piano vuole un CoGe di ramo PASSIVITA (la rata rimborsa un debito, non è un costo)
+                + "\"contoCoge\":" + cogeId("20.01.001") + ",\"importoRata\":" + importoRata + ","
+                + "\"giornoDelMese\":15,\"frequenza\":\"MENSILE\",\"numeroRate\":3,"
+                + "\"dataInizio\":\"" + DATA + "\",\"tipoPiano\":\"FLAT\"}";
+        return UUID.fromString(given().contentType(ContentType.JSON).body(body)
+                .when().post("/api/spese-ricorrenti/piani")
+                .then().log().ifValidationFails().statusCode(201).extract().path("id"));
+    }
+
+    UUID primaRataPending(UUID piano) {
+        @SuppressWarnings("unchecked")
+        List<Object> ids = em.createNativeQuery(
+                "SELECT id FROM recurring_expense_installment WHERE piano_id = :p AND stato = 'PENDING' " +
+                "ORDER BY numero_rata LIMIT 1").setParameter("p", piano).getResultList();
+        assertTrue(!ids.isEmpty(), "il piano deve avere almeno una rata PENDING");
+        Object v = ids.get(0);
+        return v instanceof UUID u ? u : UUID.fromString(v.toString());
+    }
+
+    String statoRata(UUID rata) {
+        return (String) em.createNativeQuery("SELECT stato FROM recurring_expense_installment WHERE id = :id")
+                .setParameter("id", rata).getSingleResult();
+    }
+
+    UUID movimentoDiRata(UUID rata) {
+        Object v = em.createNativeQuery("SELECT movimento_id FROM recurring_expense_installment WHERE id = :id")
+                .setParameter("id", rata).getSingleResult();
+        return v == null ? null : (v instanceof UUID u ? u : UUID.fromString(v.toString()));
+    }
+
+    LocalDate dataMovimento(UUID movId) {
+        Object v = em.createNativeQuery("SELECT data_movimento FROM movimenti WHERE id = :id")
+                .setParameter("id", movId).getSingleResult();
+        return ((java.sql.Date) v).toLocalDate();
+    }
 
     @Transactional
     UUID seedRicorrente(String tipo, String descr, Short conto) {

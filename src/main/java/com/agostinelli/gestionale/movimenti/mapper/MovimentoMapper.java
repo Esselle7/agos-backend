@@ -38,9 +38,11 @@ public interface MovimentoMapper {
      *         ENTRATA: qualcuno è in ritardo nel pagarti);
      *  null → non applicabile (movimento già liquidato/annullato, o senza scadenza).
      *
-     * Le rate dei piani di spesa ricorrente non finiscono qui: lo scheduler le
-     * converte in movimenti REGISTRATI alla scadenza (vedi RecurringExpenseScheduler),
-     * quindi dataFinanziaria è sempre valorizzata e il metodo ritorna null.
+     * Le rate dei piani di spesa ricorrente non finiscono qui: diventano movimenti solo quando
+     * qualcuno le conferma (COLLEGA dall'import, oppure "Paga" dal dettaglio piano), e nascono già
+     * REGISTRATI con la data reale dell'addebito — quindi dataFinanziaria è valorizzata e il metodo
+     * ritorna null. Finché non sono confermate restano rate PENDING, fuori dalla tabella movimenti.
+     * (Fino al 2026-08-05 le generava un job giornaliero alla scadenza: rimosso.)
      */
     default Long giorniAllaScadenza(Movimento m) {
         if (m == null || !"DA_LIQUIDARE".equals(m.stato) || m.dataLiquidita == null) {

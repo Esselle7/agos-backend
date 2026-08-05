@@ -218,8 +218,16 @@ public class DashboardService {
     }
 
     // ── GET /api/dashboard/scadenze-imminenti ────────────────────────────────
-    // WHY query diretta su eventi: importoIncassato è aggiornato da trigger
-    // real-time; la MV mv_redditivita_eventi sarebbe stale in modo inaccettabile.
+    // WHY query diretta su eventi: importoIncassato è ricalcolato in modo sincrono dentro la
+    // transazione che tocca i movimenti dell'evento (EventiService#ricalcolaIncassi), quindi la
+    // tabella eventi è sempre allineata; la MV mv_redditivita_eventi sarebbe stale in modo
+    // inaccettabile.
+    //
+    // NB: NON c'è nessun trigger. Il vecchio trg_z_aggiorna_totali_evento è stato rimosso in V20 e
+    // sostituito dal ricalcolo Java. La funzione fn_aggiorna_totali_evento() è rimasta in pg_proc
+    // ma non è agganciata a niente (verificato su pg_trigger, 2026-08-05): non fidarsi del suo nome.
+    // Conseguenza pratica: annullare i movimenti di un evento NON azzera importoIncassato — il
+    // ricalcolo parte solo alla mutazione successiva di quell'evento.
 
     @Transactional
     public ScadenzeImminentiDTO getScadenzeImminenti(LocalDate from, LocalDate to) {

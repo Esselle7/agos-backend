@@ -17,9 +17,9 @@ public class RecurringExpenseInstallmentRepository
         return list("pianoId = ?1 ORDER BY numeroRata ASC", pianoId);
     }
 
-    public List<RecurringExpenseInstallment> findPendingDue(LocalDate upTo) {
-        return list("stato = 'PENDING' AND dataScadenza <= ?1", upTo);
-    }
+    // findPendingDue(upTo) rimosso col job di auto-generazione (2026-08-05): serviva solo a
+    // convertire le rate scadute in movimenti senza conferma della banca. Le rate scadute e non
+    // ancora addebitate si leggono dallo Scadenzario e dal previsionale, che filtrano già su PENDING.
 
     public List<RecurringExpenseInstallment> findPendingByPiano(UUID pianoId) {
         return list("pianoId = ?1 AND stato = 'PENDING' ORDER BY numeroRata ASC", pianoId);

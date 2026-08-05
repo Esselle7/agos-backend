@@ -56,6 +56,8 @@ public class ImportTriageService {
     @Inject MvRefreshService mvRefresh;
     @Inject KeywordLearningService keywordLearning;
     @Inject MovimentiService movimentiService;
+    /** Serve all'azione COLLEGA: la contabilità della rata resta di competenza del modulo spese. */
+    @Inject com.agostinelli.gestionale.spese.service.RecurringExpenseService recurringService;
     @Inject com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     // ── KPI (§13) ────────────────────────────────────────────────────────────────
@@ -462,6 +464,7 @@ public class ImportTriageService {
         }
         String azione = req.azione() == null ? "" : req.azione().toUpperCase();
         switch (azione) {
+            case "COLLEGA" -> collegaRicorrente(id, r, req, userId);
             case "CONFERMA" -> confermaRicorrente(id, r, req, userId);
             case "IGNORA" -> {
                 int claimed = em.createNativeQuery(
@@ -474,7 +477,43 @@ public class ImportTriageService {
                 }
             }
             default -> throw new ApiException(Response.Status.BAD_REQUEST, "AZIONE_NON_VALIDA",
-                    "Azione non valida: " + req.azione() + " (CONFERMA | IGNORA)");
+                    "Azione non valida: " + req.azione() + " (COLLEGA | CONFERMA | IGNORA)");
+        }
+    }
+
+    /**
+     * COLLEGA: aggancia la riga parcheggiata alla rata di un piano ricorrente.
+     * Il lavoro contabile sta in {@code RecurringExpenseService.collegaRataDaImport}, che decide se
+     * creare i movimenti (rata PENDING) o riusare quelli esistenti (rata già PAID). Qui si fa solo
+     * il claim atomico della riga e si scrive il collegamento.
+     *
+     * NB: il movimento appartiene al PIANO (fonte RICORRENTE, senza fonte_importazione_id), quindi
+     * un rollback dell'import non lo cancella e non può lasciare una rata PAID che punta al vuoto.
+     */
+    private void collegaRicorrente(UUID id, Object[] r, RisolviRicorrenteRequest req, UUID userId) {
+        if (req.pianoId() == null || req.rataId() == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "PIANO_O_RATA_MANCANTE",
+                    "Per collegare servono il piano e la rata");
+        }
+        String tipo = (String) r[4];
+        if ("ENTRATA".equals(tipo)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "COLLEGA_SOLO_USCITE",
+                    "Un'entrata (erogazione) non è una rata: usa CONFERMA");
+        }
+        LocalDate dataAddebito = r[2] == null ? null : ((java.sql.Date) r[2]).toLocalDate();
+
+        UUID movimentoId = recurringService.collegaRataDaImport(req.pianoId(), req.rataId(), dataAddebito, userId);
+
+        int claimed = em.createNativeQuery(
+                "UPDATE ricorrenti_da_riconciliare SET stato = 'RICONCILIATA', recurring_plan_id = :piano, " +
+                "movimento_id = :mov, note = :nota, risolto_at = now(), risolto_by = :uid " +
+                "WHERE id = :id AND stato = 'DA_RICONCILIARE'")
+                .setParameter("piano", req.pianoId()).setParameter("mov", movimentoId)
+                .setParameter("nota", req.nota()).setParameter("uid", userId).setParameter("id", id)
+                .executeUpdate();
+        if (claimed == 0) {
+            throw new ApiException(Response.Status.CONFLICT, "RICORRENTE_GIA_RISOLTA",
+                    "La voce è già stata risolta");
         }
     }
 

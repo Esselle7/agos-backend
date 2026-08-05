@@ -178,6 +178,66 @@ public class RecurringExpenseService {
         return buildDetail(plan, installmentRepo.findByPianoOrdered(planId));
     }
 
+    // ── COLLEGA DA IMPORT ────────────────────────────────────────────────────
+
+    /**
+     * Aggancia un addebito bancario (riga parcheggiata dall'import) alla rata di un piano.
+     * Chiamato da {@code ImportTriageService.risolviRicorrente} con azione COLLEGA.
+     *
+     * Due casi, ed è QUI che si chiude il doppio conteggio:
+     *  - rata {@code PENDING} → la riga banca È il pagamento: si paga la rata usando la **data reale
+     *    dell'addebito** (non la scadenza, non oggi) e nascono i movimenti del piano;
+     *  - rata già {@code PAID} → lo scheduler è arrivato prima: **non si crea nulla**, si restituisce
+     *    il movimento che esiste già, così la riga vi si aggancia invece di duplicarlo.
+     *
+     * @return l'id del movimento a cui agganciare la riga (capitale, per i FINANZIAMENTO).
+     */
+    @Transactional
+    public UUID collegaRataDaImport(UUID planId, UUID installmentId, LocalDate dataAddebito, UUID userId) {
+        RecurringExpensePlan plan = findActivePlanOrThrow(planId);
+        RecurringExpenseInstallment rata = findInstallmentOrThrow(installmentId, planId);
+
+        if ("PAID".equals(rata.stato)) {
+            return rata.movimentoId;                       // già contabilizzata: nessun movimento nuovo
+        }
+        if (!"PENDING".equals(rata.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "RATA_NON_COLLEGABILE",
+                    "Si collegano solo rate PENDING o già PAID (stato attuale: " + rata.stato + ")");
+        }
+        if (dataAddebito == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "DATA_MANCANTE",
+                    "La riga da collegare non ha una data di addebito");
+        }
+
+        checkSaldo(plan.contoBancarioId, rata.importo);
+
+        if ("FINANZIAMENTO".equals(plan.tipoPiano) && rata.quotaCapitale != null) {
+            Movimento mCap = buildMovimento(plan, rata.quotaCapitale, dataAddebito, userId,
+                    plan.descrizione + " – Rata " + rata.numeroRata + " (cap.)");
+            em.persist(mCap);
+            Movimento mInt = buildMovimentoInteressi(plan, rata.quotaInteressi, dataAddebito, userId,
+                    plan.descrizione + " – Rata " + rata.numeroRata + " (int.)");
+            em.persist(mInt);
+            em.flush();
+            rata.stato                = "PAID";
+            rata.movimentoId          = mCap.id;
+            rata.movimentoInteressiId = mInt.id;
+        } else {
+            Movimento m = buildMovimento(plan, rata.importo, dataAddebito, userId,
+                    plan.descrizione + " – Rata " + rata.numeroRata);
+            em.persist(m);
+            em.flush();
+            rata.stato       = "PAID";
+            rata.movimentoId = m.id;
+        }
+
+        if (installmentRepo.findPendingByPiano(planId).isEmpty()) {
+            plan.stato = "COMPLETATO";
+        }
+        mvRefresh.requestRefreshAfterCommit();
+        return rata.movimentoId;
+    }
+
     // ── SKIP ─────────────────────────────────────────────────────────────────
 
     @Transactional
@@ -383,44 +443,22 @@ public class RecurringExpenseService {
         mvRefresh.requestRefreshAfterCommit();
     }
 
-    // ── PROCESS SCHEDULED (chiamato dallo scheduler) ───────────────────────────
+    // ── PROCESS SCHEDULED — RIMOSSO il 2026-08-05 ─────────────────────────────
+    //
+    // Fino a questa data un job giornaliero (RecurringExpenseScheduler, cron 06:00) prendeva le rate
+    // scadute e le convertiva in movimenti REGISTRATI, marcandole PAID. Cioè: il gestionale dava per
+    // pagata una rata alla sua data di scadenza ANCHE SE la banca non aveva addebitato nulla. Se
+    // l'addebito slittava, cambiava importo o non arrivava, il dato era falso e nessuno se ne accorgeva.
+    //
+    // Ora la rata la conferma l'ESTRATTO CONTO:
+    //  - dall'import, azione COLLEGA sulla riga parcheggiata (ImportTriageService) → collegaRataDaImport,
+    //    che paga la rata con la data reale dell'addebito;
+    //  - oppure a mano dal dettaglio piano, bottone "Paga" → payInstallment.
+    // Finché nessuno conferma, la rata resta PENDING: la vedi nello Scadenzario e nel previsionale
+    // come uscita ATTESA, che è la verità.
+    //
+    // Vedi docs/specs/ricorrenti-collega-da-import.md.
 
-    @Transactional
-    public int processScheduledInstallments() {
-        List<RecurringExpenseInstallment> due = installmentRepo.findPendingDue(LocalDate.now());
-        int processed = 0;
-        for (RecurringExpenseInstallment rata : due) {
-            try {
-                RecurringExpensePlan plan = planRepo.findById(rata.pianoId);
-                if (plan == null || !"ATTIVO".equals(plan.stato)) continue;
-
-                if ("FINANZIAMENTO".equals(plan.tipoPiano) && rata.quotaCapitale != null) {
-                    Movimento mCap = buildMovimento(plan, rata.quotaCapitale, rata.dataScadenza,
-                            plan.createdBy, plan.descrizione + " – Rata " + rata.numeroRata + " (cap.)");
-                    em.persist(mCap);
-                    Movimento mInt = buildMovimentoInteressi(plan, rata.quotaInteressi, rata.dataScadenza,
-                            plan.createdBy, plan.descrizione + " – Rata " + rata.numeroRata + " (int.)");
-                    em.persist(mInt);
-                    em.flush();
-                    rata.stato                = "PAID";
-                    rata.movimentoId          = mCap.id;
-                    rata.movimentoInteressiId = mInt.id;
-                } else {
-                    Movimento m = buildMovimento(plan, rata.importo, rata.dataScadenza, plan.createdBy,
-                            plan.descrizione + " – Rata " + rata.numeroRata);
-                    em.persist(m);
-                    em.flush();
-                    rata.stato       = "PAID";
-                    rata.movimentoId = m.id;
-                }
-                processed++;
-            } catch (Exception e) {
-                log.warnf("Errore generazione movimento per rata %s: %s", rata.id, e.getMessage());
-            }
-        }
-        if (processed > 0) mvRefresh.requestRefreshAfterCommit();
-        return processed;
-    }
 
     // ── HELPERS ───────────────────────────────────────────────────────────────
 

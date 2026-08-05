@@ -14,9 +14,15 @@ import java.util.UUID;
  * importo corrisponde alla colonna importo_lordo nel DB, cioè l'importo effettivo
  * del movimento (netto commissioni quando applicabile).
  *
- * I totali sull'entità Evento (importo_incassato, caparre, costi_diretti) vengono
- * aggiornati AUTOMATICAMENTE dal trigger DB trg_z_aggiorna_totali_evento.
- * Non aggiornare l'evento da Java per evitare race condition e doppio scrittura.
+ * I totali sull'entità Evento (importo_incassato, caparre, costi_diretti) NON sono aggiornati da
+ * un trigger DB: il trigger trg_z_aggiorna_totali_evento è stato RIMOSSO in V20 e sostituito dal
+ * ricalcolo Java {@code EventiService#ricalcolaIncassi(Evento)}, che va chiamato dopo ogni flush()
+ * che tocca i movimenti di un evento. (La funzione fn_aggiorna_totali_evento() è rimasta in
+ * pg_proc ma non è agganciata a nessun trigger — verificato su pg_trigger il 2026-08-05.)
+ *
+ * Conseguenza da conoscere: modificare qui lo stato di un movimento di evento — per esempio
+ * annullarlo — NON riallinea da solo i totali dell'evento; il ricalcolo scatta alla mutazione
+ * successiva di quell'evento passando da EventiService.
  */
 @Entity
 @Table(name = "movimenti")

@@ -23,7 +23,14 @@ import static org.junit.jupiter.api.Assertions.*;
  * per scontrino elettronico non-agriturismo (categoria da Billy, conto da ripartizione), banche POS
  * NON contabilizzate, contanti su Cassa, coda testa esclusa per anno, coda fondo in attesa,
  * quadratura scomposta, idempotenza. Numeri reali §3: 20.769,38 / Σ_BPM 12.115,08 / Σ_CA 8.819,70 /
- * testa 230,00 / fondo 39,90 / contabilizzato 20.729,48 / residuo core 205,30.
+ * testa 230,00 / fondo 39,90 / contabilizzato 20.729,48.
+ *
+ * <p>⚠️ 2026-08-11: questo test descrive il modello PRE-A2 (ricavi POS creati dagli scontrini Billy,
+ * righe banca POS non contabilizzate). Il fix A2 del 09/08 l'ha rovesciato — le banche sono
+ * l'ossatura — quindi le sue asserzioni (2), (3) e la ripartizione proporzionale sono superate.
+ * Non fallisce solo perché le fixture di {@code esempi_input_per_ETL_new} non sono in repo e
+ * l'intera classe viene saltata. Va riscritto o cancellato: vedi TermometroLuglioIntegrationTest,
+ * che presidia lo stesso percorso sul modello attuale.
  */
 @QuarkusTest
 class EtlImportCongiuntoIntegrationTest {
@@ -134,7 +141,7 @@ class EtlImportCongiuntoIntegrationTest {
         // ── (7) QUADRATURA DI PERIODO persistita (V10) con i numeri reali §3 ──
         Object[] q = (Object[]) em.createNativeQuery(
                 "SELECT anno, billy_elettronico_non_agri, billy_contabilizzato, sigma_bpm, sigma_ca, "
-                + "coda_testa, coda_fondo, residuo_core, assegnato_bpm, assegnato_ca FROM quadratura_periodo WHERE import_log_id = :id")
+                + "coda_testa, coda_fondo, assegnato_bpm, assegnato_ca FROM quadratura_periodo WHERE import_log_id = :id")
                 .setParameter("id", logId).getSingleResult();
         assertEquals(2026, ((Number) q[0]).intValue());
         assertEquals(0, new BigDecimal("20769.38").compareTo((BigDecimal) q[1]), "Billy elettronico no-agri");
@@ -143,12 +150,11 @@ class EtlImportCongiuntoIntegrationTest {
         assertEquals(0, new BigDecimal("8819.70").compareTo((BigDecimal) q[4]), "Σ_CA core");
         assertEquals(0, new BigDecimal("230.00").compareTo((BigDecimal) q[5]), "coda testa (del 31/12/2025)");
         assertEquals(0, new BigDecimal("39.90").compareTo((BigDecimal) q[6]), "coda fondo in attesa di accredito");
-        assertEquals(0, new BigDecimal("205.30").compareTo((BigDecimal) q[7]), "residuo core");
-        // Ripartizione PROPORZIONALE: lo scarto (205,30) spalmato su entrambe (~0,98%), non tutto su CA.
-        assertEquals(0, new BigDecimal("11995.79").compareTo((BigDecimal) q[8]), "assegnato BPM (proporzionale)");
-        assertEquals(0, new BigDecimal("8733.69").compareTo((BigDecimal) q[9]), "assegnato CA (proporzionale)");
+        // (residuo_core non esiste più: era ≡ 0 per costruzione — V30, audit §8 #9)
+        assertEquals(0, new BigDecimal("11995.79").compareTo((BigDecimal) q[7]), "assegnato BPM (proporzionale)");
+        assertEquals(0, new BigDecimal("8733.69").compareTo((BigDecimal) q[8]), "assegnato CA (proporzionale)");
         // il totale ripartito torna sempre al contabilizzato
-        assertEquals(0, new BigDecimal("20729.48").compareTo(((BigDecimal) q[8]).add((BigDecimal) q[9])), "BPM+CA = contabilizzato");
+        assertEquals(0, new BigDecimal("20729.48").compareTo(((BigDecimal) q[7]).add((BigDecimal) q[8])), "BPM+CA = contabilizzato");
 
         // ── (7b) Endpoint getQuadratura: esercita il path SQL completo (CAST note/in_attesa + JSON) ──
         var dto = triageService.getQuadratura(logId);

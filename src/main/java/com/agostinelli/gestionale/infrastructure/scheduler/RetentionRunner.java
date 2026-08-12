@@ -40,10 +40,14 @@ public class RetentionRunner {
                 .setParameter("m", importMesi).executeUpdate();
     }
 
+    // Tiene la coda «Righe fuori dai conti» pendente: cancella solo le righe già decise.
+    // Senza questo filtro una coda che vale 1.189,55 € si svuoterebbe da sola dopo 3 mesi,
+    // senza che nessuno abbia deciso niente (SPEC righe-fuori-dai-conti.md, invariante I5).
     @Transactional(Transactional.TxType.REQUIRES_NEW)
     public int purgeScartati() {
         return em.createNativeQuery(
-                "DELETE FROM import_scartati WHERE created_at < now() - make_interval(months => :m)")
+                "DELETE FROM import_scartati WHERE created_at < now() - make_interval(months => :m)"
+                        + " AND stato <> 'DA_VEDERE'")
                 .setParameter("m", importMesi).executeUpdate();
     }
 

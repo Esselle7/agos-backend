@@ -39,6 +39,9 @@ public class MovimentiResource {
     @Inject com.agostinelli.gestionale.movimenti.importlayer.ImportTriageService triageService;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService keywordService;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.MatchingDifferitiService matchingDifferitiService;
+    // AUDIT-TEMP: registro decisionale dell'import su file. Vedi ImportAuditLog per come si spegne
+    // e si cancella tutto (questi 3 endpoint spariscono insieme alla classe).
+    @Inject com.agostinelli.gestionale.movimenti.importlayer.ImportAuditLog auditLog;
 
     /**
      * Filtri avanzati (docs/specs/movimenti-filtri-avanzati.md).
@@ -167,7 +170,8 @@ public class MovimentiResource {
 
     // ── Import ETL CONGIUNTO (Billy + BPM + CA) ───────────────────────────────────────
     // L'import single-file (billy/bpm/ca) è stato RIMOSSO (PROMPT-KEYWORD-LEARNING.md §4.9):
-    // si importa solo congiunto. Il metodo interno importFile resta per i test (non più REST).
+    // si importa solo congiunto. Anche il metodo interno importFile è stato cancellato il
+    // 2026-08-11 (104 righe vive per un solo test) — audit-catena-import §6.2/5.
 
     /**
      * Import ETL CONGIUNTO: i 3 file (Billy + BPM + CA) dello stesso periodo, OBBLIGATORI,
@@ -229,6 +233,15 @@ public class MovimentiResource {
             @Context SecurityContext ctx) {
         UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
         importLogService.classificaAmbiguita(id, req, userId);
+        return Response.noContent().build();
+    }
+
+    /** "Va che è un evento": sposta la riga ambigua nella coda degli incassi-evento. */
+    @PUT
+    @Path("/import/ambiguita/{id}/e-un-evento")
+    @RolesAllowed("ADMIN")
+    public Response ambiguitaEUnEvento(@PathParam("id") UUID id, @Context SecurityContext ctx) {
+        importLogService.promuoviAEvento(id, UUID.fromString(ctx.getUserPrincipal().getName()));
         return Response.noContent().build();
     }
 
@@ -301,6 +314,35 @@ public class MovimentiResource {
         return Response.noContent().build();
     }
 
+    /** Rami storicamente usati per ogni conto: il wizard chiede la BU solo quando ce n'è più d'uno. */
+    @GET
+    @Path("/import/bu-per-coge")
+    @RolesAllowed("ADMIN")
+    public java.util.Map<Integer, java.util.List<Short>> buPerCoge() {
+        return triageService.buPerCoge();
+    }
+
+    // ── Pannello BU dell'import: rifinitura manuale della classificazione analitica ──
+    // Gli "incerti" (conto CoGe transitorio) arrivano in un gruppo a parte: sono il lavoro.
+
+    @GET
+    @Path("/import/{importLogId}/bu")
+    @RolesAllowed("ADMIN")
+    public BuPanelDTO buPanel(@PathParam("importLogId") UUID importLogId) {
+        return triageService.getBuPanel(importLogId);
+    }
+
+    /** Sposta un movimento dell'import su un'altra BU. Dimensione analitica: nessun saldo si muove. */
+    @PUT
+    @Path("/import/{importLogId}/bu/{movimentoId}")
+    @RolesAllowed("ADMIN")
+    public Response cambiaBu(@PathParam("importLogId") UUID importLogId,
+                             @PathParam("movimentoId") UUID movimentoId,
+                             @Valid CambiaBusinessUnitRequest req) {
+        triageService.cambiaBusinessUnit(importLogId, movimentoId, req.businessUnitId());
+        return Response.noContent().build();
+    }
+
     // ── Centro smistamento: eventi parcheggiati ──────────────────────────────────
 
     @GET
@@ -323,6 +365,33 @@ public class MovimentiResource {
         UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
         triageService.risolviEvento(id, req, userId);
         return Response.noContent().build();
+    }
+
+    // ── AUDIT-TEMP: traccia decisionale dell'import (file .txt) ───────────────────────
+
+    /** Elenco dei file di audit prodotti dagli import. */
+    @GET
+    @Path("/import/audit-log")
+    public List<com.agostinelli.gestionale.movimenti.importlayer.ImportAuditLog.FileAudit> auditLogList() {
+        return auditLog.elenco();
+    }
+
+    /** Contenuto di un file di audit, da leggere così com'è. */
+    @GET
+    @Path("/import/audit-log/{nome}")
+    @Produces(MediaType.TEXT_PLAIN)
+    public Response auditLogFile(@PathParam("nome") String nome) {
+        String testo = auditLog.contenuto(nome);
+        return testo == null ? Response.status(Response.Status.NOT_FOUND).build()
+                             : Response.ok(testo).build();
+    }
+
+    /** Cancella TUTTI i file di audit prodotti: è la pulizia di fine indagine. */
+    @DELETE
+    @Path("/import/audit-log")
+    public Response auditLogPulisci() {
+        int n = auditLog.cancellaTutto();
+        return Response.ok(java.util.Map.of("cancellati", n)).build();
     }
 
     // ── Parcheggio spese ricorrenti / finanziamenti (V9) ──────────────────────────────
@@ -375,16 +444,32 @@ public class MovimentiResource {
         return Response.noContent().build();
     }
 
-    // ── Vista Effetti / RiBa da catalogare (transitori filtrati) ──────────────────────
+    // ── Coda «Righe fuori dai conti» (audit §7.4): righe bancarie escluse dalla pipeline ──
+    //    (SKIP_POS, SKIP_CODA_TESTA, SKIP_GIROCONTO). Sono denaro fuori dai conti finché
+    //    qualcuno non le guarda: «Mettila nei conti» crea il movimento, «Lasciala fuori» chiude.
 
     @GET
-    @Path("/import/transitori/riba")
+    @Path("/import/scartati")
     @RolesAllowed("ADMIN")
-    public PagedResponse<TransitorioDTO> listRibaTransitori(
+    public PagedResponse<ScartatoDTO> listScartati(
+            @QueryParam("stato") @DefaultValue("DA_VEDERE") String stato,
             @QueryParam("page") @DefaultValue("0") int page,
             @QueryParam("size") @DefaultValue("20") int size) {
-        return triageService.listRibaTransitori(page, Math.min(Math.max(size, 1), MAX_TRIAGE_SIZE));
+        return triageService.listScartati(stato, page, Math.min(Math.max(size, 1), MAX_TRIAGE_SIZE));
     }
+
+    @PUT
+    @Path("/import/scartati/{id}/risolvi")
+    @RolesAllowed("ADMIN")
+    public Response risolviScartato(@PathParam("id") UUID id, RisolviScartatoRequest req,
+                                    @Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        triageService.risolviScartato(id, req, userId);
+        return Response.noContent().build();
+    }
+
+    // La vista Effetti/RiBa separata è cancellata (audit §7.7): quelle righe sono uscite da
+    // catalogare come le altre e ora compaiono in /import/transitori.
 
     // ── Pannello di quadratura di periodo (sostituisce "Incassi POS da ripartire") ──────
     // PROMPT-RICONCILIAZIONE-PERIODO §5: i ricavi POS nascono da Billy; qui si mostra solo il

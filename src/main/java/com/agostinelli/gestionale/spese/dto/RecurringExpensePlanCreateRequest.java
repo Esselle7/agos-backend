@@ -39,6 +39,11 @@ public record RecurringExpensePlanCreateRequest(
 
     String note,
 
+    // Testo con cui l'import riconosce l'addebito in estratto conto (mandato SDD, creditore,
+    // n. contratto). Opzionale: se vuoto si usano i token del nome del piano.
+    @Size(max = 120)
+    String riferimentoEstrattoConto,
+
     @Pattern(regexp = "FLAT|FINANZIAMENTO")
     String tipoPiano,              // default "FLAT" se null
 

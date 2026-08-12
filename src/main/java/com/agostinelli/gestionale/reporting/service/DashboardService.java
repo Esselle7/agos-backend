@@ -72,6 +72,9 @@ public class DashboardService {
                 "LEFT JOIN movimenti m ON m.conto_bancario_id = cb.id " +
                 "  AND m.stato != 'ANNULLATO' " +
                 "  AND m.data_finanziaria IS NOT NULL " +
+                // V24: "saldo AL giorno X" = conta solo ciò che si muove DOPO quel giorno.
+                "  AND (cb.data_saldo_iniziale IS NULL " +
+                "       OR COALESCE(m.data_finanziaria, m.data_movimento) > cb.data_saldo_iniziale) " +
                 "WHERE cb.is_active = true " +
                 "GROUP BY cb.id, cb.saldo_iniziale " +
                 "ORDER BY cb.id")

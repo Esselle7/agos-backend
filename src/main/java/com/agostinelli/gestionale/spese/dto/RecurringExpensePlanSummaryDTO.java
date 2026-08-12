@@ -18,6 +18,8 @@ public record RecurringExpensePlanSummaryDTO(
     int         numeroRate,
     LocalDate   dataPrimaRata,
     String      stato,
+    /** Testo con cui l'import riconosce l'addebito di questa rata (null = si usa il nome). */
+    String      riferimentoEstrattoConto,
     // riepilogo rate
     int         ratePending,
     int         ratePaid,

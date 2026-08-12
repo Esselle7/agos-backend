@@ -627,10 +627,15 @@ class EventiIntegrationTest {
                 .body("code", equalTo("EVENTO_SALDATO"));
     }
 
+    /**
+     * I3 (rivisto 2026-08-08): una caparra pagata in due tranche è legittima — il vincolo
+     * "max 1 CAPARRA/ACCONTO/SALDO per evento" è stato rimosso. Il test difende sia
+     * l'accettazione sia la somma: due CAPARRA devono sommarsi, non sovrascriversi.
+     */
     @Test
     @Order(77)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
-    void doppiaCaparra_409() {
+    void doppiaCaparra_ammessa_eSiSomma() {
         String id = creaEventoConfermato("Evento Doppia Caparra", "2000");
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("CAPARRA", "500.00"))
@@ -641,8 +646,49 @@ class EventiIntegrationTest {
             .body(buildPagamentoRequest("CAPARRA", "300.00"))
             .when().post("/api/eventi/" + id + "/pagamenti")
             .then()
+                .statusCode(201)
+                .body("tipo", equalTo("CAPARRA"));
+
+        given()
+            .when().get("/api/eventi/" + id)
+            .then()
+                .body("importoIncassato", equalTo(800.0f))
+                .body("importoResiduo",   equalTo(1200.0f))
+                .body("stato",            equalTo("CONFERMATO"));
+
+        // Terza tranche che chiude il residuo: l'auto-transizione a SALDATO resta viva
+        // anche con più pagamenti dello stesso tipo.
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("CAPARRA", "1200.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        given()
+            .when().get("/api/eventi/" + id)
+            .then()
+                .body("importoIncassato", equalTo(2000.0f))
+                .body("stato",            equalTo("SALDATO"));
+    }
+
+    /**
+     * L'unicità è caduta, il tetto sul residuo no: la quarta tranche che sfonda il
+     * preventivato deve continuare a essere rifiutata (guardia percorso-soldi).
+     */
+    @Test
+    @Order(78)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void tranceMultipleOltreIlResiduo_409() {
+        String id = creaEventoConfermato("Evento Tranche Oltre Residuo", "1000");
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("ACCONTO", "600.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("ACCONTO", "500.00"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
                 .statusCode(409)
-                .body("code", equalTo("PAGAMENTO_GIA_PRESENTE"));
+                .body("code", equalTo("IMPORTO_SUPERA_RESIDUO"));
     }
 
     // ── 9. Pagamenti – RIMBORSO ───────────────────────────────────────────────

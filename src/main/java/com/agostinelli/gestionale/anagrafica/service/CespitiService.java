@@ -209,6 +209,8 @@ public class CespitiService {
                                                              ELSE 0 END), 0)
                 FROM conti_bancari cb
                 LEFT JOIN movimenti m ON m.conto_bancario_id = cb.id AND m.stato <> 'ANNULLATO'
+                  AND (cb.data_saldo_iniziale IS NULL
+                       OR COALESCE(m.data_finanziaria, m.data_movimento) > cb.data_saldo_iniziale)
                 WHERE cb.id = :id
                 GROUP BY cb.tipo, cb.saldo_iniziale
                 """).setParameter("id", contoBancarioId).getResultList();

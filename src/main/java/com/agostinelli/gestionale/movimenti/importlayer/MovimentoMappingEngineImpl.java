@@ -31,6 +31,8 @@ public class MovimentoMappingEngineImpl {
     @Inject EntityManager em;
     @Inject RegoleClassificazioneEngine regoleEngine;
     @Inject KeywordClassificazioneEngine keywordEngine;
+    @Inject RataMatchService matchService;
+    @Inject ImportAuditLog audit;   // AUDIT-TEMP
 
     // COGE per codice (mai hardcodare l'ID)
     private static final String COGE_CARNE_10 = "30.03.001";
@@ -53,9 +55,17 @@ public class MovimentoMappingEngineImpl {
     // NON sono più hardcoded: provengono dalle firme DOMINIO azione=PARK_EVENTO (editabili da UI)
     // via KeywordClassificazioneEngine. Vedi PROMPT-KEYWORD-LEARNING.md §3.2/§4.3.
 
-    // Data evento best-effort: prima occorrenza gg/mm/aaaa (o gg.mm.aaaa) nella descrizione.
+    // Data evento best-effort: prima occorrenza gg/mm/aaaa (gg.mm.aaaa, gg-mm-aaaa).
     private static final Pattern EVENTO_DATE = Pattern.compile(
-            "\\b(\\d{1,2})[/.](\\d{1,2})[/.](\\d{2,4})\\b");
+            "\\b(\\d{1,2})[/.\\-](\\d{1,2})[/.\\-](\\d{2,4})\\b");
+
+    // Gli estratti conto vanno a capo dentro la causale e l'a capo arriva qui come spazio:
+    // "12 LUGLIO 202 6", "28.06. 26", "18.09 .26", "8/7/202 6". Prima di cercare la data si
+    // richiudono SOLO gli spazi che stanno fra due caratteri da data (cifre e separatori):
+    // "202 6" -> "2026". Misurato su 198 descrizioni della copia di produzione del 07/08/2026:
+    // 5 differenze, tutte correzioni, 0 date nuove sbagliate. Senza questa chiusura
+    // "8/7/202 6" veniva letto come anno 202 (LocalDate.of(202,7,8) non solleva nulla).
+    private static final Pattern SPAZI_DENTRO_DATA = Pattern.compile("(?<=[0-9./\\-])[ ]+(?=[0-9./\\-])");
 
     // Data evento in forma testuale italiana: "7 MARZO 2026". I bonifici esteri/SEPA in
     // entrata riportano spesso la causale per esteso (niente "BON.DA", data a parole),
@@ -65,6 +75,23 @@ public class MovimentoMappingEngineImpl {
             "LUGLIO", "AGOSTO", "SETTEMBRE", "OTTOBRE", "NOVEMBRE", "DICEMBRE");
     private static final Pattern EVENTO_DATE_TESTUALE = Pattern.compile(
             "\\b(\\d{1,2})\\s+(" + String.join("|", MESI_IT) + ")\\s+(\\d{4})\\b");
+
+    // Data evento SENZA anno: il cliente scrive "SALDO EVENTO 6/07", "ACCONTO EVENTO 5 DICEMBRE".
+    // Si accetta solo se ancorata a un marcatore di pagamento-evento entro 40 caratteri non
+    // numerici, perché una coppia di numeri isolata è rumore: nel bonifico estero
+    // "BONIFICO IN ENTRATA - 02-02 00650071 ... ACCONTO FESTA 7 MARZO 2026" il "02-02" senza
+    // ancora batteva (sta più a sinistra) la data vera scritta per esteso.
+    // L'anno non si inventa: lo dà la data del movimento bancario (vedi extractEventoDate).
+    // Misurato su 1096 descrizioni bancarie reali (BPM/CA luglio 2026 + storico gen-giu in
+    // esempi_dati_storici/ + descrizioni a DB): date estratte 349 -> 363, cioe' 14 nuove,
+    // 2 cambiate (entrambe correzioni), 0 perse, 0 falsi positivi. L'anno opzionale OVUNQUE,
+    // misurato in alternativa, dava 28 nuove ma 3 cambiate con falsi positivi sui riferimenti
+    // SEPA. Vedi docs/adr/007-data-evento-senza-anno.md.
+    private static final String MARCATORE_EVENTO = "(?:EVENTO|SALDO|ACCONTO|CAPARRA|AFFITTO|FESTA)";
+    private static final Pattern EVENTO_DATE_SENZA_ANNO = Pattern.compile(
+            MARCATORE_EVENTO + "[^0-9]{0,40}(\\d{1,2})[/.\\-](\\d{1,2})(?![/.\\-]?\\d)");
+    private static final Pattern EVENTO_DATE_TESTUALE_SENZA_ANNO = Pattern.compile(
+            MARCATORE_EVENTO + "[^0-9]{0,40}(\\d{1,2})\\s+(" + String.join("|", MESI_IT) + ")\\b(?!\\s+\\d{4})");
 
     private volatile boolean loaded = false;
     private final Map<String, Integer> cogeByCode = new HashMap<>();
@@ -97,6 +124,10 @@ public class MovimentoMappingEngineImpl {
 
         // ── REGOLE DATA-DRIVEN (priorità) — ETL v2 §9: valutate PRIMA dei gate ──
         RegoleClassificazioneEngine.Match rule = regoleEngine.evaluate(n, sorgente);
+        audit.passo("[1] REGOLE", rule == null
+                ? "nessuna regola data-driven ha fatto match"
+                : "match regola → azione " + rule.azione()
+                  + (rule.cogeCodice() != null ? " (coge=" + rule.cogeCodice() + ", bu=" + rule.buId() + ")" : ""));
         Classify cl;
         String via; // traccia del percorso decisionale (per il log per-import)
         if (rule != null && !"MAP".equals(rule.azione())) {
@@ -108,7 +139,7 @@ public class MovimentoMappingEngineImpl {
                 case "SKIP_RICORRENTE" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_RICORRENTE, n)
                         .withTrace("REGOLA DATA-DRIVEN → SKIP_RICORRENTE");
                 case "PARK_EVENTO" -> MappingResult.parkEvento(
-                        buildPark(safe(n.descrizione()), safe(n.descCompact())), n)
+                        buildPark(safe(n.descrizione()), safe(n.descCompact()), n.dataMovimento()), n)
                         .withTrace("REGOLA DATA-DRIVEN → PARK_EVENTO");
                 default -> MappingResult.ambiguous("AZIONE_REGOLA_SCONOSCIUTA", n)
                         .withTrace("REGOLA DATA-DRIVEN → azione sconosciuta: " + rule.azione());
@@ -131,9 +162,18 @@ public class MovimentoMappingEngineImpl {
             if (n.girosalto() != null) {
                 cl = classifyGirosalto(n, sorgente);
                 via = "GIROSALTO → " + n.girosalto();
+                audit.passo("[3] GIRO", "riga marcata come " + n.girosalto()
+                        + " → conto patrimoniale " + codeOf(cl.cogeId) + " (fuori P&L)");
             } else {
                 // ── GATE B — parcheggio eventi (ETL v2 §5) ──
                 ParkEvento park = gateB(n, sorgente);
+                audit.passo("[6] GATE B", park == null
+                        ? ("nessun incasso-evento riconosciuto" + ("ENTRATA".equals(n.tipo())
+                            ? " (nessuna keyword evento forte/debole con contesto)" : " (solo le ENTRATE possono esserlo)"))
+                        : "incasso-evento riconosciuto: keyword=" + park.keywordMatch()
+                          + ", tipo presunto=" + park.tipoEventoPresunto()
+                          + ", data evento estratta=" + park.dataEventoEstratta()
+                          + " (la controparte la legge la coda dal movimento normalizzato)");
                 if (park != null) {
                     return MappingResult.parkEvento(park, n).withTrace(
                             "GATE B → PARK_EVENTO (kw=" + park.keywordMatch()
@@ -142,6 +182,12 @@ public class MovimentoMappingEngineImpl {
                 boolean entrata = "ENTRATA".equals(n.tipo());
                 cl = entrata ? classifyEntrata(n, sorgente) : classifyUscita(n, sorgente);
                 via = "GATE C → " + (entrata ? "classifyEntrata" : "classifyUscita");
+                audit.passo("[7] COGE", (entrata ? "classifyEntrata" : "classifyUscita") + " → conto "
+                        + codeOf(cl.cogeId) + " · BU " + cl.bu
+                        + (cl.fornitoreId != null ? " · fornitore riconosciuto da alias" : " · nessun fornitore")
+                        + (cl.aliquota != null ? " · IVA " + cl.aliquota : "")
+                        + (cl.keywordConflittoSig != null ? " · CONFLITTO KEYWORD " + cl.keywordConflittoSig : "")
+                        + (cl.motivo != null ? " · AMBIGUA: " + cl.motivo : ""));
             }
         }
 
@@ -155,6 +201,9 @@ public class MovimentoMappingEngineImpl {
 
         // ── Validazione invarianti (§6.1) ──
         String motivo = validate(n, metodoCodice, metodoId, cl);
+        audit.passo("[7] VALID", motivo == null
+                ? "invarianti ok (metodo=" + metodoCodice + ")"
+                : "violata: " + motivo + " → la riga finisce in import_ambiguita");
         if (motivo != null) {
             return MappingResult.ambiguous(motivo, n).withTrace(via + " → AMBIGUOUS (validazione): " + motivo);
         }
@@ -282,7 +331,10 @@ public class MovimentoMappingEngineImpl {
      * degli incassi POS e non contiene spese ricorrenti.
      */
     private MappingResult.MappingOutcome gateA(RawMovimento n, String sorgente) {
-        if (Sorgente.BILLY.equals(sorgente)) return null; // Billy non ha giroconti né POS duplicati
+        if (Sorgente.BILLY.equals(sorgente)) {
+            audit.passo("[2] GATE A", "saltato: Billy è la fonte originale (niente POS duplicati né giroconti)");
+            return null;
+        }
 
         String desc = n.descrizione() == null ? "" : n.descrizione();
         String causale = upperCausale(n);
@@ -291,7 +343,10 @@ public class MovimentoMappingEngineImpl {
         // il payout Satispay riporta in descrizione il beneficiario "SOCIETA AGRICOLA
         // AGOSTINELLI", la stessa stringa che marca i trasferimenti interni; senza questa
         // precedenza verrebbe scartato come SKIP_GIROCONTO invece che SKIP_POS.
-        if (desc.contains("SATISPAY EUROPE")) return MappingResult.MappingOutcome.SKIP_POS;
+        if (desc.contains("SATISPAY EUROPE")) {
+            audit.passo("[2] GATE A1", "«SATISPAY EUROPE» in descrizione → SKIP_POS (duplicato di Billy)");
+            return MappingResult.MappingOutcome.SKIP_POS;
+        }
 
         // A2 — i giroconti NON sono più uno scarto: il normalizzatore li marca (girosalto)
         // e map() li contabilizza sul CoGe patrimoniale 10.03.x (classifyGirosalto).
@@ -302,9 +357,13 @@ public class MovimentoMappingEngineImpl {
                 return MappingResult.MappingOutcome.SKIP_POS;
             }
         } else if (Sorgente.BPM.equals(sorgente)) {
-            if ("090".equals(causale) || "092".equals(causale)
-                    || desc.contains("INC.POS") || desc.contains("INCAS. TRAMITE P.O.S")
-                    || desc.contains("NUMIA")) {
+            // Solo le ENTRATE possono essere un incasso POS. Le USCITE che nominano Numia sono le
+            // commissioni del gestore POS (causale 660, "spese - commissioni …"): scartarle come
+            // SKIP_POS faceva sparire denaro realmente uscito dal conto (2 righe, 36,60 € a luglio).
+            if ("ENTRATA".equals(n.tipo())
+                    && ("090".equals(causale) || "092".equals(causale)
+                        || desc.contains("INC.POS") || desc.contains("INCAS. TRAMITE P.O.S")
+                        || desc.contains("NUMIA"))) {
                 return MappingResult.MappingOutcome.SKIP_POS;
             }
             // POS che arriva come bonifico (causale 480 + accredito Nexi)
@@ -313,8 +372,34 @@ public class MovimentoMappingEngineImpl {
             }
         }
 
+        audit.passo("[2] GATE A1", "non è POS/Satispay (causale=" + causale + ")");
+
         // A3 — spese ricorrenti / finanziamenti (fallback keyword editabile)
-        if (isRicorrente(desc)) return MappingResult.MappingOutcome.SKIP_RICORRENTE;
+        boolean kw = isRicorrente(desc);
+        audit.passo("[4] GATE A3", kw
+                ? "keyword ricorrente trovata nella descrizione → SKIP_RICORRENTE (parcheggio)"
+                : "nessuna keyword ricorrente (ASSICURAZ/POLIZZA/MUTUO/LEASING/FINANZIAMENTO/ASCONFIDI/RATA)");
+        if (kw) return MappingResult.MappingOutcome.SKIP_RICORRENTE;
+
+        // A3-bis — match STRUTTURATO contro i piani ricorrenti attivi: intercetta le rate che
+        // nessuna parola chiave descrive (SDD Enel/Telepass/Nexi). Senza piani attivi non fa
+        // nulla e il comportamento resta quello della sola rete a keyword (SPEC R5).
+        if ("USCITA".equals(n.tipo())) {
+            var piani = matchService.pianiAttivi();
+            boolean somiglia = RataMatcher.somigliaARata(n.contoBancarioId(), n.importo(), desc, piani);
+            if (audit.attivo()) {
+                audit.passo("[5] GATE A3-bis", "confronto con " + piani.size() + " piani ricorrenti ATTIVI:");
+                for (String d : RataMatcher.diagnostica(n.contoBancarioId(), n.importo(), desc, piani)) {
+                    audit.dettaglio(d);
+                }
+                audit.passo("[5] GATE A3-bis", somiglia
+                        ? "almeno un piano aggancia → SKIP_RICORRENTE (parcheggio, mai contabilizzata da sola)"
+                        : "nessun piano aggancia → la riga prosegue verso la contabilizzazione");
+            }
+            if (somiglia) return MappingResult.MappingOutcome.SKIP_RICORRENTE;
+        } else {
+            audit.passo("[5] GATE A3-bis", "saltato: solo le USCITE possono essere rate");
+        }
 
         return null;
     }
@@ -349,13 +434,24 @@ public class MovimentoMappingEngineImpl {
     /**
      * Fallback keyword per le ricorrenti (ETL v2 §4 A3). NOTA: {@code AFFITTO} è
      * volutamente escluso finché il Gate B (eventi) non distingue "AFFITTO SALA"
-     * (evento) dall'affitto-non-evento. Il match strutturato contro le ricorrenze
-     * attive del modulo dedicato arriverà in una fase successiva.
+     * (evento) dall'affitto-non-evento. Resta come rete per le rate di piani non ancora
+     * creati: il match strutturato contro i piani attivi è in A3-bis ({@link RataMatcher}).
      */
     private boolean isRicorrente(String desc) {
-        if (desc.contains("CANONE") || desc.contains("ASSICURAZ") || desc.contains("POLIZZA")
+        // ⚠️ DUPLICAZIONE NOTA (audit-catena-import-2026-08-11.md §6.2/4, intervento §8 #5):
+        // questa lista vive anche a DB, nelle regole 1 (CA) e 2 (BPM) di regole_classificazione
+        // (pattern IN_LIST, azione SKIP_RICORRENTE, priorità 30 → valutate PRIMA di qui). Toccarne
+        // una sola lascia il motore incoerente: la scheda A4 del 09/08 dovette correggerle
+        // entrambe. Unica differenza voluta: \bRATA\b esiste solo qui, ed è la rete per le righe
+        // che dicono «RATA» senza nominare il tipo di finanziamento. Non si toglie: con zero piani
+        // in archivio è l'unica protezione attiva (A3-bis non ha nulla da confrontare).
+        //
+        // CANONE e BOLLO sono usciti dalla lista (V28): sono spese bancarie ricorrenti ma NON piani
+        // di ammortamento, e classifyUscita le manda già su 40.02.002. Tenerle qui faceva parcheggiare
+        // bolli da 29,42 € chiedendo all'operatore di creare un piano (5 righe / 98,94 € a luglio 2026).
+        if (desc.contains("ASSICURAZ") || desc.contains("POLIZZA")
                 || desc.contains("MUTUO") || desc.contains("LEASING")
-                || desc.contains("FINANZIAMENTO") || desc.contains("BOLLO")
+                || desc.contains("FINANZIAMENTO")
                 || desc.contains("ASCONFIDI")) {
             return true;
         }
@@ -363,6 +459,22 @@ public class MovimentoMappingEngineImpl {
     }
 
     // ── GATE B — parcheggio eventi (PARK_EVENTO, ETL v2 §5) ────────────────────
+
+    /**
+     * Contesto "fattura" che spegne il Gate B. Era {@code contains("FATT")}: agganciava la ragione
+     * sociale del cliente — «ORD:FATTI DI SETA … ACCONTO PER EVENTO AZIENDALE DEL 17/05/26» non
+     * veniva parcheggiato come incasso-evento. Misurato sul corpus gen–giu 2026: 2 falsi positivi
+     * su 6 ENTRATE contenenti «FATT» (audit-catena-import-2026-08-11.md §6.2/1, intervento §8 #4).
+     * Ora servono la parola intera o l'abbreviazione col punto: FATTURA / FATTURE / FATT.
+     */
+    private static final Pattern FATTURA_CTX = Pattern.compile("\\bFATT(URA|URE|\\.)");
+
+    /** Package-private per il test: è la riga che decide se il Gate B si spegne. */
+    boolean fatturaCtx(String descrizione) {
+        String d = descrizione == null ? "" : descrizione;
+        return FATTURA_CTX.matcher(d).find() || d.contains("DOCUM") || d.contains("NOTA CREDITO");
+    }
+
     /**
      * Restituisce i metadati evento se la riga va parcheggiata, altrimenti null.
      * Solo le ENTRATE possono essere eventi. Riconoscimento robusto:
@@ -376,8 +488,7 @@ public class MovimentoMappingEngineImpl {
 
         String spaced = n.descrizione() == null ? "" : n.descrizione();
         String compact = n.descCompact() == null ? "" : n.descCompact();
-        boolean fatturaCtx = spaced.contains("FATTURA") || spaced.contains("FATT")
-                || spaced.contains("DOCUM") || spaced.contains("NOTA CREDITO");
+        boolean fatturaCtx = fatturaCtx(spaced);
 
         java.util.Set<String> forti = keywordEngine.eventiForti();
         java.util.Set<String> deboli = keywordEngine.eventiDeboli();
@@ -385,28 +496,37 @@ public class MovimentoMappingEngineImpl {
         if (Sorgente.BILLY.equals(sorgente)) {
             if (!positive(n.billyAgriturismo())) {
                 // Billy non-agri: parcheggia solo su keyword evento esplicita (forte)
-                return (!fatturaCtx && containsAny(compact, forti)) ? buildPark(spaced, compact) : null;
+                return (!fatturaCtx && containsAny(compact, forti)) ? buildPark(spaced, compact, n.dataMovimento()) : null;
             }
             // Agriturismo>0: evento salvo carve-out (gestiti in classifyEntrata)
             if (isPosIncasso(spaced) || "SATISPAY".equals(n.metodoPagamentoCodice())) return null;
             if (compact.contains("KAIROS")) return null;
-            return buildPark(spaced, compact);
+            return buildPark(spaced, compact, n.dataMovimento());
         }
 
         // Banca (CA / BPM)
         if (fatturaCtx) return null;
-        if (containsAny(compact, forti)) return buildPark(spaced, compact);
-        if (containsAny(compact, deboli) && hasEventoContext(n)) return buildPark(spaced, compact);
+        if (containsAny(compact, forti)) return buildPark(spaced, compact, n.dataMovimento());
+        if (containsAny(compact, deboli) && hasEventoContext(n)) return buildPark(spaced, compact, n.dataMovimento());
         return null;
     }
 
     /** Contesto evento: ordinante (persona fisica) presente o data nella descrizione. */
     private boolean hasEventoContext(RawMovimento n) {
         if (n.entita() != null && n.entita().ordinante() != null) return true;
-        return extractEventoDate(n.descrizione()) != null;
+        return extractEventoDate(n.descrizione(), n.dataMovimento()) != null;
     }
 
-    private ParkEvento buildPark(String spaced, String compact) {
+    /**
+     * Estrae i segnali evento (tipo presunto, keyword, data) da una descrizione già normalizzata.
+     * Riusata dal triage quando l'operatore dichiara che una riga finita in ambiguità è in realtà
+     * un incasso-evento: l'euristica dev'essere la stessa del Gate B, non una copia divergente.
+     */
+    public ParkEvento estraiSegnaliEvento(String descrizione, String descCompact, LocalDate dataMovimento) {
+        return buildPark(safe(descrizione), safe(descCompact), dataMovimento);
+    }
+
+    private ParkEvento buildPark(String spaced, String compact, LocalDate dataMovimento) {
         String tipo;
         String keyword;
         if (compact.contains("CAPARRA")) { tipo = "CAPARRA"; keyword = "CAPARRA"; }
@@ -414,7 +534,7 @@ public class MovimentoMappingEngineImpl {
         else if (compact.contains("AFFITTOSALA") || compact.contains("AFFITTO")) { tipo = "AFFITTO_SALA"; keyword = "AFFITTO"; }
         else if (compact.contains("SALDO")) { tipo = "SALDO"; keyword = "SALDO"; }
         else { tipo = null; keyword = firstMatch(compact, keywordEngine.eventiForti()); }
-        return new ParkEvento(tipo, keyword, extractEventoDate(spaced));
+        return new ParkEvento(tipo, keyword, extractEventoDate(spaced, dataMovimento));
     }
 
     private boolean isPosIncasso(String spaced) {
@@ -433,32 +553,84 @@ public class MovimentoMappingEngineImpl {
         return null;
     }
 
-    private LocalDate extractEventoDate(String descrizione) {
+    /**
+     * Data evento dalla causale, best-effort.
+     *
+     * <p>Vince la data che compare <b>più a sinistra</b>, numerica o testuale che sia: la
+     * causale scritta dal cliente ("EVENTO DOMENICA 12 LUGLIO 2026") precede sempre i
+     * timestamp che la banca appende in coda ("SCT ISTANTANEO DEL 18/07/2026 ORE 13:14").
+     * Preferire sempre il formato numerico, come faceva prima, significava preferire il
+     * timestamp bancario: misurato su LO MONACO VANESSA 274,00 → data evento 18/07 invece
+     * di 12/07, cioè l'evento sbagliato proposto all'operatore.
+     *
+     * <p>Quattro forme concorrono, tutte sulla stessa regola "vince la più a sinistra":
+     * gg/mm/aaaa, "7 MARZO 2026", e le due forme <b>senza anno</b> ancorate a un marcatore
+     * di pagamento-evento ("SALDO EVENTO 6/07", "ACCONTO EVENTO 5 DICEMBRE").
+     *
+     * @param riferimento data del movimento bancario: dà l'anno alle date scritte senza.
+     *                    Se è {@code null} le forme senza anno sono ignorate — l'anno non
+     *                    si inventa, e senza anno la data non identifica nessun evento.
+     */
+    // package-private: pura funzione di parsing, testata da MovimentoMappingEngineDateTest
+    LocalDate extractEventoDate(String descrizione, LocalDate riferimento) {
         if (descrizione == null) return null;
-        Matcher m = EVENTO_DATE.matcher(descrizione);
-        if (m.find()) {
-            try {
-                int d = Integer.parseInt(m.group(1));
-                int mo = Integer.parseInt(m.group(2));
-                int y = Integer.parseInt(m.group(3));
-                if (y < 100) y += 2000;
-                return LocalDate.of(y, mo, d);
-            } catch (Exception ignored) {
-                // formato numerico non valido (es. 32/13/2026): provo quello testuale
-            }
+        String s = SPAZI_DENTRO_DATA.matcher(descrizione).replaceAll("");
+
+        Candidata migliore = null;
+        migliore = piuASinistra(migliore, prima(EVENTO_DATE, s,
+                m -> toDate(m.group(3), m.group(2), m.group(1))));
+        migliore = piuASinistra(migliore, prima(EVENTO_DATE_TESTUALE, s,
+                m -> toDate(m.group(3), mese(m.group(2)), m.group(1))));
+        if (riferimento != null) {
+            String anno = String.valueOf(riferimento.getYear());
+            migliore = piuASinistra(migliore, prima(EVENTO_DATE_SENZA_ANNO, s,
+                    m -> toDate(anno, m.group(2), m.group(1))));
+            migliore = piuASinistra(migliore, prima(EVENTO_DATE_TESTUALE_SENZA_ANNO, s,
+                    m -> toDate(anno, mese(m.group(2)), m.group(1))));
         }
-        Matcher mt = EVENTO_DATE_TESTUALE.matcher(descrizione);
-        if (mt.find()) {
-            try {
-                int d = Integer.parseInt(mt.group(1));
-                int mo = MESI_IT.indexOf(mt.group(2)) + 1;
-                int y = Integer.parseInt(mt.group(3));
-                return LocalDate.of(y, mo, d);
-            } catch (Exception ignored) {
-                return null;
-            }
+        return migliore == null ? null : migliore.data();
+    }
+
+    /** Una data trovata nella causale e la posizione in cui è scritta (gruppo 1 = il giorno). */
+    private record Candidata(LocalDate data, int pos) {}
+
+    /**
+     * Prima data <b>valida</b> prodotta dal pattern: una tripletta impossibile (32/13/2026)
+     * non interrompe la ricerca, si continua con l'occorrenza successiva.
+     */
+    private static Candidata prima(Pattern p, String s, java.util.function.Function<Matcher, LocalDate> aData) {
+        Matcher m = p.matcher(s);
+        while (m.find()) {
+            LocalDate d = aData.apply(m);
+            if (d != null) return new Candidata(d, m.start(1));
         }
         return null;
+    }
+
+    private static Candidata piuASinistra(Candidata a, Candidata b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        return b.pos() < a.pos() ? b : a;
+    }
+
+    private static String mese(String nomeMese) {
+        return String.valueOf(MESI_IT.indexOf(nomeMese) + 1);
+    }
+
+    /**
+     * null se la tripletta non è una data reale (32/13/2026) o se l'anno non è plausibile.
+     * L'anno a 3 cifre ("8/7/202") non è una data: senza questo controllo
+     * {@code LocalDate.of(202, 7, 8)} passa senza un fiato e nasce una data dell'anno 202.
+     */
+    LocalDate toDate(String anno, String mese, String giorno) {
+        try {
+            int y = Integer.parseInt(anno);
+            if (y < 100) y += 2000;
+            if (y < 2000) return null;
+            return LocalDate.of(y, Integer.parseInt(mese), Integer.parseInt(giorno));
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     // ── ENTRATE ────────────────────────────────────────────────────────────────

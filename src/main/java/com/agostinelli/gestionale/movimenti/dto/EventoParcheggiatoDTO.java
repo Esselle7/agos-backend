@@ -22,5 +22,14 @@ public record EventoParcheggiatoDTO(
         String controparteNome,
         String controparteIban,
         LocalDate dataEventoEstratta,
-        String stato                 // DA_RICONCILIARE | RICONCILIATO | SCARTATO
+        String stato,                // DA_RICONCILIARE | RICONCILIATO | SCARTATO
+
+        /**
+         * Evento proposto dal sistema, da pre-selezionare in UI. Valorizzato SOLO quando nome
+         * controparte e data evento coincidono entrambi: sul solo nome la precisione misurata è
+         * del 20% (4 falsi positivi su 5), inaccettabile su un aggancio che muove denaro.
+         * null = nessuna proposta, sceglie l'operatore.
+         */
+        UUID eventoSuggeritoId,
+        String eventoSuggeritoNome
 ) {}

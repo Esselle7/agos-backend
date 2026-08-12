@@ -34,6 +34,8 @@ public class ImportLogService {
     @Inject MvRefreshService mvRefresh;
     @Inject ObjectMapper objectMapper;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService keywordLearning;
+    /** Riusa l'euristica del Gate B quando l'operatore promuove una riga ambigua a incasso-evento. */
+    @Inject MovimentoMappingEngineImpl mappingEngine;
 
     // ── Storico import ────────────────────────────────────────────────────────
     public PagedResponse<ImportLogDTO> findHistory(String fonte, int page, int size) {
@@ -95,6 +97,70 @@ public class ImportLogService {
                 .getSingleResult()).longValue();
 
         return PagedResponse.of(content, page, size, total);
+    }
+
+    /**
+     * "Va che è un evento": sposta una riga da {@code import_ambiguita} alla coda
+     * {@code eventi_da_riconciliare}, dove potrà essere attribuita a un evento.
+     *
+     * <p>Non crea movimenti — l'incasso-evento nasce solo dal modulo Eventi (invariante DACLASS).
+     * I segnali (tipo presunto, data evento, controparte) sono ricavati con la stessa euristica
+     * del Gate B, non con una copia divergente.
+     */
+    @CacheInvalidateAll(cacheName = "import-kpi")
+    @Transactional
+    public void promuoviAEvento(UUID id, UUID userId) {
+        @SuppressWarnings("unchecked")
+        List<Object[]> found = em.createNativeQuery(
+                        "SELECT import_log_id, riga_numero, fonte, raw_data, stato " +
+                        "FROM import_ambiguita WHERE id = :id")
+                .setParameter("id", id).getResultList();
+        if (found.isEmpty()) {
+            throw new ApiException(Response.Status.NOT_FOUND, "AMBIGUITA_NON_TROVATA",
+                    "Ambiguità non trovata: " + id);
+        }
+        Object[] r = found.get(0);
+        if (!"DA_CLASSIFICARE".equals((String) r[4])) {
+            throw new ApiException(Response.Status.CONFLICT, "AMBIGUITA_GIA_CHIUSA",
+                    "La riga ambigua è già stata classificata o scartata");
+        }
+
+        RawMovimento norm = normalizer.normalize(new RawRow(toInt(r[1]), parseMap(r[3])));
+        if (!"ENTRATA".equals(norm.tipo())) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "NON_E_UN_INCASSO",
+                    "Solo un'entrata può essere un incasso-evento: questa riga è " + norm.tipo());
+        }
+        var park = mappingEngine.estraiSegnaliEvento(
+                norm.descrizione(), norm.descCompact(), norm.dataMovimento());
+        String ordinante = norm.entita() == null ? null : norm.entita().ordinante();
+
+        em.createNativeQuery(
+                "INSERT INTO eventi_da_riconciliare (id, import_log_id, fonte, chiave_aggancio, " +
+                "data_movimento, importo, tipo, conto_bancario_id, descrizione_norm, " +
+                "tipo_evento_presunto, keyword_match, controparte_nome, controparte_iban, " +
+                "data_evento_estratta, stato, raw_data, created_at) " +
+                "VALUES (gen_random_uuid(), CAST(:log AS uuid), :fonte, :chiave, :data, :imp, 'ENTRATA', " +
+                ":conto, :descr, :tipoPres, :kw, :contro, :iban, :dataEv, 'DA_RICONCILIARE', " +
+                "CAST(:raw AS jsonb), now())")
+                .setParameter("log", r[0] == null ? null : r[0].toString())
+                .setParameter("fonte", (String) r[2])
+                .setParameter("chiave", norm.chiaveAggancio())
+                .setParameter("data", norm.dataMovimento())
+                .setParameter("imp", norm.importo())
+                .setParameter("conto", norm.contoBancarioId())
+                .setParameter("descr", norm.descrizione())
+                .setParameter("tipoPres", park == null ? null : park.tipoEventoPresunto())
+                .setParameter("kw", park == null ? null : park.keywordMatch())
+                .setParameter("contro", ordinante)
+                .setParameter("iban", norm.entita() == null ? null : norm.entita().ibanControparte())
+                .setParameter("dataEv", park == null ? null : park.dataEventoEstratta())
+                .setParameter("raw", r[3] == null ? "{}" : r[3].toString())
+                .executeUpdate();
+
+        em.createNativeQuery(
+                "UPDATE import_ambiguita SET stato = 'CLASSIFICATA', classificato_da = :uid, " +
+                "classificato_at = now(), note_operatore = 'Promossa a incasso-evento' WHERE id = :id")
+                .setParameter("uid", userId).setParameter("id", id).executeUpdate();
     }
 
     // ── Classificazione manuale ──────────────────────────────────────────────────

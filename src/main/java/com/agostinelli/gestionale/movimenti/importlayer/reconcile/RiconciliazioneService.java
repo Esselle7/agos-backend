@@ -63,16 +63,21 @@ public class RiconciliazioneService {
         int anno = determinaAnno(billy, posRows);
 
         // ── Step 3.1 — coda testa (DEL di anno diverso) → esclusa, NON contabilizzata ──
+        // Le righe escluse escono da qui NOMINATE (non solo contate): l'orchestratore le scrive in
+        // import_scartati con motivo SKIP_CODA_TESTA. Fino al 2026-08-11 sparivano lasciando come
+        // unica traccia una nota nella quadratura: 230,00 € di accredito bancario vero fuori dai
+        // conti e da ogni coda (audit-catena-import-2026-08-11.md §2, FINDING F1). Il criterio
+        // «anno solare del DEL» resta, ma ora chi importa gennaio VEDE la coda di dicembre.
         List<RawMovimento> coreBpm = new ArrayList<>();
         List<RawMovimento> coreCa = new ArrayList<>();
+        List<RawMovimento> codaTesta = new ArrayList<>();
         long testaCents = 0;
-        int testaCount = 0;
         LocalDate maxDel = null;
         for (RawMovimento r : posRows) {
             LocalDate del = r.dataIncassoPos();
             if (del != null && del.getYear() != anno) { // periodo precedente
                 testaCents += cents(r.importo());
-                testaCount++;
+                codaTesta.add(r);
                 continue;
             }
             if (del != null && (maxDel == null || del.isAfter(maxDel))) maxDel = del;
@@ -89,40 +94,39 @@ public class RiconciliazioneService {
             else bookable.add(s);
         }
 
-        // ── Step 4 — ripartizione PROPORZIONALE deterministica dei ricavi sui conti BPM/CA ──
-        // Non sappiamo quale carta/banca abbia incassato quale scontrino (le righe banca sono
-        // aggregate per circuito e non mappabili al singolo scontrino): distribuiamo i ricavi Billy
-        // così che ciascuna banca riceva la sua QUOTA del totale POS. Il totale ricavi da ripartire
-        // è < del totale POS banca (per il non-spaccio: agriturismo a POS, Satispay, storni): con la
-        // ripartizione proporzionale quello scarto si SPALMA su entrambe le banche in proporzione
-        // (ognuna ~uguale % sotto il suo POS lordo), invece di cadere tutto sull'ultima riempita.
-        // Regola deterministica e stabile: scontrini per importo decrescente (poi rif), si riempie
-        // BPM fino al suo TARGET PROPORZIONALE, il resto a CA. Tutto in centesimi interi (no double).
-        // L'attribuzione categoria↔banca resta CONVENZIONALE (non reale): documentato in UI.
-        bookable.sort(Comparator
-                .comparingLong((RawMovimento s) -> cents(s.importo())).reversed()
-                .thenComparing(s -> rif(s)));
-        boolean bpmDisponibile = sigmaBpmCents > 0;
-        boolean caDisponibile = sigmaCaCents > 0;
-        long sigmaTotCents = sigmaBpmCents + sigmaCaCents;
-        long bookCents = somma(bookable);
-        // Quota BPM del totale POS, applicata al totale ricavi da ripartire. Prodotto entro long
-        // (≈2,5e12 sul reale, max teorico molto sotto 9,2e18): nessun overflow, nessun double.
-        long targetBpmCents = sigmaTotCents == 0 ? 0 : (bookCents * sigmaBpmCents) / sigmaTotCents;
+        // ── Step 4 — LE BANCHE SONO L'OSSATURA: ogni riga POS bancaria diventa un movimento ──
+        // Il movimento nasce dalla RIGA BANCA (conto, data di accredito e importo sono quelli veri,
+        // per costruzione); Billy arricchisce solo la CATEGORIA contabile (coge/BU/IVA) dello
+        // scontrino agganciato. L'aggancio è DETERMINISTICO e già presente nel dato: la descrizione
+        // bancaria porta "DEL gg/mm/aa" (estratta in dataIncassoPos dal normalizzatore) e l'importo.
+        //
+        // Perché non serve più l'euristica: sui dati di luglio il join (importo, DEL) risolve 7 righe
+        // POS su 13 — 5 esatte 1:1 e 2 come somma di più circuiti dello stesso DEL (755,20 + 117,30
+        // = scontrino 872,50). Le orfane restano contabilizzate come ricavo POS generico: il denaro
+        // non si perde MAI, al massimo perde la categoria di dettaglio.
+        //
+        // Storia: fino al 2026-08-09 questo passo faceva il contrario (ricavi creati dagli scontrini
+        // Billy, banca/metodo assegnati per riempimento proporzionale, righe banca POS scartate).
+        // Produceva banca e data sbagliate, 14 righe BPM sparite (4.371,33 €) e movimenti inesistenti
+        // in estratto conto. Vedi docs/specs/piano-attacco-import-2026-08-09.md scheda A2.
+        Map<String, RawMovimento> billyPerChiave = indicizzaBilly(spaccioElettronico);
+
         long assBpm = 0, assCa = 0;
         int nBpm = 0, nCa = 0;
         List<RawMovimentoArricchito> daMappare = new ArrayList<>();
-        for (RawMovimento s : bookable) {
-            long c = cents(s.importo());
-            boolean toBpm;
-            if (!caDisponibile) toBpm = true;             // nessun POS CA → tutto su BPM
-            else if (!bpmDisponibile) toBpm = false;      // nessun POS BPM → tutto su CA
-            else toBpm = (assBpm + c <= targetBpmCents);   // riempi BPM fino al target proporzionale, poi CA
-            if (toBpm) { assBpm += c; nBpm++; } else { assCa += c; nCa++; }
-            daMappare.add(RawMovimentoArricchito.arricchito(s, ricavoPos(s, toBpm)));
+        List<RawMovimento> posContabilizzate = new ArrayList<>();
+        for (RawMovimento r : posRows) {
+            LocalDate del = r.dataIncassoPos();
+            if (del != null && del.getYear() != anno) continue; // coda testa: periodo precedente
+            RawMovimento scontrino = agganciaScontrino(r, posRows, billyPerChiave);
+            boolean toBpm = contoDi(r) != CONTO_CA;
+            if (toBpm) { assBpm += cents(r.importo()); nBpm++; } else { assCa += cents(r.importo()); nCa++; }
+            posContabilizzate.add(r);
+            daMappare.add(RawMovimentoArricchito.arricchito(r, ricavoPosBanca(r, scontrino)));
         }
 
-        // ── Contanti Billy → Cassa (unico ricavo creato direttamente da Billy) ──
+        // ── Contanti Billy → Cassa: unico caso in cui Billy crea un movimento, perché il
+        //    contante non ha (per definizione) nessuna riga bancaria che lo rappresenti. ──
         for (RawMovimento c : contanti) {
             daMappare.add(RawMovimentoArricchito.arricchito(c, cassa(c)));
         }
@@ -134,63 +138,111 @@ public class RiconciliazioneService {
 
         // ── Step 5 — quadratura di periodo (informativa) ──
         long billyNonAgriCents = somma(spaccioElettronico);
-        long billyBookCents = assBpm + assCa;
+        long posBookCents = assBpm + assCa;          // POS bancario effettivamente contabilizzato
         long posCoreCents = sigmaBpmCents + sigmaCaCents;
         long posTotCents = posCoreCents + testaCents;
         long fondoCents = somma(inAttesa);
-        long residuoCents = posCoreCents - billyBookCents;
 
         List<String> note = new ArrayList<>();
-        if (testaCount > 0) {
-            note.add("Coda testa esclusa: " + testaCount + " riga/e POS con DEL dell'anno precedente ("
-                    + euro(testaCents).toPlainString() + " €), periodo precedente.");
+        if (!codaTesta.isEmpty()) {
+            note.add("Coda testa esclusa: " + codaTesta.size() + " riga/e POS con DEL dell'anno precedente ("
+                    + euro(testaCents).toPlainString() + " €), periodo precedente. Tracciate in "
+                    + "import_scartati (motivo SKIP_CODA_TESTA): vanno guardate una per una.");
         }
         if (!inAttesa.isEmpty()) {
-            note.add("Coda fondo in attesa di accredito: " + inAttesa.size() + " scontrino/i venduti dopo l'ultima DEL banca ("
-                    + euro(fondoCents).toPlainString() + " €) — non contabilizzati, al prossimo import.");
+            note.add("Coda fondo: " + inAttesa.size() + " scontrino/i venduti dopo l'ultima DEL banca ("
+                    + euro(fondoCents).toPlainString() + " €) — l'accredito arriverà nel prossimo estratto conto.");
         }
         if (!eventiAttesi.isEmpty()) {
             note.add("Eventi (agriturismo): " + eventiAttesi.size() + " scontrino/i Billy agriturismo esclusi dalla "
                     + "contabilità import (li gestisce il modulo Eventi). I relativi incassi in banca sono per la "
                     + "gran parte BONIFICI evento (parcheggiati), non incassi POS: NON inquinano i ricavi spaccio.");
         }
-        note.add("Residuo core = POS banca core − Billy spaccio contabilizzato. Lo compongono: la quota di "
-                + "agriturismo effettivamente incassata al TERMINALE POS (piccola), Satispay (netto banca vs "
-                + "lordo Billy ~1%) e storni. È piccolo e atteso, non è un errore.");
+        // NB: qui NON c'è più il confronto posCore − posBook. Era una guardia vacua: i due addendi
+        // nascevano dallo stesso loop con lo stesso filtro, quindi il residuo era ≡ 0 per costruzione
+        // — un controllo che non poteva fallire (audit §2, intervento §8 #9). Il confronto che può
+        // davvero divergere è lo «scarto informativo» qui sotto (POS banca − Billy spaccio).
+        note.add("Quadratura POS: tutte le righe POS del periodo sono contabilizzate dalla riga bancaria "
+                + "(importo, conto e data di accredito sono quelli dell'estratto conto). Billy fornisce "
+                + "solo la categoria contabile dello scontrino agganciato.");
+        long scarto = posCoreCents - (billyNonAgriCents - fondoCents);
+        if (scarto != 0) {
+            note.add("Scarto informativo POS banca − Billy spaccio del periodo: " + euro(scarto).toPlainString()
+                    + " €. Non incide sui saldi (contano le righe banca); misura quanto del POS bancario non "
+                    + "trova uno scontrino spaccio: agriturismo incassato al terminale, Satispay, storni.");
+        }
 
         QuadraturaPeriodo quadratura = new QuadraturaPeriodo(
                 anno,
-                euro(billyNonAgriCents), euro(billyBookCents),
+                euro(billyNonAgriCents), euro(posBookCents),
                 euro(posTotCents), euro(posCoreCents),
                 euro(sigmaBpmCents), euro(sigmaCaCents),
                 euro(assBpm), euro(assCa),
-                euro(testaCents), euro(fondoCents), euro(residuoCents),
+                euro(testaCents), euro(fondoCents),
                 maxDel, note);
 
-        List<RawMovimento> contabilizzati = new ArrayList<>(bookable.size() + contanti.size());
-        contabilizzati.addAll(bookable);
+        List<RawMovimento> contabilizzati = new ArrayList<>(posContabilizzate.size() + contanti.size());
+        contabilizzati.addAll(posContabilizzate);
         contabilizzati.addAll(contanti);
 
         DatasetRiconciliato.Statistiche stat = new DatasetRiconciliato.Statistiche(
-                posRows.size(), testaCount, bookable.size(), contanti.size(),
+                posRows.size(), codaTesta.size(), posContabilizzate.size(), contanti.size(),
                 eventiAttesi.size(), inAttesa.size(), nBpm, nCa, nonPos);
 
-        return new DatasetRiconciliato(daMappare, contabilizzati, inAttesa, eventiAttesi, quadratura, stat);
+        return new DatasetRiconciliato(daMappare, contabilizzati, inAttesa, eventiAttesi, codaTesta,
+                quadratura, stat);
     }
 
     // ── costruzione DettagliBilly ──────────────────────────────────────────────────
 
-    /** Ricavo POS spaccio: categoria da Billy, conto/metodo dalla ripartizione (BPM o CA). */
-    private DettagliBilly ricavoPos(RawMovimento scontrino, boolean bpm) {
-        BillyCategoria.Esito cat = BillyCategoria.classifica(scontrino);
-        String metodo = bpm ? METODO_BPM : METODO_CA;
-        short conto = bpm ? CONTO_BPM : CONTO_CA;
+    /**
+     * Ricavo POS: il movimento è la RIGA BANCA (conto/metodo/data/importo suoi), la categoria
+     * contabile viene dallo scontrino Billy agganciato. Scontrino null (riga orfana) → categoria
+     * lasciata a null: la riga si contabilizza comunque come ricavo POS generico.
+     */
+    private DettagliBilly ricavoPosBanca(RawMovimento rigaBanca, RawMovimento scontrino) {
+        BillyCategoria.Esito cat = scontrino == null ? null : BillyCategoria.classifica(scontrino);
+        short conto = contoDi(rigaBanca);
+        String metodo = conto == CONTO_CA ? METODO_CA : METODO_BPM;
+        List<String> refs = new ArrayList<>(refs(rigaBanca));
+        if (scontrino != null) refs.addAll(refs(scontrino)); // traccia lo scontrino agganciato
         return new DettagliBilly(
                 EsitoMatch.RICAVO_POS,
                 cat == null ? null : cat.cogeCodice(),
                 cat == null ? null : cat.bu(),
                 cat == null ? null : cat.aliquotaIva(),
-                metodo, conto, refs(scontrino));
+                metodo, conto, refs);
+    }
+
+    /** Indice degli scontrini Billy per chiave "data|centesimi" (aggancio deterministico). */
+    private Map<String, RawMovimento> indicizzaBilly(List<RawMovimento> scontrini) {
+        Map<String, RawMovimento> idx = new HashMap<>();
+        for (RawMovimento s : scontrini) {
+            if (s.dataMovimento() == null || s.importo() == null) continue;
+            idx.putIfAbsent(s.dataMovimento() + "|" + cents(s.importo()), s);
+        }
+        return idx;
+    }
+
+    /**
+     * Aggancia una riga POS bancaria al suo scontrino Billy usando (data DEL, importo).
+     * Due tentativi, in ordine: (1) 1:1 sull'importo della riga; (2) N:1, cioè la somma di tutte
+     * le righe POS della stessa banca con lo stesso DEL (più circuiti per lo stesso scontrino).
+     * Nessun match → null (riga orfana, contabilizzata comunque).
+     */
+    private RawMovimento agganciaScontrino(RawMovimento rigaBanca, List<RawMovimento> posRows,
+                                           Map<String, RawMovimento> billyPerChiave) {
+        LocalDate del = rigaBanca.dataIncassoPos();
+        if (del == null) return null;
+        RawMovimento esatto = billyPerChiave.get(del + "|" + cents(rigaBanca.importo()));
+        if (esatto != null) return esatto;
+        long somma = 0;
+        for (RawMovimento altra : posRows) {
+            if (del.equals(altra.dataIncassoPos()) && contoDi(altra) == contoDi(rigaBanca)) {
+                somma += cents(altra.importo());
+            }
+        }
+        return billyPerChiave.get(del + "|" + somma);
     }
 
     /** Scontrino contante → Cassa (conto 3), categoria da Billy. */

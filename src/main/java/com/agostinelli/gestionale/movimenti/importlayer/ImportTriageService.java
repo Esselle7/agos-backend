@@ -2,6 +2,7 @@ package com.agostinelli.gestionale.movimenti.importlayer;
 
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.movimenti.domain.Movimento;
+import com.agostinelli.gestionale.movimenti.dto.BuPanelDTO;
 import com.agostinelli.gestionale.movimenti.dto.ClassificaTransitorioRequest;
 import com.agostinelli.gestionale.movimenti.dto.EventoParcheggiatoDTO;
 import com.agostinelli.gestionale.movimenti.dto.ImportKpiDTO;
@@ -12,6 +13,8 @@ import com.agostinelli.gestionale.movimenti.dto.RegolaClassificazioneDTO;
 import com.agostinelli.gestionale.movimenti.dto.RicorrenteParcheggiataDTO;
 import com.agostinelli.gestionale.movimenti.dto.RisolviEventoRequest;
 import com.agostinelli.gestionale.movimenti.dto.RisolviRicorrenteRequest;
+import com.agostinelli.gestionale.movimenti.dto.RisolviScartatoRequest;
+import com.agostinelli.gestionale.movimenti.dto.ScartatoDTO;
 import com.agostinelli.gestionale.movimenti.dto.TransitorioDTO;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService;
 import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
@@ -31,7 +34,9 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -55,9 +60,14 @@ public class ImportTriageService {
     @Inject RegoleClassificazioneEngine regoleEngine;
     @Inject MvRefreshService mvRefresh;
     @Inject KeywordLearningService keywordLearning;
+    /** Serve al SUGGERIMENTO del wizard §7.1: quale conto propone una firma già appresa. */
+    @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordClassificazioneEngine keywordEngine;
     @Inject MovimentiService movimentiService;
+    @Inject RataMatchService matchService;
     /** Serve all'azione COLLEGA: la contabilità della rata resta di competenza del modulo spese. */
     @Inject com.agostinelli.gestionale.spese.service.RecurringExpenseService recurringService;
+    /** Serve all'azione RICONCILIA: il ricavo evento nasce SOLO qui (invariante DACLASS). */
+    @Inject com.agostinelli.gestionale.eventi.service.EventiService eventiService;
     @Inject com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     // ── KPI (§13) ────────────────────────────────────────────────────────────────
@@ -176,19 +186,21 @@ public class ImportTriageService {
 
     // ── Centro smistamento: movimenti su conti transitori (39/49.99.999) ──────────
 
-    /** Lista paginata dei movimenti ancora su conto transitorio (da catalogare). */
+    /**
+     * Lista paginata dei movimenti ancora su conto transitorio (da catalogare), con la chiave di
+     * raggruppamento del wizard §7.1 e l'eventuale suggerimento di una firma keyword appresa.
+     *
+     * <p>Da 11/08/2026 include ANCHE le righe EFFETTI/RiBa (audit §7.7: «sono uscite da catalogare
+     * come le altre»); la coda separata e {@code listRibaTransitori} sono cancellate. Gli incassi
+     * POS non finiscono più sul transitorio (li categorizza Billy): un ricavo Billy con categoria
+     * non determinabile (raro) resta visibile qui invece di sparire.
+     */
     @SuppressWarnings("unchecked")
     public PagedResponse<TransitorioDTO> listTransitori(String tipo, int page, int size) {
-        // "Da catalogare" mostra i transitori GENERICI: esclude solo ciò che ha una sezione dedicata
-        // (effetti/RiBa → "Effetti/RiBa") così ogni riga compare una volta sola e i badge sono
-        // disgiunti. Gli incassi POS non finiscono più sul transitorio (sono categorizzati da Billy):
-        // la vecchia esclusione POS è rimossa, così un ricavo Billy con categoria non determinabile
-        // (raro) resta visibile qui invece di sparire.
         String where =
                 "FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id " +
                 "WHERE p.codice IN ('" + COGE_RICAVI_DACLASS + "','" + COGE_COSTI_DACLASS + "') " +
-                "AND m.stato <> 'ANNULLATO' AND (CAST(:tipo AS VARCHAR) IS NULL OR m.tipo = :tipo) " +
-                "AND NOT (m.tipo = 'USCITA' AND (m.descrizione ILIKE '%EFFETTI%' OR m.descrizione ILIKE '%RIBA%'))";
+                "AND m.stato <> 'ANNULLATO' AND (CAST(:tipo AS VARCHAR) IS NULL OR m.tipo = :tipo)";
 
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT m.id, m.tipo, m.importo_lordo, m.data_movimento, m.descrizione, p.codice, " +
@@ -199,22 +211,99 @@ public class ImportTriageService {
                 .setParameter("offset", (long) page * size)
                 .getResultList();
 
+        // Suggerimenti keyword: il motore è in memoria, ma i CODICI vanno risolti in id — UNA
+        // query per pagina, non una per riga (no N+1).
+        List<String> codiciSugg = new ArrayList<>(rows.size());
+        for (Object[] r : rows) codiciSugg.add(suggerimentoKeyword((String) r[4], (String) r[1], r[7]));
+        Map<String, Integer> idByCodice = cogeIdByCodice(new java.util.HashSet<>(codiciSugg));
+
+        // Riscontro Billy: UNA query di aggregazione per pagina (giorno+conto → n, totale), poi
+        // l'aggancio si fa in memoria. Non è un join per riga: sarebbe N+1 su un dato indicativo.
+        Map<String, long[]> billyCount = new LinkedHashMap<>();
+        Map<String, BigDecimal> billyTot = ricaviBillyPerGiorno(billyCount);
+
         List<TransitorioDTO> content = new ArrayList<>(rows.size());
-        for (Object[] r : rows) {
+        for (int i = 0; i < rows.size(); i++) {
+            Object[] r = rows.get(i);
             String descr = (String) r[4];
             Short conto = r[7] == null ? null : ((Number) r[7]).shortValue();
+            LocalDate data = ((java.sql.Date) r[3]).toLocalDate();
+            BigDecimal importo = (BigDecimal) r[2];
             EntitaEstratte ent = estraiEntita(descr, conto);
+            String controparte = ent.beneficiario() != null ? ent.beneficiario() : ent.ordinante();
+            Integer idSugg = codiciSugg.get(i) == null ? null : idByCodice.get(codiciSugg.get(i));
+
+            // Solo sulle righe POS: altrove «cosa ha incassato Billy quel giorno» non vuol dire nulla.
+            String circuito = DescNormalizer.circuitoPos(descr);
+            TransitorioDTO.RiscontroBillyDTO riscontro = null;
+            if (circuito != null && conto != null) {
+                String k = data + "|" + conto;
+                BigDecimal tot = billyTot.get(k);
+                if (tot != null) {
+                    riscontro = new TransitorioDTO.RiscontroBillyDTO(
+                            billyCount.get(k)[0], tot, importo.subtract(tot));
+                }
+            }
+
             content.add(new TransitorioDTO(
-                    toUuid(r[0]), (String) r[1], (BigDecimal) r[2],
-                    ((java.sql.Date) r[3]).toLocalDate(), descr, (String) r[5],
+                    toUuid(r[0]), (String) r[1], importo, data, descr, (String) r[5],
                     r[6] == null ? null : toUuid(r[6]), conto,
-                    ent.ibanControparte(),
-                    ent.beneficiario() != null ? ent.beneficiario() : ent.ordinante()));
+                    ent.ibanControparte(), controparte,
+                    DescNormalizer.chiaveGruppo(controparte, descr),
+                    DescNormalizer.dataOperazione(descr), circuito, riscontro,
+                    idSugg,
+                    idSugg == null ? null : "l'hai già catalogata così una volta: la causale "
+                            + "contiene una firma che avevi insegnato al sistema"));
         }
 
         long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where)
                 .setParameter("tipo", tipo).getSingleResult()).longValue();
         return PagedResponse.of(content, page, size, total);
+    }
+
+    /** Mastri dei ricavi che nascono dagli scontrini Billy (spaccio/agriturismo). */
+    private static final String COGE_RICAVI_BILLY = "30.03.";
+
+    /**
+     * Ricavi Billy aggregati per giorno e conto: {@code "2026-01-12|2" → totale}, e nella mappa
+     * {@code conteggi} il numero di righe.
+     *
+     * <p>È il riscontro di GIORNATA del wizard §7.1 sugli incassi POS. <b>Non</b> è un abbinamento
+     * scontrino↔accredito: quello non esiste nei dati (la ripartizione POS lavora sui totali di
+     * periodo). Misurato l'11/08/2026 sul corpus: per data-accredito 32 righe POS su 48 hanno un
+     * riscontro, con importi che non coincidono — per questo il DTO lo dichiara come indicativo.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, BigDecimal> ricaviBillyPerGiorno(Map<String, long[]> conteggi) {
+        Map<String, BigDecimal> out = new LinkedHashMap<>();
+        for (Object[] r : (List<Object[]>) em.createNativeQuery(
+                "SELECT m.data_movimento, m.conto_bancario_id, COUNT(*), SUM(m.importo_lordo) " +
+                "FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id " +
+                "WHERE p.codice LIKE '" + COGE_RICAVI_BILLY + "%' AND m.stato <> 'ANNULLATO' " +
+                "  AND m.conto_bancario_id IS NOT NULL " +
+                "GROUP BY 1, 2").getResultList()) {
+            String k = ((java.sql.Date) r[0]).toLocalDate() + "|" + ((Number) r[1]).shortValue();
+            conteggi.put(k, new long[]{ ((Number) r[2]).longValue() });
+            out.put(k, (BigDecimal) r[3]);
+        }
+        return out;
+    }
+
+    /**
+     * Codice CoGe proposto da una firma keyword APPRESA per questa riga, o null.
+     *
+     * <p>Declassamento del gate 9b (audit §7.8): la firma non cataloga più da sola fuori
+     * dall'import — qui diventa una proposta col «perché» in chiaro, che l'utente conferma con un
+     * click. Un target sul mastro riservato non si propone nemmeno (invariante DACLASS).
+     */
+    private String suggerimentoKeyword(String descrizione, String tipo, Object contoBancarioId) {
+        Short conto = contoBancarioId == null ? null : ((Number) contoBancarioId).shortValue();
+        String sorgente = conto == null ? Sorgente.CA
+                : (conto == 1 ? Sorgente.BPM : (conto == 2 ? Sorgente.CA : Sorgente.BILLY));
+        return keywordEngine.valuta(descrizione, tipo, sorgente)
+                .filter(m -> !m.conflitto() && !CogeRiservatoEventi.riservato(m.cogeCodice()))
+                .map(com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordClassificazioneEngine.KeywordMatch::cogeCodice)
+                .orElse(null);
     }
 
 
@@ -240,6 +329,17 @@ public class ImportTriageService {
                     "Il movimento non è su un conto transitorio (è su " + cogeCorrente + ")");
         }
 
+        // Boundary sul conto scelto: deve esistere (senza, la FK darebbe un 500 illeggibile) e non
+        // può essere il mastro riservato agli eventi — la UI che lo nasconde è cortesia, non guardia.
+        List<?> target = em.createNativeQuery(
+                "SELECT codice FROM piano_dei_conti_coge WHERE id = :id")
+                .setParameter("id", req.cogeId()).getResultList();
+        if (target.isEmpty()) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "COGE_NON_TROVATO",
+                    "Conto CoGe inesistente: " + req.cogeId());
+        }
+        CogeRiservatoEventi.vieta((String) target.get(0));
+
         m.contoCoge = req.cogeId();
         m.businessUnitId = req.businessUnitId();
         m.fornitoreId = req.fornitoreId();
@@ -254,6 +354,128 @@ public class ImportTriageService {
                     req.fornitoreId(), movimentoId, null);
         }
 
+        mvRefresh.requestRefreshAfterCommit();
+    }
+
+    // ── Pannello BU dell'import (docs/adr/006) ───────────────────────────────────
+    //
+    // Vista di rifinitura post-import: i movimenti di UN import raggruppati per Business Unit,
+    // con gli INCERTI a parte. "Incerto" è DERIVATO dal dato — conto CoGe transitorio
+    // (39.99.999 / 49.99.999) + BU ancora sul fallback 5 — non marcato dal motore: nel mapping
+    // engine ogni assegnazione di quei conti porta con sé bu=5, mentre le altre bu=5 (spese banca
+    // 40.02.*, giroconti 10.03.*, versamento soci) sono classificazioni VOLUTE, non incertezza.
+    // Nessuna migration, nessun campo nuovo.
+
+    /**
+     * Movimenti creati dall'import {@code importLogId}, raggruppati per BU (annullati esclusi).
+     * Una sola query: i volumi sono quelli di un import (~10²), il raggruppamento sta in Java.
+     */
+    @SuppressWarnings("unchecked")
+    public BuPanelDTO getBuPanel(UUID importLogId) {
+        List<Object[]> log = em.createNativeQuery(
+                "SELECT data_import, filename FROM import_log WHERE id = :id")
+                .setParameter("id", importLogId)
+                .getResultList();
+        if (log.isEmpty()) throw new ApiException(Response.Status.NOT_FOUND,
+                "IMPORT_NON_TROVATO", "Import " + importLogId);
+
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT m.id, m.tipo, m.importo_lordo, m.data_movimento, m.descrizione, " +
+                "p.codice, p.descrizione, m.business_unit_id, bu.codice, bu.nome " +
+                "FROM movimenti m " +
+                "JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id " +
+                "JOIN business_units bu ON bu.id = m.business_unit_id " +
+                "WHERE m.fonte_importazione_id = :imp AND m.stato <> 'ANNULLATO' " +
+                "ORDER BY m.business_unit_id, m.data_movimento, m.id")
+                .setParameter("imp", importLogId)
+                .getResultList();
+
+        // Accumulatori per gruppo: le BU vere in una mappa ordinata, gli incerti a parte.
+        Map<Short, Acc> perBu = new LinkedHashMap<>();
+        Acc incerti = new Acc(null, null, "Da assegnare (transitori)");
+
+        for (Object[] r : rows) {
+            String cogeCodice = (String) r[5];
+            boolean transitorio = COGE_RICAVI_DACLASS.equals(cogeCodice) || COGE_COSTI_DACLASS.equals(cogeCodice);
+            Short buId = ((Number) r[7]).shortValue();
+            BuPanelDTO.Riga riga = new BuPanelDTO.Riga(
+                    toUuid(r[0]), (String) r[1], (BigDecimal) r[2], toLocalDate(r[3]),
+                    (String) r[4], cogeCodice, (String) r[6], buId, transitorio);
+
+            // Coda "da assegnare" = transitorio ANCORA sulla BU di fallback: appena l'operatore
+            // sceglie una BU vera la riga esce dalla coda e compare nel gruppo scelto (resta
+            // marcata transitorio: la CoGe si sistema in "Da catalogare", è un altro lavoro).
+            Acc acc = transitorio && BU_OVERHEAD == buId ? incerti
+                    : perBu.computeIfAbsent(buId, k -> new Acc(k, (String) r[8], (String) r[9]));
+            acc.add(riga);
+        }
+
+        List<BuPanelDTO.Gruppo> gruppi = new ArrayList<>(perBu.size());
+        for (Acc a : perBu.values()) gruppi.add(a.toGruppo());
+        return new BuPanelDTO(importLogId, toInstant(log.get(0)[0]), (String) log.get(0)[1],
+                rows.size(), gruppi, incerti.toGruppo());
+    }
+
+    /** Accumulatore di gruppo (conteggio + entrate/uscite + righe): vive solo dentro getBuPanel. */
+    private static final class Acc {
+        private final Short buId;
+        private final String codice;
+        private final String nome;
+        private final List<BuPanelDTO.Riga> righe = new ArrayList<>();
+        private BigDecimal entrate = BigDecimal.ZERO;
+        private BigDecimal uscite = BigDecimal.ZERO;
+
+        Acc(Short buId, String codice, String nome) { this.buId = buId; this.codice = codice; this.nome = nome; }
+
+        void add(BuPanelDTO.Riga r) {
+            righe.add(r);
+            if ("ENTRATA".equals(r.tipo())) entrate = entrate.add(r.importo());
+            else uscite = uscite.add(r.importo());
+        }
+
+        BuPanelDTO.Gruppo toGruppo() {
+            return new BuPanelDTO.Gruppo(buId, codice, nome, righe.size(), entrate, uscite, righe);
+        }
+    }
+
+    /**
+     * Sposta un movimento dell'import su un'altra Business Unit.
+     *
+     * INVARIANTE (app che tratta soldi): la BU è una dimensione ANALITICA — nessun saldo cambia.
+     * mv_saldi_conti / mv_cash_flow_statement / mv_riconciliazione_bancaria non leggono
+     * business_unit_id; la ri-partizione riguarda solo mv_kpi_mensili e mv_conto_economico_mensile,
+     * i cui TOTALI restano invariati (cambia solo su quale BU sono appoggiati). Per questo qui si
+     * tocca UNA colonna e si chiede il refresh delle MV analitiche — niente ricalcoli contabili.
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @Transactional
+    public void cambiaBusinessUnit(UUID importLogId, UUID movimentoId, Short businessUnitId) {
+        // Boundary 1: la BU deve esistere ed essere attiva (la FK darebbe un 500 illeggibile).
+        List<?> bu = em.createNativeQuery("SELECT id FROM business_units WHERE id = :id AND is_active = true")
+                .setParameter("id", businessUnitId)
+                .getResultList();
+        if (bu.isEmpty()) throw new ApiException(Response.Status.NOT_FOUND, "BU_NON_TROVATA",
+                "Business Unit " + businessUnitId);
+
+        // Boundary 2: il movimento deve esistere...
+        Movimento m = em.find(Movimento.class, movimentoId);
+        if (m == null) throw new ApiException(Response.Status.NOT_FOUND, "MOVIMENTO_NON_TROVATO",
+                "Movimento " + movimentoId);
+        // ...ed essere nato da QUESTO import (il pannello è per-import: fuori da lì non si tocca).
+        if (!importLogId.equals(m.fonteImportazioneId)) {
+            throw new ApiException(Response.Status.NOT_FOUND, "MOVIMENTO_NON_DI_QUESTO_IMPORT",
+                    "Il movimento " + movimentoId + " non appartiene all'import " + importLogId);
+        }
+        // Boundary 3: uno storno/annullato è fuori da ogni lettura analitica: non si riclassifica.
+        if ("ANNULLATO".equals(m.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "MOVIMENTO_ANNULLATO",
+                    "Il movimento è annullato: la BU non è modificabile");
+        }
+
+        m.businessUnitId = businessUnitId;
+        em.merge(m);
         mvRefresh.requestRefreshAfterCommit();
     }
 
@@ -281,13 +503,17 @@ public class ImportTriageService {
 
         List<EventoParcheggiatoDTO> content = new ArrayList<>(rows.size());
         for (Object[] r : rows) {
+            LocalDate dataEv = r[12] == null ? null : ((java.sql.Date) r[12]).toLocalDate();
+            Object[] sugg = suggerisciEvento((String) r[10], dataEv);
             content.add(new EventoParcheggiatoDTO(
                     toUuid(r[0]), (String) r[1], (String) r[2],
                     r[3] == null ? null : ((java.sql.Date) r[3]).toLocalDate(),
                     (BigDecimal) r[4], (String) r[5],
                     r[6] == null ? null : ((Number) r[6]).shortValue(),
                     (String) r[7], (String) r[8], (String) r[9], (String) r[10], (String) r[11],
-                    r[12] == null ? null : ((java.sql.Date) r[12]).toLocalDate(), (String) r[13]));
+                    dataEv, (String) r[13],
+                    sugg == null ? null : (UUID) sugg[0],
+                    sugg == null ? null : (String) sugg[1]));
         }
 
         long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where)
@@ -363,7 +589,8 @@ public class ImportTriageService {
     public void risolviEvento(UUID eventoParkId, RisolviEventoRequest req, UUID userId) {
         List<Object[]> found = em.createNativeQuery(
                 "SELECT import_log_id, fonte, data_movimento, importo, tipo, conto_bancario_id, " +
-                "descrizione_norm, stato FROM eventi_da_riconciliare WHERE id = :id")
+                "descrizione_norm, stato, controparte_nome, data_evento_estratta, tipo_evento_presunto " +
+                "FROM eventi_da_riconciliare WHERE id = :id")
                 .setParameter("id", eventoParkId).getResultList();
         if (found.isEmpty()) {
             throw new ApiException(Response.Status.NOT_FOUND, "EVENTO_NON_TROVATO", "Evento parcheggiato " + eventoParkId);
@@ -384,11 +611,162 @@ public class ImportTriageService {
                     "Le voci evento parcheggiate non generano movimenti: il ricavo nasce dal "
                     + "modulo Eventi (caparra/acconto/saldo). Usa SCARTA o RICONCILIA.");
 
-            case "RICONCILIA" -> aggiornaStatoEvento(eventoParkId, "RICONCILIATO", req.eventoId(), req.nota());
+            case "RICONCILIA" -> riconciliaEvento(eventoParkId, e, req, userId);
 
             default -> throw new ApiException(Response.Status.BAD_REQUEST, "AZIONE_NON_VALIDA",
                     "Azione non valida: " + req.azione() + " (SCARTA | CLASSIFICA | RICONCILIA)");
         }
+    }
+
+    /**
+     * Propone un evento per l'incasso parcheggiato, con regola deliberatamente stretta:
+     * serve un token in comune col nome/contatto dell'evento <b>e</b> la data evento esatta.
+     *
+     * <p>Il solo nome non basta: misurato sull'import di luglio 2026 dà 5 candidati di cui 1 giusto
+     * (20%) — "EVENTO" aggancia "Evento del 10/01", "Alberto" aggancia "Pranzo Alberto", "Molteni"
+     * aggancia "Battesimo Laura Molteni". Su un aggancio che muove denaro è meglio nessuna proposta
+     * che una sbagliata: chi conferma a occhi chiusi sposta soldi sull'evento di un altro.
+     *
+     * <p>Sono esclusi gli eventi SALDATO: {@code registraPagamento} li rifiuta comunque
+     * (EventiService:252), quindi proporli offre all'operatore un solo esito possibile, il 409.
+     * Misurato sulla copia di produzione del 07/08/2026: l'unica proposta che il sistema
+     * produceva — MOLTENI ELENA 1.000,00 → "Elena molteni" — puntava a un evento SALDATO con
+     * residuo 0,00. Edge case già scritto nella SPEC ("la UI deve escluderlo dai candidati").
+     *
+     * @return {id, nome} dell'unico evento compatibile, o null (nessuno o più d'uno)
+     */
+    private Object[] suggerisciEvento(String controparte, LocalDate dataEvento) {
+        if (dataEvento == null) return null;
+        // senza controparte il match per nome non è calcolabile: si passa direttamente alla data
+        if (controparte == null || controparte.isBlank()) return soloEventoInQuellaData(dataEvento);
+        List<Object[]> hit = em.createNativeQuery(
+                "SELECT e.id, e.nome FROM eventi e " +
+                "WHERE e.is_segnaposto = false AND e.data_evento = :d " +
+                "  AND e.stato NOT IN ('ANNULLATO', 'SALDATO') " +
+                "  AND EXISTS (" +
+                "    SELECT 1 FROM unnest(string_to_array(upper(regexp_replace(" +
+                "        coalesce(e.contatto_nome,'') || ' ' || e.nome, '[^A-Za-z ]', ' ', 'g')), ' ')) te" +
+                "    JOIN unnest(string_to_array(upper(regexp_replace(" +
+                "        CAST(:c AS TEXT), '[^A-Za-z ]', ' ', 'g')), ' ')) tp ON tp = te" +
+                "    WHERE length(te) > 3 AND te <> 'EVENTO')")
+                .setParameter("d", dataEvento)
+                .setParameter("c", controparte)
+                .getResultList();
+        // Più di un candidato = ambiguo: non si propone nulla, sceglie l'operatore.
+        if (hit.size() == 1) return new Object[]{ toUuid(hit.get(0)[0]), hit.get(0)[1] };
+
+        return soloEventoInQuellaData(dataEvento);
+    }
+
+    /**
+     * Secondo segnale: la <b>data evento è già di per sé identificante</b> quando in agenda c'è
+     * un solo evento aperto quel giorno. Serve perché il nome dell'evento è una descrizione
+     * ("Compleanno Ravera"), non il nominativo di chi bonifica: sulle 26 righe di luglio 2026,
+     * 14 portavano la data evento ma nessuna agganciava per nome.
+     *
+     * <p>Misurato sulla copia di produzione del 08/08/2026: sugli 8 incassi in cui la risposta
+     * giusta è nota (match nome+data), la sola data individuava l'evento corretto <b>8 volte su
+     * 8</b>; e 10 delle 14 date orfane puntano a un unico evento. Copertura attesa 8/26 → 18/26.
+     * Resta la regola d'oro: un solo candidato o nessuna proposta.
+     */
+    private Object[] soloEventoInQuellaData(LocalDate dataEvento) {
+        if (dataEvento == null) return null;
+        List<Object[]> hit = em.createNativeQuery(
+                "SELECT e.id, e.nome FROM eventi e " +
+                "WHERE e.is_segnaposto = false AND e.data_evento = :d " +
+                "  AND e.stato NOT IN ('ANNULLATO', 'SALDATO')")
+                .setParameter("d", dataEvento)
+                .getResultList();
+        return hit.size() == 1 ? new Object[]{ toUuid(hit.get(0)[0]), hit.get(0)[1] } : null;
+    }
+
+    /** I 5 codici di lk_tipi_evento_mov. AFFITTO_SALA, che l'ETL sa suggerire, NON è tra questi. */
+    private static final List<String> TIPI_PAGAMENTO_EVENTO =
+            List.of("CAPARRA", "ACCONTO", "SALDO", "PENALE", "RIMBORSO");
+
+    private static final int METODO_BONIFICO = 5;
+
+    /**
+     * Attribuisce l'incasso parcheggiato a un evento e ne registra il pagamento.
+     *
+     * <p>È il passo che fa entrare il denaro nei saldi: prima di questo, "Riconcilia" si limitava
+     * a marcare la riga e i soldi restavano fuori (misurato: 18.924,00 € invisibili dopo l'import
+     * di luglio 2026). Il movimento nasce comunque in {@code EventiService.registraPagamento},
+     * così l'invariante DACLASS resta intatta — il triage attribuisce, non contabilizza.
+     */
+    private void riconciliaEvento(UUID parkId, Object[] e, RisolviEventoRequest req, UUID userId) {
+        String tipo = req.tipo() == null ? null : req.tipo().toUpperCase();
+        if (!TIPI_PAGAMENTO_EVENTO.contains(tipo)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "TIPO_EVENTO_NON_VALIDO",
+                    "Tipo pagamento non valido: " + req.tipo() + " (ammessi: " + TIPI_PAGAMENTO_EVENTO + ")");
+        }
+        if (e[5] == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "CONTO_BANCARIO_MANCANTE",
+                    "La riga non ha un conto bancario: assegnalo prima di attribuirla a un evento");
+        }
+        if (req.eventoId() == null && !req.creaSegnaposto()) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "EVENTO_RICHIESTO",
+                    "Serve un eventoId, oppure creaSegnaposto=true se l'evento non è in anagrafica");
+        }
+
+        BigDecimal importo    = (BigDecimal) e[3];
+        LocalDate dataMov     = ((java.sql.Date) e[2]).toLocalDate();
+        Short conto           = ((Number) e[5]).shortValue();
+        String controparte    = (String) e[8];
+        LocalDate dataEvento  = e[9] == null ? null : ((java.sql.Date) e[9]).toLocalDate();
+
+        UUID eventoId = req.eventoId() != null
+                ? req.eventoId()
+                : creaSegnaposto(controparte, dataEvento != null ? dataEvento : dataMov, importo, userId);
+
+        eventiService.registraPagamento(eventoId,
+                new com.agostinelli.gestionale.eventi.dto.PagamentoRequest(
+                        tipo, importo, dataMov, req.nota(), METODO_BONIFICO, conto, req.cogeId()),
+                userId);
+
+        aggiornaStatoEvento(parkId, "RICONCILIATO", eventoId, req.nota());
+    }
+
+    /**
+     * Contenitore temporaneo per un incasso il cui evento non è ancora in anagrafica.
+     *
+     * <p>Uno per pagamento, non uno condiviso: con un contenitore unico il pagamento successivo
+     * verrebbe rifiutato dalle guardie del percorso-soldi (max 1 CAPARRA/ACCONTO/SALDO per evento,
+     * importo ≤ residuo, auto-chiusura a SALDATO) e la competenza economica di tutti gli incassi
+     * collasserebbe sulla data del contenitore. Vedi docs/specs/import-eventi-attribuzione.md.
+     */
+    private UUID creaSegnaposto(String controparte, LocalDate dataEvento, BigDecimal importo, UUID userId) {
+        String nome = "[DA ATTRIBUIRE] "
+                + (controparte == null || controparte.isBlank() ? "Incasso senza controparte" : controparte.trim());
+        UUID id = UUID.randomUUID();
+        em.createNativeQuery(
+                "INSERT INTO eventi (id, nome, tipo, data_evento, importo_totale_preventivato, " +
+                "importo_incassato, caparre_incassate, costi_diretti_imputati, stato, business_unit_id, " +
+                "contatto_nome, numero_totale_partecipanti, is_segnaposto, created_by, created_at) " +
+                "VALUES (:id, :nome, 'ALTRO', :data, :imp, 0, 0, 0, 'PREVENTIVATO', 2, " +
+                ":contatto, 0, true, :user, now())")
+                .setParameter("id", id)
+                .setParameter("nome", nome)
+                .setParameter("data", dataEvento)
+                // preventivato = importo: il residuo copre esattamente questo pagamento e nulla di più
+                .setParameter("imp", importo)
+                .setParameter("contatto", controparte)
+                .setParameter("user", userId)
+                .executeUpdate();
+
+        // Una voce di preventivo pari all'importo: senza, il segnaposto sarebbe l'unico evento
+        // con preventivato != somma voci, e la prima mutazione di voce lo azzererebbe
+        // (EventiService.ricalcolaPreventivato) portando incassato > preventivato.
+        em.createNativeQuery(
+                "INSERT INTO evento_voce (evento_id, label, prezzo_unitario, quantita_preventivo, " +
+                "importo_preventivo, origine, created_by) " +
+                "VALUES (:ev, 'Incasso da attribuire', :imp, 1, :imp, 'MANUALE', :user)")
+                .setParameter("ev", id)
+                .setParameter("imp", importo)
+                .setParameter("user", userId)
+                .executeUpdate();
+        em.flush();
+        return id;
     }
 
     private void aggiornaStatoEvento(UUID id, String stato, UUID eventoId, String nota) {
@@ -421,23 +799,39 @@ public class ImportTriageService {
         for (Object[] r : rows) codiciSugg.add(suggerisciCogeCodice((String) r[4] /* tipo */, (String) r[6] /* descr */));
         java.util.Map<String, Integer> idByCodice = cogeIdByCodice(new java.util.HashSet<>(codiciSugg));
 
+        // Match strutturato coi piani attivi: UNA query per pagina, poi confronto in memoria.
+        // Ricalcolato a ogni lettura e mai persistito (SPEC I3): così le righe già in coda
+        // ricevono la proposta appena i piani vengono creati, senza rifare l'import.
+        List<RataMatcher.Piano> piani = rows.isEmpty() ? List.of() : matchService.pianiAttivi();
+
         List<RicorrenteParcheggiataDTO> content = new ArrayList<>(rows.size());
         for (int i = 0; i < rows.size(); i++) {
             Object[] r = rows.get(i);
             String codiceSugg = codiciSugg.get(i);
             Integer idSugg = codiceSugg == null ? null : idByCodice.get(codiceSugg);
+            LocalDate dataMov = r[2] == null ? null : ((java.sql.Date) r[2]).toLocalDate();
+            Short conto = r[5] == null ? null : ((Number) r[5]).shortValue();
+            RataMatcher.Esito esito = "USCITA".equals((String) r[4])
+                    ? RataMatcher.valuta(conto, (BigDecimal) r[3], dataMov, (String) r[6], piani)
+                    : new RataMatcher.Esito(null, List.of());
             content.add(new RicorrenteParcheggiataDTO(
-                    toUuid(r[0]), (String) r[1],
-                    r[2] == null ? null : ((java.sql.Date) r[2]).toLocalDate(),
-                    (BigDecimal) r[3], (String) r[4],
-                    r[5] == null ? null : ((Number) r[5]).shortValue(),
+                    toUuid(r[0]), (String) r[1], dataMov,
+                    (BigDecimal) r[3], (String) r[4], conto,
                     (String) r[6], (String) r[7],
                     r[8] == null ? null : toUuid(r[8]), (String) r[9],
-                    idSugg, idSugg == null ? null : codiceSugg));
+                    idSugg, idSugg == null ? null : codiceSugg,
+                    esito.proposta() == null ? null : esito.proposta().rataId(),
+                    esito.candidati().stream().map(ImportTriageService::toDto).toList()));
         }
         long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where)
                 .setParameter("stato", stato).getSingleResult()).longValue();
         return PagedResponse.of(content, page, size, total);
+    }
+
+    private static RicorrenteParcheggiataDTO.CandidatoRataDTO toDto(RataMatcher.Candidato c) {
+        return new RicorrenteParcheggiataDTO.CandidatoRataDTO(
+                c.pianoId(), c.pianoDescrizione(), c.rataId(), c.numeroRata(), c.dataScadenza(),
+                c.importoRata(), c.scartoGiorni(), c.scartoImporto(), c.motivo());
     }
 
     /**
@@ -502,7 +896,11 @@ public class ImportTriageService {
         }
         LocalDate dataAddebito = r[2] == null ? null : ((java.sql.Date) r[2]).toLocalDate();
 
-        UUID movimentoId = recurringService.collegaRataDaImport(req.pianoId(), req.rataId(), dataAddebito, userId);
+        // L'importo reale si legge QUI dalla riga parcheggiata, non dal client: è il dato certo
+        // dell'estratto conto e sovrascrive la stima del piano (SPEC ricorrenti-importo-reale-da-import).
+        BigDecimal importoReale = (BigDecimal) r[3];
+        UUID movimentoId = recurringService.collegaRataDaImport(
+                req.pianoId(), req.rataId(), dataAddebito, importoReale, userId);
 
         int claimed = em.createNativeQuery(
                 "UPDATE ricorrenti_da_riconciliare SET stato = 'RICONCILIATA', recurring_plan_id = :piano, " +
@@ -590,6 +988,180 @@ public class ImportTriageService {
         mvRefresh.requestRefreshAfterCommit();
     }
 
+    // ── Coda «Righe fuori dai conti» (audit §7.4 · SPEC docs/specs/righe-fuori-dai-conti.md) ──
+    // Le righe bancarie che l'import ha escluso stanno in import_scartati da sempre, ma fino
+    // all'11/08/2026 nessuna schermata le leggeva: 1.189,55 € di accrediti veri, muti, in 6 mesi.
+
+    @Inject MovimentoNormalizer normalizer;
+
+    /** La coda: righe escluse dalla pipeline, col «perché» in italiano e i dati per contabilizzarle. */
+    @SuppressWarnings("unchecked")
+    public PagedResponse<ScartatoDTO> listScartati(String stato, int page, int size) {
+        String where = "FROM import_scartati WHERE (CAST(:stato AS VARCHAR) IS NULL OR stato = :stato)";
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT id, import_log_id, riga_numero, fonte, motivo, data_movimento, importo, " +
+                "CAST(raw_data AS text), stato, movimento_id " + where +
+                " ORDER BY data_movimento, riga_numero LIMIT :size OFFSET :offset")
+                .setParameter("stato", stato).setParameter("size", size)
+                .setParameter("offset", (long) page * size)
+                .getResultList();
+
+        Map<Short, String> contoNomi = contiBancariNomi();
+        List<ScartatoDTO> content = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            String motivo = (String) r[4];
+            var norm = rinormalizza((String) r[7], ((Number) r[2]).intValue());
+            Short conto = norm == null ? null : norm.contoBancarioId();
+            content.add(new ScartatoDTO(
+                    toUuid(r[0]), toUuid(r[1]), (String) r[3], ((Number) r[2]).intValue(),
+                    motivo, motivoLeggibile(motivo),
+                    r[5] == null ? null : ((java.sql.Date) r[5]).toLocalDate(),
+                    (BigDecimal) r[6],
+                    norm == null ? null : norm.tipo(),
+                    norm == null ? null : norm.descrizione(),
+                    conto, conto == null ? null : contoNomi.get(conto),
+                    (String) r[8], r[9] == null ? null : toUuid(r[9]),
+                    norm != null && norm.contoBancarioId() != null));
+        }
+        long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where)
+                .setParameter("stato", stato).getSingleResult()).longValue();
+        return PagedResponse.of(content, page, size, total);
+    }
+
+    /**
+     * CONTABILIZZA («mettila nei conti») crea il movimento dalla riga; IGNORA («lasciala fuori»)
+     * la chiude senza toccare i saldi. In entrambi i casi la riga resta in tabella (invariante I1).
+     *
+     * <p>Il client manda SOLO il CoGe: importo, tipo, data, conto e metodo si ri-derivano dal
+     * grezzo col normalizzatore dell'import (I3) — un client che manda 10.000 € non li contabilizza.
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
+    @Transactional
+    public void risolviScartato(UUID id, RisolviScartatoRequest req, UUID userId) {
+        List<Object[]> found = em.createNativeQuery(
+                "SELECT stato, import_log_id, riga_numero, CAST(raw_data AS text) " +
+                "FROM import_scartati WHERE id = :id").setParameter("id", id).getResultList();
+        if (found.isEmpty()) {
+            throw new ApiException(Response.Status.NOT_FOUND, "SCARTATO_NON_TROVATO", "Riga " + id);
+        }
+        Object[] r = found.get(0);
+        if (!"DA_VEDERE".equals((String) r[0])) {
+            throw new ApiException(Response.Status.CONFLICT, "SCARTATO_GIA_RISOLTO",
+                    "Questa riga è già stata decisa");
+        }
+        String azione = req.azione() == null ? "" : req.azione().toUpperCase();
+        switch (azione) {
+            case "IGNORA" -> claimScartato(id, "IGNORATA", userId);
+            case "CONTABILIZZA" -> contabilizzaScartato(id, toUuid(r[1]),
+                    ((Number) r[2]).intValue(), (String) r[3], req.cogeId(), userId);
+            default -> throw new ApiException(Response.Status.BAD_REQUEST, "AZIONE_NON_VALIDA",
+                    "Azione non valida: " + req.azione() + " (CONTABILIZZA | IGNORA)");
+        }
+    }
+
+    private void contabilizzaScartato(UUID id, UUID importLogId, int riga, String rawJson,
+                                      Integer cogeId, UUID userId) {
+        if (cogeId == null) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "COGE_OBBLIGATORIO",
+                    "Scegli il conto su cui contabilizzare la riga");
+        }
+        List<Object[]> coge = em.createNativeQuery(
+                "SELECT id, codice FROM piano_dei_conti_coge WHERE id = :id")
+                .setParameter("id", cogeId).getResultList();
+        if (coge.isEmpty()) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "COGE_NON_TROVATO",
+                    "Conto CoGe inesistente: " + cogeId);
+        }
+        // Guard-rail §7.6: un ricavo-evento senza evento collegato non compare in nessun bilancio.
+        CogeRiservatoEventi.vieta((String) coge.get(0)[1]);
+
+        var n = rinormalizza(rawJson, riga);
+        if (n == null || n.contoBancarioId() == null || n.dataMovimento() == null
+                || n.importo() == null || n.importo().signum() <= 0) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "RIGA_NON_LEGGIBILE",
+                    "Il grezzo di questa riga non basta per creare un movimento (conto, data o "
+                    + "importo mancanti): va inserita a mano dalla pagina Movimenti.");
+        }
+        // Il metodo non è MAI null (I6): un movimento senza metodo sparisce dalle viste per metodo.
+        String metodoCodice = n.metodoPagamentoCodice() != null ? n.metodoPagamentoCodice()
+                : "ENTRATA".equals(n.tipo()) ? "BONIFICO" : "ADDEBITO_CONTO";
+
+        // Claim ATOMICO anti doppia-contabilizzazione (I2): la perdente vede 0 righe → 409.
+        claimScartato(id, "CONTABILIZZATA", userId);
+
+        MovimentoCreateRequest req = new MovimentoCreateRequest(
+                n.tipo(), n.importo(), null, null,
+                n.dataMovimento(), n.dataMovimento(), n.dataMovimento(), null,
+                n.contoBancarioId(), metodoIdByCodiceOrThrow(metodoCodice), BU_OVERHEAD, cogeId,
+                null, null, null, null,
+                n.descrizione() != null && !n.descrizione().isBlank()
+                        ? n.descrizione() : "Riga bancaria fuori dai conti",
+                null,
+                // Stesso riferimento esterno della riga: al prossimo import il dedup la riconosce
+                // e non la contabilizza una seconda volta.
+                n.riferimentoEsterno(), "IMPORT_BANCA", null);
+        UUID movimentoId = movimentiService.createMovimentoImport(req, userId, importLogId).id();
+
+        em.createNativeQuery("UPDATE import_scartati SET movimento_id = :mid WHERE id = :id")
+                .setParameter("mid", movimentoId).setParameter("id", id).executeUpdate();
+        mvRefresh.requestRefreshAfterCommit();
+    }
+
+    /** Transizione di stato con predicato: è l'unico guard concorrenza-safe (row-lock). */
+    private void claimScartato(UUID id, String nuovoStato, UUID userId) {
+        int claimed = em.createNativeQuery(
+                "UPDATE import_scartati SET stato = :stato, risolto_at = now(), risolto_by = :uid " +
+                "WHERE id = :id AND stato = 'DA_VEDERE'")
+                .setParameter("stato", nuovoStato).setParameter("uid", userId)
+                .setParameter("id", id).executeUpdate();
+        if (claimed == 0) {
+            throw new ApiException(Response.Status.CONFLICT, "SCARTATO_GIA_RISOLTO",
+                    "Questa riga è già stata decisa");
+        }
+    }
+
+    /**
+     * Ricostruisce i dati contabili dal grezzo con lo stesso normalizzatore dell'import (DRY: la
+     * riga non li duplica in colonne). null se il grezzo non è più interpretabile.
+     */
+    private com.agostinelli.gestionale.movimenti.importlayer.model.RawMovimento rinormalizza(
+            String rawJson, int riga) {
+        try {
+            Map<String, String> campi = objectMapper.readValue(rawJson,
+                    new com.fasterxml.jackson.core.type.TypeReference<Map<String, String>>() {});
+            return normalizer.normalize(
+                    new com.agostinelli.gestionale.movimenti.importlayer.model.RawRow(riga, campi));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Il «perché» detto in italiano: il codice motivo non spiega niente a chi deve decidere. */
+    private String motivoLeggibile(String motivo) {
+        return switch (motivo == null ? "" : motivo) {
+            case "SKIP_CODA_TESTA" -> "l'incasso POS è dell'anno prima (la banca lo accredita a "
+                    + "gennaio, ma la vendita è di dicembre): l'import lo lascia fuori dal periodo";
+            case "SKIP_POS" -> "l'import l'ha presa per un incasso già registrato da Billy — ma "
+                    + "questo accredito in Billy non c'è: controlla se è denaro tuo";
+            case "SKIP_GIROCONTO" -> "riconosciuta come trasferimento fra due conti tuoi "
+                    + "(nessun ricavo né costo)";
+            default -> "esclusa dall'import con motivo «" + motivo + "»";
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<Short, String> contiBancariNomi() {
+        Map<Short, String> out = new LinkedHashMap<>();
+        for (Object[] r : (List<Object[]>) em.createNativeQuery(
+                "SELECT id, nome FROM conti_bancari").getResultList()) {
+            out.put(((Number) r[0]).shortValue(), (String) r[1]);
+        }
+        return out;
+    }
+
     /** Suggerisce il codice CoGe dalla descrizione (case-insensitive); null = l'utente sceglie. */
     private String suggerisciCogeCodice(String tipo, String descrizione) {
         if ("ENTRATA".equals(tipo)) return COGE_FINANZIAMENTO_ENTRATA;
@@ -635,42 +1207,31 @@ public class ImportTriageService {
     }
 
     /**
-     * Vista dedicata Effetti/RiBa: i pagamenti a ricevuta bancaria finiscono sul transitorio costi
-     * (49.99.999) perché la descrizione non nomina il fornitore. Qui si filtrano per catalogarli
-     * rapidamente (riusa {@link #classificaTransitorio}). Sono movimenti USCITA su 49.99.999 la cui
-     * descrizione contiene EFFETTI o RIBA.
+     * Quali rami (BU) sono stati storicamente usati per ciascun conto CoGe.
+     *
+     * <p>Serve al secondo mezzo-passo del wizard §7.1/§7.5: scelta la voce di spesa, il ramo nella
+     * gran parte dei casi DISCENDE da quella e non va chiesto. Il wizard chiede solo quando la
+     * lista ha più di un elemento (voce usata da più rami) o è vuota (voce mai usata).
+     * Una query di aggregazione, letta all'apertura della pagina — non per riga.
      */
     @SuppressWarnings("unchecked")
-    public PagedResponse<TransitorioDTO> listRibaTransitori(int page, int size) {
-        String where =
-                "FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id " +
-                "WHERE p.codice = '" + COGE_COSTI_DACLASS + "' AND m.stato <> 'ANNULLATO' AND m.tipo = 'USCITA' " +
-                "AND (m.descrizione ILIKE '%EFFETTI%' OR m.descrizione ILIKE '%RIBA%')";
-        List<Object[]> rows = em.createNativeQuery(
-                "SELECT m.id, m.tipo, m.importo_lordo, m.data_movimento, m.descrizione, p.codice, " +
-                "m.fornitore_id, m.conto_bancario_id " + where +
-                " ORDER BY m.data_movimento, m.id LIMIT :size OFFSET :offset")
-                .setParameter("size", size).setParameter("offset", (long) page * size).getResultList();
-        List<TransitorioDTO> content = new ArrayList<>(rows.size());
-        for (Object[] r : rows) {
-            String descr = (String) r[4];
-            Short conto = r[7] == null ? null : ((Number) r[7]).shortValue();
-            EntitaEstratte ent = estraiEntita(descr, conto);
-            content.add(new TransitorioDTO(
-                    toUuid(r[0]), (String) r[1], (BigDecimal) r[2],
-                    ((java.sql.Date) r[3]).toLocalDate(), descr, (String) r[5],
-                    r[6] == null ? null : toUuid(r[6]), conto,
-                    ent.ibanControparte(), ent.beneficiario() != null ? ent.beneficiario() : ent.ordinante()));
+    public Map<Integer, List<Short>> buPerCoge() {
+        Map<Integer, List<Short>> out = new LinkedHashMap<>();
+        for (Object[] r : (List<Object[]>) em.createNativeQuery(
+                "SELECT conto_coge_id, business_unit_id, COUNT(*) AS n FROM movimenti " +
+                "WHERE stato <> 'ANNULLATO' AND conto_coge_id IS NOT NULL AND business_unit_id IS NOT NULL " +
+                "GROUP BY 1, 2 ORDER BY 1, n DESC").getResultList()) {
+            out.computeIfAbsent(((Number) r[0]).intValue(), k -> new ArrayList<>())
+                    .add(((Number) r[1]).shortValue());
         }
-        long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where).getSingleResult()).longValue();
-        return PagedResponse.of(content, page, size, total);
+        return out;
     }
 
     /**
      * Pannello di quadratura di periodo (PROMPT-RICONCILIAZIONE-PERIODO §5): sostituisce la
      * vecchia vista "Incassi POS da ripartire" a scontrino. Restituisce la quadratura dell'ultimo
      * import congiunto (o di {@code importLogId} se valorizzato): Σ Billy ↔ Σ POS banca scomposto
-     * per causa (coda testa esclusa, coda fondo in attesa, residuo core). Informativo: i ricavi
+     * per causa (coda testa esclusa, coda fondo in attesa). Informativo: i ricavi
      * sono comunque contabilizzati da Billy. Null se non c'è ancora nessuna quadratura.
      */
     @SuppressWarnings("unchecked")
@@ -681,25 +1242,25 @@ public class ImportTriageService {
                 "pos_banca_totale, pos_banca_core, sigma_bpm, sigma_ca, assegnato_bpm, assegnato_ca, " +
                 // NB: CAST(... AS text), NON '::text' → in una query native Hibernate i ':' sono
                 // marcatori di parametro e '::' rompe il parser (syntax error at or near ":").
-                "coda_testa, coda_fondo, residuo_core, max_del_banca, CAST(note AS text), CAST(in_attesa AS text) " +
+                "coda_testa, coda_fondo, max_del_banca, CAST(note AS text), CAST(in_attesa AS text) " +
                 "FROM quadratura_periodo" + where + " ORDER BY created_at DESC LIMIT 1");
         if (importLogId != null) qy.setParameter("id", importLogId);
         List<Object[]> rows = qy.getResultList();
         if (rows.isEmpty()) return null;
         Object[] r = rows.get(0);
 
-        List<String> note = jsonToStringList((String) r[15]);
-        List<QuadraturaPeriodoDTO.InAttesaDTO> attesa = jsonToInAttesa((String) r[16]);
+        List<String> note = jsonToStringList((String) r[14]);
+        List<QuadraturaPeriodoDTO.InAttesaDTO> attesa = jsonToInAttesa((String) r[15]);
         List<String> approssimazioni = buildApprossimazioni(
-                (BigDecimal) r[7], (BigDecimal) r[8], (BigDecimal) r[9], (BigDecimal) r[10], (BigDecimal) r[13]);
+                (BigDecimal) r[7], (BigDecimal) r[8], (BigDecimal) r[9], (BigDecimal) r[10]);
         return new QuadraturaPeriodoDTO(
                 toUuid(r[0]),
                 toLocalDate(r[1]),   // created_at (timestamptz): il driver lo dà come Instant, non Timestamp
                 ((Number) r[2]).intValue(),
                 (BigDecimal) r[3], (BigDecimal) r[4], (BigDecimal) r[5], (BigDecimal) r[6],
                 (BigDecimal) r[7], (BigDecimal) r[8], (BigDecimal) r[9], (BigDecimal) r[10],
-                (BigDecimal) r[11], (BigDecimal) r[12], (BigDecimal) r[13],
-                toLocalDate(r[14]),  // max_del_banca (date)
+                (BigDecimal) r[11], (BigDecimal) r[12],
+                toLocalDate(r[13]),  // max_del_banca (date)
                 note, approssimazioni, attesa);
     }
 
@@ -709,7 +1270,7 @@ public class ImportTriageService {
      * uno scarto atteso (non un errore). Calcolate dai numeri persistiti della quadratura.
      */
     private List<String> buildApprossimazioni(BigDecimal sigmaBpm, BigDecimal sigmaCa,
-                                              BigDecimal assBpm, BigDecimal assCa, BigDecimal residuo) {
+                                              BigDecimal assBpm, BigDecimal assCa) {
         BigDecimal sigmaTot = sigmaBpm.add(sigmaCa);
         BigDecimal assTot = assBpm.add(assCa);
         BigDecimal deltaBpm = assBpm.subtract(sigmaBpm);
@@ -728,9 +1289,6 @@ public class ImportTriageService {
                 + "banca non centrano il target al centesimo.");
         a.add("Anche la CATEGORIA attribuita a ciascun conto è convenzionale: deriva dallo scontrino "
                 + "Billy, non dalla riga banca.");
-        a.add("Residuo core " + residuo.toPlainString() + " € INFORMATIVO: differenza Billy↔banca da "
-                + "agriturismo incassato a POS, Satispay (netto banca vs lordo Billy ~1%) e storni. "
-                + "Non è contabilizzato come spaccio.");
         return a;
     }
 
@@ -744,6 +1302,15 @@ public class ImportTriageService {
         if (o instanceof java.time.Instant i) return i.atZone(java.time.ZoneId.systemDefault()).toLocalDate();
         if (o instanceof java.time.OffsetDateTime odt) return odt.toLocalDate();
         return LocalDate.parse(o.toString().substring(0, 10));
+    }
+
+    /** Converte un timestamp JDBC (Instant/OffsetDateTime/Timestamp) in Instant. */
+    private java.time.Instant toInstant(Object o) {
+        if (o == null) return null;
+        if (o instanceof java.time.Instant i) return i;
+        if (o instanceof java.sql.Timestamp t) return t.toInstant();
+        if (o instanceof java.time.OffsetDateTime odt) return odt.toInstant();
+        return java.time.Instant.parse(o.toString());
     }
 
     private List<String> jsonToStringList(String json) {

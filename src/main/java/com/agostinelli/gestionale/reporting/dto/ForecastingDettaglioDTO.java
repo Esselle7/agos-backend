@@ -6,6 +6,7 @@ import java.time.LocalDate;
 /**
  * Singola voce previsionale nella tabella dettaglio.
  * categoria:    MOVIMENTO | EVENTO | RATA_RICORRENTE | STIPENDIO
+ *               | RATA_RICORRENTE_CAPITALE | RATA_RICORRENTE_INTERESSI (piani FINANZIAMENTO)
  * vista:        ECONOMICA | FINANZIARIA | ENTRAMBE
  * affidabilita: CERTO (contrattualizzato) | STIMATO (media storica ricavi cash)
  */

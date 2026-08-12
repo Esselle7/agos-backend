@@ -50,6 +50,9 @@ public class EventiRepository implements PanacheRepositoryBase<Evento, UUID> {
     private void appendFilters(StringBuilder jpql, Map<String, Object> params,
             String stato, Short buId, LocalDate from, LocalDate to, String search) {
 
+        // I segnaposto ("[DA ATTRIBUIRE] …") sono contenitori tecnici di incassi non ancora
+        // attribuiti: restano fuori da lista e calendario, si vedono solo nella vista dedicata.
+        jpql.append(" AND e.isSegnaposto = false");
         if (stato != null) {
             jpql.append(" AND e.stato = :stato");
             params.put("stato", stato);
@@ -91,7 +94,8 @@ public class EventiRepository implements PanacheRepositoryBase<Evento, UUID> {
     }
 
     public List<Evento> findCalendario(LocalDate from, LocalDate to) {
-        return list("dataEvento >= ?1 AND dataEvento <= ?2 ORDER BY dataEvento ASC", from, to);
+        return list("isSegnaposto = false AND dataEvento >= ?1 AND dataEvento <= ?2 ORDER BY dataEvento ASC",
+                from, to);
     }
 
     /**

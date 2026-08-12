@@ -42,7 +42,7 @@ class ImportPerfProbeTest {
         time("getImportKpi", () -> { triage.getKpi(); return 0; });
         time("listTransitori(2000)", () -> triage.listTransitori(null, 0, 2000).totalElements());
         time("getQuadratura", () -> triage.getQuadratura(null) == null ? 0 : 1);
-        time("listRibaTransitori(2000)", () -> triage.listRibaTransitori(0, 2000).totalElements());
+        time("buPerCoge", () -> triage.buPerCoge().size());
         time("listRicorrenti(2000)", () -> triage.listRicorrenti("DA_RICONCILIARE", 0, 2000).totalElements());
         time("listEventi(2000)", () -> triage.listEventi("DA_RICONCILIARE", 0, 2000).totalElements());
         time("analisiDuplicati (O(n^2))", () -> triage.analisiDuplicati().coppie().size());

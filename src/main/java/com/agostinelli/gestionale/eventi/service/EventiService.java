@@ -49,6 +49,10 @@ public class EventiService {
 
     private static final BigDecimal SOGLIA_SALDO = new BigDecimal("0.01");
 
+    /** Foglie di ricavo della BU "Cerimonie ed Eventi" (piano dei conti, mastro 30.02). */
+    private static final String COGE_CAPARRE_EVENTI = "30.02.001";
+    private static final String COGE_SALDI_EVENTI   = "30.02.002";
+
     /**
      * Timezone di riferimento per le validazioni di date che derivano da
      * input umano (oggi/ieri). Usare la TZ del business (Italia) evita che
@@ -277,16 +281,13 @@ public class EventiService {
                     "Il rimborso EUR " + req.importo() + " supera l'incassato EUR " + e.importoIncassato);
         }
 
-        // Vincolo unicità: max 1 CAPARRA, 1 ACCONTO, 1 SALDO
-        if (List.of("CAPARRA", "ACCONTO", "SALDO").contains(req.tipo())) {
-            long contaEsistenti = movimentiRepo.count(
-                    "eventoId = ?1 AND tipoEventoMovimento = ?2 AND stato != ?3",
-                    eventoId, req.tipo(), "ANNULLATO");
-            if (contaEsistenti > 0) {
-                throw new ApiException(Response.Status.CONFLICT, "PAGAMENTO_GIA_PRESENTE",
-                        "Esiste già un pagamento di tipo " + req.tipo() + " per questo evento");
-            }
-        }
+        // NESSUN vincolo di unicità sul tipo: più pagamenti dello stesso tipo sullo stesso
+        // evento sono legittimi (una caparra pagata in due tranche è il caso normale del
+        // cliente: CELLA ERIKA, 18/09/2026, "CAPARRA 3" 320,00 + "CAPARRA 3 BIS" 20,00).
+        // Il doppio inserimento dello STESSO bonifico resta escluso a monte, non qui:
+        // dedup dell'import (chiave_aggancio / eventoDuplicatoFallback) e invariante I2
+        // "una riga parcheggiata si risolve una volta sola" (EVENTO_GIA_RISOLTO).
+        // Vedi docs/specs/import-eventi-attribuzione.md (I3) e docs/adr/003.
 
         // Importo non supera il residuo (solo per CAPARRA/ACCONTO/SALDO — non per PENALE/RIMBORSO)
         if (!"PENALE".equals(req.tipo()) && !"RIMBORSO".equals(req.tipo())
@@ -299,7 +300,7 @@ public class EventiService {
         }
 
         // Crea il Movimento: competenza economica = data evento, data finanziaria = data pagamento
-        Integer cogeId = req.contoCoge() != null ? req.contoCoge() : lookupCogeRicavi();
+        Integer cogeId = req.contoCoge() != null ? req.contoCoge() : lookupCogeRicavi(req.tipo());
         // RIMBORSO: importo negativo riduce importoIncassato via ricalcolaIncassi
         BigDecimal importoMovimento = "RIMBORSO".equals(req.tipo())
                 ? req.importo().negate()
@@ -319,7 +320,11 @@ public class EventiService {
         m.metodoPagamentoId     = req.metodoPagamentoId();
         m.businessUnitId        = e.businessUnitId != null ? e.businessUnitId : 2;
         m.contoCoge             = cogeId;
-        m.descrizione           = "[EVENTO] " + e.nome + " – " + req.tipo();
+        // Il nome dei segnaposto porta già il marcatore "[DA ATTRIBUIRE] " (ImportTriageService:520):
+        // concatenarlo a "[EVENTO] " produceva descrizioni con due prefissi in fila, del tipo
+        // «[EVENTO] [DA ATTRIBUIRE] GIOVACCHINI MATTIA – SALDO». Il fatto che sia un segnaposto è
+        // già portato dalla colonna is_segnaposto: nella descrizione basta il nome della controparte.
+        m.descrizione           = "[EVENTO] " + spogliaSegnaposto(e.nome) + " – " + req.tipo();
         m.note                  = req.note();
         m.fonte                 = "MANUALE";
         m.createdBy             = userId;
@@ -1288,10 +1293,37 @@ public class EventiService {
         return count > 0;
     }
 
-    private Integer lookupCogeRicavi() {
+    /**
+     * Conto di ricavo su cui nasce il pagamento evento, quando il chiamante non ne impone uno.
+     *
+     * <p>Prima qui c'era {@code codice LIKE '30.%' ORDER BY codice LIMIT 1}, che restituisce
+     * <b>30.01 "Ricavi Ristorazione e Agriturismo"</b>: un mastro (ha due figli) e per giunta
+     * di un'altra business unit. Misurato il 07/08/2026 attribuendo i 26 incassi-evento
+     * dell'import di luglio: 18.924,00 EUR finiti tutti su 30.01, quindi fuori dalla riga
+     * "Ricavi Cerimonie ed Eventi" del conto economico. Lo storico seminato da V15 usa
+     * 30.02.002, quindi lo stesso ricavo era contabilizzato in due posti diversi.
+     *
+     * <p>Ora si sceglie la foglia giusta: le caparre hanno un conto dedicato, tutto il resto
+     * (acconto, saldo, penale, rimborso) sta sui saldi eventi.
+     */
+    private Integer lookupCogeRicavi(String tipoPagamento) {
+        String codice = "CAPARRA".equals(tipoPagamento) ? COGE_CAPARRE_EVENTI : COGE_SALDI_EVENTI;
         return ((Number) em.createNativeQuery(
-                "SELECT id FROM piano_dei_conti_coge WHERE codice LIKE '30.%' ORDER BY codice LIMIT 1")
+                "SELECT id FROM piano_dei_conti_coge WHERE codice = :c")
+                .setParameter("c", codice)
                 .getSingleResult()).intValue();
+    }
+
+
+    /** Marcatore dei segnaposto, definito in ImportTriageService: non va ripetuto in descrizione. */
+    static final String PREFISSO_SEGNAPOSTO = "[DA ATTRIBUIRE] ";
+
+    /** Toglie il marcatore di segnaposto dal nome evento, per non avere due prefissi in fila. */
+    public static String spogliaSegnaposto(String nomeEvento) {
+        if (nomeEvento == null) return "";
+        return nomeEvento.startsWith(PREFISSO_SEGNAPOSTO)
+                ? nomeEvento.substring(PREFISSO_SEGNAPOSTO.length())
+                : nomeEvento;
     }
 
 }

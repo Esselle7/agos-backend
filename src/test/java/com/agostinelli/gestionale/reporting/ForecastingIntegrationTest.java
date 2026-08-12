@@ -304,8 +304,11 @@ class ForecastingIntegrationTest {
             .then().statusCode(200)
             .extract().jsonPath().getList("economico.dettaglio");
 
+        // I piani FINANZIAMENTO spezzano la rata in due voci (ForecastingService:423): senza
+        // queste due l'invariante falliva appena esisteva un piano di quel tipo nel DB di test.
         java.util.Set<String> categorieValide = java.util.Set.of(
-            "MOVIMENTO", "EVENTO", "RATA_RICORRENTE", "STIPENDIO");
+            "MOVIMENTO", "EVENTO", "RATA_RICORRENTE", "STIPENDIO",
+            "RATA_RICORRENTE_CAPITALE", "RATA_RICORRENTE_INTERESSI");
 
         for (Map<String, Object> voce : dettaglio) {
             String cat = (String) voce.get("categoria");

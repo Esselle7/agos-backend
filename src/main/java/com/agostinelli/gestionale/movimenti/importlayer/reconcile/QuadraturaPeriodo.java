@@ -11,8 +11,12 @@ import java.util.List;
  * cause note (coda testa esclusa, coda fondo in attesa, residuo core).
  *
  * <p>Tutti gli importi sono in euro (BigDecimal, scala 2). La scomposizione vale:
- * {@code posBancaTotale = posBancaCore + codaTesta} e
- * {@code residuoCore = posBancaCore − billyContabilizzato} (può essere ≠ 0: è reale, va mostrato).
+ * {@code posBancaTotale = posBancaCore + codaTesta}.
+ *
+ * <p>Il campo {@code residuoCore} è stato rimosso il 2026-08-11: dopo il fix A2 (le righe POS
+ * bancarie SONO i movimenti) valeva {@code posCore − posBook}, cioè zero per costruzione — una
+ * guardia che non poteva fallire. Il delta che può davvero divergere (POS banca − Billy spaccio)
+ * resta come nota testuale «scarto informativo».
  *
  * @param anno                  anno del periodo (dedotto dagli scontrini Billy)
  * @param billyElettronicoNonAgri Σ scontrini Billy elettronici non-agriturismo (tutto il file)
@@ -25,7 +29,6 @@ import java.util.List;
  * @param assegnatoCa           Σ ricavi Billy assegnati al conto CA dalla ripartizione
  * @param codaTesta             POS con DEL di anno precedente → esclusi (non contabilizzati)
  * @param codaFondo             vendite Billy dopo l'ultima DEL → in attesa di accredito (non contab.)
- * @param residuoCore           Δ core residuo (agriturismo-a-POS, Satispay netto/lordo, storni)
  * @param maxDelBanca           ultima data "DEL" presente negli estratti banca (soglia coda fondo)
  * @param note                  cause leggibili del residuo (per il pannello)
  */
@@ -41,7 +44,6 @@ public record QuadraturaPeriodo(
         BigDecimal assegnatoCa,
         BigDecimal codaTesta,
         BigDecimal codaFondo,
-        BigDecimal residuoCore,
         LocalDate maxDelBanca,
         List<String> note
 ) {}

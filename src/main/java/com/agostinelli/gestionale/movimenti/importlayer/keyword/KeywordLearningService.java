@@ -6,6 +6,7 @@ import com.agostinelli.gestionale.movimenti.dto.KeywordAnteprimaDTO;
 import com.agostinelli.gestionale.movimenti.dto.KeywordConflittoDTO;
 import com.agostinelli.gestionale.movimenti.dto.KeywordFirmaDTO;
 import com.agostinelli.gestionale.movimenti.dto.RisolviConflittoKeywordRequest;
+import com.agostinelli.gestionale.movimenti.importlayer.CogeRiservatoEventi;
 import com.agostinelli.gestionale.movimenti.importlayer.DescNormalizer;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordExtractor.FirmaCandidata;
 import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
@@ -46,6 +47,7 @@ public class KeywordLearningService {
     private static final String COGE_RICAVI_DACLASS = "39.99.999";
     private static final String COGE_COSTI_DACLASS = "49.99.999";
 
+
     // ── APPRENDIMENTO (hook del triage) ─────────────────────────────────────────────────
 
     /**
@@ -58,6 +60,7 @@ public class KeywordLearningService {
                                               String tipoMovimento, Short bu, Integer cogeId,
                                               UUID fornitoreId, UUID movimentoId, UUID userId) {
         String coge = cogeCodice(cogeId);
+        CogeRiservatoEventi.vieta(coge);
         List<FirmaCandidata> firme = KeywordExtractor.estraiFirme(
                 descrizione, entita, engine.stopwords(), engine.domainTokens());
 
@@ -226,6 +229,7 @@ public class KeywordLearningService {
         if (!park && (d.cogeCodice() == null || d.buId() == null)) {
             throw new ApiException(Response.Status.BAD_REQUEST, "FIRMA_BOOK_INCOMPLETA", "Una firma BOOK richiede COGE e BU");
         }
+        CogeRiservatoEventi.vieta(d.cogeCodice());
         if (d.fornitoreId() != null && !"IDENTITA".equals(d.natura())) {
             throw new ApiException(Response.Status.BAD_REQUEST, "FORNITORE_SOLO_IDENTITA", "Il fornitore è ammesso solo per firme IDENTITA");
         }
@@ -256,6 +260,7 @@ public class KeywordLearningService {
 
     @Transactional
     public void updateFirma(UUID id, KeywordFirmaDTO d) {
+        CogeRiservatoEventi.vieta(d.cogeCodice());
         int upd = em.createNativeQuery(
                 "UPDATE keyword_firma SET bu_id = CAST(:bu AS smallint), coge_codice = :coge, " +
                 "fornitore_id = CAST(:forn AS uuid), tipo_movimento = :tm, sorgente = :src, " +

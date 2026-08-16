@@ -62,11 +62,22 @@ class KeywordLearningIntegrationTest {
         assertEquals(1, esito.firmeCreate(), "deve creare una firma IDENTITÀ");
         assertFalse(esito.conflittoGenerato());
 
-        // Una riga simile al prossimo import viene auto-catalogata sul target appreso.
+        // Una riga simile al prossimo import riceve la PROPOSTA del target appreso — e NON la
+        // applica (SPEC import-v2 R5): una firma è un'ipotesi su un nome di fornitore, non un
+        // campo strutturale, quindi il movimento nasce sul transitorio e l'utente conferma.
         MappingResult r = mapping.map(rawUscita("PAGAMENTO FATTURA SELECOVER SRL"));
         assertEquals(MappingResult.MappingOutcome.SUCCESS, r.outcome());
-        assertEquals(coge, r.request().contoCoge(), "COGE dal target appreso");
-        assertEquals(fornitore, r.request().fornitoreId(), "fornitore dal target appreso");
+        assertEquals(com.agostinelli.gestionale.movimenti.importlayer.model.Confidenza.PROPOSTA,
+                r.confidenza(), "una firma appresa propone, non decide");
+        assertEquals(cogeId("49.99.999"), r.request().contoCoge(),
+                "il movimento nasce sul transitorio costi: il denaro resta a libro, la categoria no");
+        assertNotNull(r.proposta(), "la proposta va allegata");
+        assertEquals("40.11.001", r.proposta().cogeCodice(), "il conto PROPOSTO è il target appreso");
+        assertEquals(fornitore, r.proposta().fornitoreId(), "fornitore dal target appreso");
+        // R6: il perché in chiaro, e arriva al dato (nota del movimento), non solo al log.
+        assertTrue(r.proposta().perche().contains("SELECOVER"),
+                "il perché deve nominare la firma: " + r.proposta().perche());
+        assertTrue(r.request().note().contains("40.11.001"), r.request().note());
         assertNull(r.keywordConflittoSig(), "nessun conflitto");
     }
 
@@ -98,11 +109,13 @@ class KeywordLearningIntegrationTest {
         assertTrue(engine.classifica(rawEntrata("ACCONTO MATRIMONIO ROSSI"), Sorgente.CA).isEmpty(),
                 "una keyword evento non produce un target da contabilizzare (verrà parcheggiata dal Gate B)");
 
-        // SPACCIO è DOMINIO-CATEGORIA (BOOK): contabilizza su BU3 / 30.03.001.
+        // SPACCIO è DOMINIO-CATEGORIA (BOOK): PROPONE BU3 / 30.03.001 e lascia decidere (R5).
         MappingResult r = mapping.map(rawEntrata("INCASSO VENDITA SPACCIO"));
         assertEquals(MappingResult.MappingOutcome.SUCCESS, r.outcome());
-        assertEquals(cogeId("30.03.001"), r.request().contoCoge(), "SPACCIO → ricavi spaccio");
-        assertEquals((short) 3, (short) r.request().businessUnitId(), "SPACCIO → BU3");
+        assertEquals(cogeId("39.99.999"), r.request().contoCoge(), "nasce sul transitorio ricavi");
+        assertNotNull(r.proposta());
+        assertEquals("30.03.001", r.proposta().cogeCodice(), "SPACCIO → propone ricavi spaccio");
+        assertEquals((short) 3, (short) r.proposta().bu(), "SPACCIO → propone BU3");
     }
 
     @Test

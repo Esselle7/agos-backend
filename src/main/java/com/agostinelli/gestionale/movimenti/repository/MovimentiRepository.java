@@ -141,6 +141,51 @@ public class MovimentiRepository implements PanacheRepositoryBase<Movimento, UUI
         return list("eventoId = ?1 AND stato != 'ANNULLATO'", eventoId);
     }
 
+    /**
+     * Come {@link #findByEventoId} ma per un'intera pagina di eventi, in UNA query.
+     * Serve a {@code EventiService#findWithFilters}: chiamare findByEventoId per ogni evento
+     * era un N+1 (misurato 15/08/2026: ~274 transazioni per 37 eventi).
+     * Stesso identico predicato del metodo singolo, così le due strade non divergono.
+     */
+    public List<Movimento> findByEventoIds(Collection<UUID> eventoIds) {
+        if (eventoIds.isEmpty()) return List.of();
+        return list("eventoId IN ?1 AND stato != 'ANNULLATO'", eventoIds);
+    }
+
+    /**
+     * Un pagamento-evento identico già a libro: stesso evento, tipo, importo, data finanziaria
+     * e conto. Quella combinazione è lo <b>stesso bonifico registrato due volte</b>, non due
+     * incassi veri — due incassi reali differiscono almeno per data o importo.
+     *
+     * <p>Serve alla guardia di {@code EventiService.registraPagamento}: la lettura sta nella
+     * stessa transazione che scrive, quindi non può sfasarsi come farebbe un controllo fatto
+     * a inizio import (nel caso reale che l'ha motivata passarono 2 giorni fra le due
+     * registrazioni — vedi docs/specs/misure/incassi-evento-verifica-2026-08-14.md).
+     *
+     * <p>Con {@code contoBancarioId} null non blocca nulla: NULL = NULL è «unknown» in SQL.
+     * È voluto — i pagamenti-evento hanno sempre un conto (il triage rifiuta senza,
+     * {@code CONTO_BANCARIO_MANCANTE}) e restare fail-open su un caso che la guardia non
+     * riguarda è meglio che inventare un confronto fra sconosciuti.
+     *
+     * <p><b>Sesto campo, la controparte (A4).</b> Due bonifici di persone diverse con stesso
+     * importo, stesso giorno e stesso evento non sono un doppione: il 07/07/2026 due caparre da
+     * 20,00 € (INDUNI RENATA e DE AGOSTINI M RCO) sullo stesso evento del 25/09. Il confronto è
+     * <b>fail-closed</b>: solo una differenza <i>conosciuta</i> salva la riga, quindi una
+     * controparte NULL — da un lato o da entrambi — non distingue e il gemello scatta lo stesso.
+     * È la scrittura esplicita di ciò che SQL farebbe al contrario: con {@code = ?6} un NULL
+     * riaprirebbe il buco di «Greg» (registrazione manuale senza controparte + conferma dal
+     * wizard con controparte = due volte lo stesso bonifico a libro).
+     */
+    public Optional<Movimento> findPagamentoEventoGemello(
+            UUID eventoId, String tipoEventoMovimento, BigDecimal importo,
+            LocalDate dataFinanziaria, Short contoBancarioId, String controparte) {
+        return find("eventoId = ?1 AND tipoEventoMovimento = ?2 AND importo = ?3 "
+                  + "AND dataFinanziaria = ?4 AND contoBancarioId = ?5 AND stato != 'ANNULLATO' "
+                  + "AND (controparte IS NULL OR ?6 IS NULL OR controparte = ?6)",
+                eventoId, tipoEventoMovimento, importo, dataFinanziaria, contoBancarioId, controparte)
+                .firstResultOptional();
+    }
+
     /** Movimenti attivi non ancora attribuiti a un conto/cassa (conto_bancario_id IS NULL). */
     public List<Movimento> findSenzaBanca() {
         return list("contoBancarioId IS NULL AND stato != 'ANNULLATO' ORDER BY dataMovimento DESC");

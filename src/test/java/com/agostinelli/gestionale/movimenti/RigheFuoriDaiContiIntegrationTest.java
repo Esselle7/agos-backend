@@ -99,7 +99,7 @@ class RigheFuoriDaiContiIntegrationTest {
         ScartatoDTO riga = trovaCodaTesta(triageService.listScartati("DA_VEDERE", 0, 100).content());
 
         triageService.risolviScartato(riga.id(),
-                new RisolviScartatoRequest("CONTABILIZZA", cogeId(COGE_TRANSITORIO_COSTI)), TEST_USER);
+                new RisolviScartatoRequest("CONTABILIZZA", cogeId(COGE_TRANSITORIO_COSTI), null), TEST_USER);
 
         Object[] creati = (Object[]) em.createNativeQuery(
                 "SELECT count(*), COALESCE(sum(importo_lordo), 0) FROM movimenti m "
@@ -130,9 +130,9 @@ class RigheFuoriDaiContiIntegrationTest {
         ScartatoDTO riga = trovaCodaTesta(triageService.listScartati("DA_VEDERE", 0, 100).content());
         Integer coge = cogeId(COGE_TRANSITORIO_COSTI);
 
-        triageService.risolviScartato(riga.id(), new RisolviScartatoRequest("CONTABILIZZA", coge), TEST_USER);
+        triageService.risolviScartato(riga.id(), new RisolviScartatoRequest("CONTABILIZZA", coge, null), TEST_USER);
         ApiException e = assertThrows(ApiException.class, () -> triageService.risolviScartato(
-                riga.id(), new RisolviScartatoRequest("CONTABILIZZA", coge), TEST_USER));
+                riga.id(), new RisolviScartatoRequest("CONTABILIZZA", coge, null), TEST_USER));
         assertEquals("SCARTATO_GIA_RISOLTO", e.getCode());
 
         long quanti = ((Number) em.createNativeQuery(
@@ -147,7 +147,7 @@ class RigheFuoriDaiContiIntegrationTest {
         ScartatoDTO riga = trovaCodaTesta(triageService.listScartati("DA_VEDERE", 0, 100).content());
         long movimentiPrima = contaMovimentiImport();
 
-        triageService.risolviScartato(riga.id(), new RisolviScartatoRequest("IGNORA", null), TEST_USER);
+        triageService.risolviScartato(riga.id(), new RisolviScartatoRequest("IGNORA", null, "denaro gia' contato altrove"), TEST_USER);
 
         assertEquals(movimentiPrima, contaMovimentiImport(), "«Lasciala fuori» non muove un centesimo");
         assertEquals("IGNORATA", statoDi(riga.id()), "la riga resta a DB, marcata (invariante I1)");
@@ -163,7 +163,7 @@ class RigheFuoriDaiContiIntegrationTest {
                 .getSingleResult()).intValue();
 
         ApiException e = assertThrows(ApiException.class, () -> triageService.risolviScartato(
-                riga.id(), new RisolviScartatoRequest("CONTABILIZZA", cogeEvento), TEST_USER));
+                riga.id(), new RisolviScartatoRequest("CONTABILIZZA", cogeEvento, null), TEST_USER));
         assertEquals("COGE_RISERVATO_EVENTI", e.getCode());
         assertEquals("DA_VEDERE", statoDi(riga.id()), "il rifiuto non consuma la riga");
     }

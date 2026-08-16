@@ -9,5 +9,6 @@ package com.agostinelli.gestionale.movimenti.dto;
  */
 public record RisolviScartatoRequest(
         String azione,     // CONTABILIZZA | IGNORA
-        Integer cogeId     // obbligatorio su CONTABILIZZA; ignorato su IGNORA
+        Integer cogeId,    // obbligatorio su CONTABILIZZA; ignorato su IGNORA
+        String nota        // OBBLIGATORIO su IGNORA (R9): «escluso di proposito» vuole un perché scritto
 ) {}

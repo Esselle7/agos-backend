@@ -192,13 +192,14 @@ public class ImportLogService {
                     "La riga ambigua è già stata classificata o scartata");
         }
 
-        // Scarto: nessun movimento creato
+        // Scarto: nessun movimento creato. R9 — serve il motivo scritto: è una riga bancaria vera
+        // che resta fuori dai conti.
         if (req.scarta()) {
             em.createNativeQuery(
                             "UPDATE import_ambiguita SET stato = 'SCARTATO', classificato_da = :uid, " +
                             "classificato_at = now(), note_operatore = :nota WHERE id = :id")
                     .setParameter("uid", userId)
-                    .setParameter("nota", req.nota())
+                    .setParameter("nota", EsclusioneMotivata.obbligatorio(req.nota()))
                     .setParameter("id", id)
                     .executeUpdate();
             return;

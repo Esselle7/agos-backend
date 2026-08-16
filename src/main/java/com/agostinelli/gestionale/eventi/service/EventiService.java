@@ -40,9 +40,15 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class EventiService {
@@ -126,10 +132,49 @@ public class EventiService {
             String stato, Short buId, LocalDate from, LocalDate to,
             String search, int page, int size, boolean isAdmin) {
 
-        List<EventoDTO> content = repo.findWithFilters(stato, buId, from, to, search, page, size)
-                .stream().map(e -> buildEventoDTO(e, isAdmin)).toList();
+        List<Evento> eventi = repo.findWithFilters(stato, buId, from, to, search, page, size);
+        Prefetch pre = prefetch(eventi);
+        List<EventoDTO> content = eventi.stream().map(e -> buildEventoDTO(e, isAdmin, pre)).toList();
         long total = repo.countWithFilters(stato, buId, from, to, search);
         return PagedResponse.of(content, page, size, total);
+    }
+
+    /**
+     * Figli di un'intera pagina di eventi, caricati in 3 query invece che 3 per evento.
+     *
+     * PERCHE': {@link #buildEventoDTO} nasce per il singolo evento e interroga i figli uno alla
+     * volta; usato dentro il map di {@link #findWithFilters} diventava un N+1 (misurato il
+     * 15/08/2026: ~274 transazioni e 489 ms per 37 eventi, costo lineare a ~13 ms/evento).
+     * Il CLAUDE.md di progetto tratta l'N+1 Panache come correttezza, non come ottimizzazione.
+     *
+     * Le mappe usano gli STESSI predicati dei metodi singoli, così la strada lista e la strada
+     * dettaglio non possono divergere.
+     */
+    private record Prefetch(Map<UUID, List<Movimento>> movimenti,
+                            Map<UUID, List<String>> allergie,
+                            Map<UUID, List<EventoVoce>> voci) {}
+
+    @SuppressWarnings("unchecked")
+    private Prefetch prefetch(List<Evento> eventi) {
+        List<UUID> ids = eventi.stream().map(e -> e.id).toList();
+        if (ids.isEmpty()) return new Prefetch(Map.of(), Map.of(), Map.of());
+
+        Map<UUID, List<Movimento>> mov = movimentiRepo.findByEventoIds(ids).stream()
+                .collect(Collectors.groupingBy(m -> m.eventoId));
+        Map<UUID, List<EventoVoce>> voci = vociRepo.findByEventoIds(ids).stream()
+                .collect(Collectors.groupingBy(v -> v.eventoId));
+
+        // Le allergie restano native come nel metodo singolo (stesso ORDER BY id).
+        Map<UUID, List<String>> allergie = new HashMap<>();
+        List<Object[]> righe = em.createNativeQuery(
+                "SELECT evento_id, descrizione FROM evento_allergie "
+                + "WHERE evento_id IN (:ids) ORDER BY id")
+                .setParameter("ids", ids)
+                .getResultList();
+        for (Object[] r : righe) {
+            allergie.computeIfAbsent((UUID) r[0], k -> new ArrayList<>()).add((String) r[1]);
+        }
+        return new Prefetch(mov, allergie, voci);
     }
 
     @Transactional
@@ -289,22 +334,72 @@ public class EventiService {
         // "una riga parcheggiata si risolve una volta sola" (EVENTO_GIA_RISOLTO).
         // Vedi docs/specs/import-eventi-attribuzione.md (I3) e docs/adr/003.
 
+        // RIMBORSO: importo negativo riduce importoIncassato via ricalcolaIncassi.
+        // Il calcolo sta QUI, sopra la guardia anti-doppione (A1): il confronto col gemello deve
+        // usare l'importo col segno con cui il movimento è finito a libro, altrimenti un rimborso
+        // ripetuto verrebbe cercato col segno sbagliato e non troverebbe mai il suo gemello.
+        BigDecimal importoMovimento = "RIMBORSO".equals(req.tipo())
+                ? req.importo().negate()
+                : req.importo();
+
+        // Stesso evento + stesso tipo + stesso importo + stessa data finanziaria + stesso conto
+        // (+ controparte, A4) = lo STESSO bonifico registrato due volte. Non è il caso dell'ADR 003
+        // (più pagamenti dello stesso tipo sono legittimi: due tranche differiscono per data o
+        // per importo).
+        //
+        // La guardia sta QUI e non nel wizard perché questo è il punto comune alle due strade che
+        // hanno prodotto il doppione reale su «Greg»: registrazione manuale dalla scheda evento
+        // (10/08) e conferma dal wizard incassi-evento (14/08). Le tre guardie dichiarate in
+        // docs/adr/003 guardano tutte altrove — il dedup dell'import confronta le righe
+        // parcheggiate fra loro, EVENTO_GIA_RISOLTO protegge la singola riga, e il tetto sul
+        // residuo non scatta finché c'è capienza. Vedi docs/adr/009.
+        //
+        // ORDINE (A1): questa guardia corre PRIMA del tetto sul residuo. Su un evento senza
+        // capienza i due controlli scattano entrambi, e quello che parla per primo detta la
+        // diagnosi: col vecchio ordine il doppione veniva rifiutato come IMPORTO_SUPERA_RESIDUO,
+        // che manda a correggere il preventivo — cioè a fare spazio a un incasso che non esiste.
+        // Caso reale: «18esimo Erica balzaretti», 550 € su 1.050 preventivati già incassati per 550.
+        movimentiRepo.findPagamentoEventoGemello(
+                eventoId, req.tipo(), importoMovimento, req.data(), req.contoBancarioId(),
+                req.controparte())
+            .ifPresent(gemello -> {
+                // Il messaggio lo legge il titolare, non un log: importi e date all'italiana.
+                throw new ApiException(Response.Status.CONFLICT, "PAGAMENTO_DUPLICATO",
+                        "Su questo evento è già registrato un " + req.tipo().toLowerCase()
+                        + " di " + euro(req.importo()) + " del " + giorno(req.data())
+                        + ", inserito il " + giorno(gemello.createdAt.atZone(ITALY).toLocalDate())
+                        + ": sembra lo stesso pagamento, non un secondo incasso.");
+            });
+
         // Importo non supera il residuo (solo per CAPARRA/ACCONTO/SALDO — non per PENALE/RIMBORSO)
         if (!"PENALE".equals(req.tipo()) && !"RIMBORSO".equals(req.tipo())
                 && e.importoTotalePreviventivato != null) {
-            BigDecimal residuo = e.importoTotalePreviventivato.subtract(e.importoIncassato);
+            // A3 criterio 2 — il tetto si ALLARGA, mai si stringe: è il maggiore fra il pattuito
+            // (Σ preventivo, la colonna denormalizzata) e il reale (Σ consuntivo, con fallback sul
+            // preventivo voce per voce). Serve all'«extra a consuntivo»: chi incassa più del
+            // pattuito registra l'eccedenza come voce con preventivo 0, e il pagamento entra —
+            // senza gonfiare il preventivo, che è il pattuito e non deve mentire (A2).
+            // Il MAX, e non il consuntivo secco: un evento con consuntivo MINORE del preventivo
+            // (voci non erogate) continuerebbe altrimenti a rifiutare pagamenti legittimi.
+            BigDecimal tetto = e.importoTotalePreviventivato.max(calcolaTotaleConsuntivato(eventoId));
+            BigDecimal residuo = tetto.subtract(e.importoIncassato);
             if (req.importo().compareTo(residuo) > 0) {
+                // A2 — la prima domanda è sul doppione, non sul preventivo. Il messaggio arriva
+                // qui solo se la guardia sopra NON ha riconosciuto un gemello, ma il pagamento
+                // può essere lo stesso bonifico con un dato diverso (data o importo ritoccati):
+                // mandare a "correggere il preventivo" produrrebbe preventivo falso E ricavo
+                // fantasma. La seconda via è l'extra a consuntivo, che lascia intatto il pattuito.
                 throw new ApiException(Response.Status.CONFLICT, "IMPORTO_SUPERA_RESIDUO",
-                        "L'importo EUR " + req.importo() + " supera il residuo da incassare EUR " + residuo);
+                        "È lo stesso pagamento già registrato? " + euro(req.importo())
+                        + " del " + giorno(req.data()) + " superano di "
+                        + euro(req.importo().subtract(residuo)) + " il residuo da incassare ("
+                        + euro(residuo) + "). Se invece è un incasso in più rispetto al pattuito, "
+                        + "registra l'eccedenza come extra a consuntivo sull'evento.");
             }
         }
 
         // Crea il Movimento: competenza economica = data evento, data finanziaria = data pagamento
         Integer cogeId = req.contoCoge() != null ? req.contoCoge() : lookupCogeRicavi(req.tipo());
-        // RIMBORSO: importo negativo riduce importoIncassato via ricalcolaIncassi
-        BigDecimal importoMovimento = "RIMBORSO".equals(req.tipo())
-                ? req.importo().negate()
-                : req.importo();
 
         Movimento m = new Movimento();
         m.tipo                  = "ENTRATA";
@@ -326,6 +421,7 @@ public class EventiService {
         // già portato dalla colonna is_segnaposto: nella descrizione basta il nome della controparte.
         m.descrizione           = "[EVENTO] " + spogliaSegnaposto(e.nome) + " – " + req.tipo();
         m.note                  = req.note();
+        m.controparte           = req.controparte();   // A4: null se registrato dalla scheda evento
         m.fonte                 = "MANUALE";
         m.createdBy             = userId;
         movimentiRepo.persist(m);
@@ -1117,7 +1213,17 @@ public class EventiService {
      * permettere al frontend di renderizzare lo stato di avanzamento.
      */
     private EventoDTO buildEventoDTO(Evento e, boolean isAdmin) {
-        List<Movimento> movimenti = movimentiRepo.findByEventoId(e.id);
+        return buildEventoDTO(e, isAdmin, null);
+    }
+
+    /**
+     * @param pre figli già caricati per l'intera pagina ({@link #prefetch}), oppure {@code null}
+     *            per la strada a evento singolo, che continua a interrogare il DB da sé.
+     */
+    private EventoDTO buildEventoDTO(Evento e, boolean isAdmin, Prefetch pre) {
+        List<Movimento> movimenti = pre != null
+                ? pre.movimenti().getOrDefault(e.id, List.of())
+                : movimentiRepo.findByEventoId(e.id);
 
         List<PagamentoEventoDTO> pagamenti = movimenti.stream()
                 .map(m -> new PagamentoEventoDTO(
@@ -1133,20 +1239,28 @@ public class EventiService {
         LocalDate dataSaldo    = computeDataSaldo(movimenti);
 
         @SuppressWarnings("unchecked")
-        List<String> allergie = em.createNativeQuery(
-                "SELECT descrizione FROM evento_allergie WHERE evento_id = :eid ORDER BY id")
-                .setParameter("eid", e.id)
-                .getResultList();
+        List<String> allergie = pre != null
+                ? pre.allergie().getOrDefault(e.id, List.of())
+                : em.createNativeQuery(
+                        "SELECT descrizione FROM evento_allergie WHERE evento_id = :eid ORDER BY id")
+                        .setParameter("eid", e.id)
+                        .getResultList();
 
         BigDecimal residuo    = isAdmin ? calcImportoResiduo(e) : null;
         BigDecimal perc       = isAdmin ? calcPercentualeIncassata(e) : null;
-        BigDecimal costiReali = isAdmin ? calcolaCostiReali(e.id) : null;
+        // I costi reali sono un sottoinsieme di `movimenti`, che ha già lo stesso filtro
+        // (stato != ANNULLATO): sommarli qui evita una query identica a quella appena fatta.
+        BigDecimal costiReali = isAdmin ? sommaUscite(movimenti) : null;
         BigDecimal profitto   = isAdmin ? safeProfitto(e, costiReali) : null;
 
+        List<EventoVoce> vociEntita = !isAdmin ? List.of()
+                : pre != null ? pre.voci().getOrDefault(e.id, List.of())
+                : vociRepo.findByEventoId(e.id);
         List<EventoVoceDTO> voci = isAdmin
-                ? vociRepo.findByEventoId(e.id).stream().map(this::toVoceDTO).toList()
+                ? vociEntita.stream().map(this::toVoceDTO).toList()
                 : null;
-        BigDecimal totaleConsuntivato = isAdmin ? calcolaTotaleConsuntivato(e.id) : null;
+        // Stessa somma di calcolaTotaleConsuntivato, ma sulle voci che abbiamo già in mano.
+        BigDecimal totaleConsuntivato = isAdmin ? sommaConsuntivo(vociEntita) : null;
         BigDecimal scostamentoConsuntivo = isAdmin
                 ? totaleConsuntivato.subtract(
                         e.importoTotalePreviventivato != null ? e.importoTotalePreviventivato : BigDecimal.ZERO)
@@ -1204,6 +1318,17 @@ public class EventiService {
         return incassato.subtract(costi);
     }
 
+    private static final DateTimeFormatter GIORNO_IT = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+
+    /** «1500.00» → «1.500,00 €». Solo per i messaggi d'errore letti dal titolare. */
+    private static String euro(BigDecimal v) {
+        return String.format(Locale.ITALY, "%,.2f €", v);
+    }
+
+    private static String giorno(LocalDate d) {
+        return d.format(GIORNO_IT);
+    }
+
     private BigDecimal calcImportoResiduo(Evento e) {
         if (e.importoTotalePreviventivato == null) return null;
         BigDecimal incassato = e.importoIncassato != null ? e.importoIncassato : BigDecimal.ZERO;
@@ -1218,6 +1343,27 @@ public class EventiService {
                 .divide(e.importoTotalePreviventivato, 4, RoundingMode.HALF_UP)
                 .multiply(new BigDecimal("100"))
                 .setScale(2, RoundingMode.HALF_UP);
+    }
+
+    /**
+     * Gemello in memoria di {@link #calcolaCostiReali}: la lista in ingresso arriva sempre da
+     * {@code findByEventoId(s)}, che filtra già {@code stato != 'ANNULLATO'} — resta da filtrare
+     * il solo tipo. Se i due criteri divergono, divergono anche i costi mostrati: tienili allineati.
+     */
+    private BigDecimal sommaUscite(List<Movimento> movimenti) {
+        return movimenti.stream()
+                .filter(m -> "USCITA".equals(m.tipo))
+                .map(m -> m.importo)
+                .filter(java.util.Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    /** Gemello in memoria di {@link #calcolaTotaleConsuntivato}: stesso COALESCE, stesse voci. */
+    private BigDecimal sommaConsuntivo(List<EventoVoce> voci) {
+        return voci.stream()
+                .map(v -> v.importoConsuntivo != null ? v.importoConsuntivo : v.importoPreventivo)
+                .filter(java.util.Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
     private BigDecimal calcolaCostiReali(UUID eventoId) {

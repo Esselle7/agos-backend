@@ -5,6 +5,7 @@ import com.agostinelli.gestionale.movimenti.domain.Movimento;
 import com.agostinelli.gestionale.movimenti.dto.BuPanelDTO;
 import com.agostinelli.gestionale.movimenti.dto.ClassificaTransitorioRequest;
 import com.agostinelli.gestionale.movimenti.dto.EventoParcheggiatoDTO;
+import com.agostinelli.gestionale.movimenti.dto.ImportBadgeDTO;
 import com.agostinelli.gestionale.movimenti.dto.ImportKpiDTO;
 import com.agostinelli.gestionale.movimenti.dto.MovimentoCreateRequest;
 import com.agostinelli.gestionale.movimenti.service.MovimentiService;
@@ -14,10 +15,14 @@ import com.agostinelli.gestionale.movimenti.dto.RicorrenteParcheggiataDTO;
 import com.agostinelli.gestionale.movimenti.dto.RisolviEventoRequest;
 import com.agostinelli.gestionale.movimenti.dto.RisolviRicorrenteRequest;
 import com.agostinelli.gestionale.movimenti.dto.RisolviScartatoRequest;
+import com.agostinelli.gestionale.movimenti.dto.SpostaRigaRequest;
 import com.agostinelli.gestionale.movimenti.dto.ScartatoDTO;
 import com.agostinelli.gestionale.movimenti.dto.TransitorioDTO;
+import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordClassificazioneEngine;
+import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordExtractor;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService;
 import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
+import com.agostinelli.gestionale.movimenti.importlayer.model.Proposta;
 import com.agostinelli.gestionale.movimenti.importlayer.parser.Sorgente;
 import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
 import com.agostinelli.gestionale.movimenti.dto.AnalisiDuplicatiDTO;
@@ -35,6 +40,7 @@ import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -49,8 +55,8 @@ import java.util.UUID;
 @ApplicationScoped
 public class ImportTriageService {
 
-    private static final String COGE_RICAVI_DACLASS = "39.99.999";
-    private static final String COGE_COSTI_DACLASS = "49.99.999";
+    private static final String COGE_RICAVI_DACLASS = CogeTransitorio.RICAVI;
+    private static final String COGE_COSTI_DACLASS = CogeTransitorio.COSTI;
 
     // BU 5 = Overhead (mutui/assicurazioni/ammortamenti): natura delle rate ricorrenti.
     private static final short BU_OVERHEAD = 5;
@@ -121,6 +127,27 @@ public class ImportTriageService {
                 round2(tassoAmbiguita), round2(copertura),
                 ricaviTransitoriCount, ricaviDaClassificare,
                 costiTransitoriCount, costiDaClassificare);
+    }
+
+    /**
+     * I badge della console Import in UNA query e UNA risposta (vedi {@link ImportBadgeDTO}).
+     * Le sottoquery ripetono alla lettera le clausole delle liste che sostituiscono: se una di
+     * quelle cambia, questa deve cambiare con lei — il badge non è una seconda verità.
+     */
+    public ImportBadgeDTO getBadge() {
+        Object[] r = (Object[]) em.createNativeQuery(
+                "SELECT " +
+                "  (SELECT COUNT(*) FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id " +
+                "    WHERE p.codice IN ('" + COGE_RICAVI_DACLASS + "','" + COGE_COSTI_DACLASS + "') " +
+                "      AND m.stato <> 'ANNULLATO'), " +
+                "  (SELECT COUNT(*) FROM ricorrenti_da_riconciliare WHERE stato = 'DA_RICONCILIARE'), " +
+                "  (SELECT COUNT(*) FROM eventi_da_riconciliare WHERE stato = 'DA_RICONCILIARE'), " +
+                "  (SELECT COUNT(*) FROM matching_differiti WHERE stato = 'DA_RICONCILIARE'), " +
+                "  (SELECT COUNT(*) FROM import_scartati WHERE stato = 'DA_VEDERE'), " +
+                "  (SELECT id FROM import_log ORDER BY data_import DESC LIMIT 1)")
+                .getSingleResult();
+        return new ImportBadgeDTO(num(r[0]), num(r[1]), num(r[2]), num(r[3]), num(r[4]),
+                r[5] == null ? null : toUuid(r[5]));
     }
 
     // I suggerimenti basati sulla rubrica controparti (IBAN/fuzzy) sono rimossi con la dismissione
@@ -197,30 +224,66 @@ public class ImportTriageService {
      */
     @SuppressWarnings("unchecked")
     public PagedResponse<TransitorioDTO> listTransitori(String tipo, int page, int size) {
+        String from = "FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id ";
+        // L'anagrafica serve solo alla pagina: il COUNT resta sulla forma minima. I due LEFT JOIN
+        // sono su chiave primaria e non moltiplicano le righe.
+        String fromConAnagrafica = from
+                + "LEFT JOIN fornitori f ON f.id = m.fornitore_id "
+                + "LEFT JOIN metodi_pagamento mp ON mp.id = m.metodo_pagamento_id ";
         String where =
-                "FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id " +
                 "WHERE p.codice IN ('" + COGE_RICAVI_DACLASS + "','" + COGE_COSTI_DACLASS + "') " +
                 "AND m.stato <> 'ANNULLATO' AND (CAST(:tipo AS VARCHAR) IS NULL OR m.tipo = :tipo)";
 
+        // Tutto quello che la riga sa di sé, in una lettura sola: la ragione sociale del fornitore
+        // che il motore ha già riconosciuto e il metodo di pagamento arrivano dall'anagrafica
+        // agganciata qui (nessun N+1), il riferimento esterno è la chiave con cui si ritrova la
+        // riga sull'estratto conto della banca.
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT m.id, m.tipo, m.importo_lordo, m.data_movimento, m.descrizione, p.codice, " +
-                "m.fornitore_id, m.conto_bancario_id " + where +
+                "m.fornitore_id, m.conto_bancario_id, m.note, f.ragione_sociale, " +
+                "m.riferimento_esterno, mp.descrizione, f.bu_default_id " + fromConAnagrafica + where +
                 " ORDER BY m.data_movimento, m.id LIMIT :size OFFSET :offset")
                 .setParameter("tipo", tipo)
                 .setParameter("size", size)
                 .setParameter("offset", (long) page * size)
                 .getResultList();
 
-        // Suggerimenti keyword: il motore è in memoria, ma i CODICI vanno risolti in id — UNA
-        // query per pagina, non una per riga (no N+1).
+        // La proposta: prima quella che il motore ha SCRITTO all'import (R1/R6 — porta il perché
+        // esatto, firma o alias che sia), poi, come rete, quella ricalcolata adesso dal motore
+        // keyword. Il ricalcolo serve alle righe già in coda da prima e a quelle che una firma
+        // nuova sa spiegare solo ora (stesso principio di listRicorrenti, SPEC I3).
         List<String> codiciSugg = new ArrayList<>(rows.size());
-        for (Object[] r : rows) codiciSugg.add(suggerimentoKeyword((String) r[4], (String) r[1], r[7]));
+        List<String> perche = new ArrayList<>(rows.size());
+        List<Short> buSugg = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            var scritta = Proposta.leggi((String) r[8]);
+            // Una proposta che punta al transitorio è «ti propongo di lasciarla dov'è»: rumore.
+            // Vale anche per le righe già a DB, importate prima della guardia in applyKeyword.
+            if (scritta != null && (COGE_RICAVI_DACLASS.equals(scritta.cogeCodice())
+                    || COGE_COSTI_DACLASS.equals(scritta.cogeCodice()))) {
+                scritta = null;
+            }
+            if (scritta != null) {
+                codiciSugg.add(scritta.cogeCodice());
+                perche.add(scritta.perche());
+                buSugg.add(scritta.bu());
+            } else {
+                // Il ricalcolo nomina la firma esattamente come fa il motore all'import (R6): i
+                // token sono già nel match, e una frase che dice «c'è una firma» senza dire QUALE
+                // chiede fiducia invece di darne le ragioni.
+                var m = suggerimentoKeyword((String) r[4], (String) r[1], r[7]);
+                codiciSugg.add(m == null ? null : m.cogeCodice());
+                perche.add(m == null ? null
+                        : "la causale contiene la firma «" + m.firmaLeggibile() + "» ("
+                          + m.natura().name().toLowerCase(Locale.ROOT) + "): l'hai già catalogata così");
+                buSugg.add(m == null ? null : m.bu());
+            }
+        }
         Map<String, Integer> idByCodice = cogeIdByCodice(new java.util.HashSet<>(codiciSugg));
 
-        // Riscontro Billy: UNA query di aggregazione per pagina (giorno+conto → n, totale), poi
-        // l'aggancio si fa in memoria. Non è un join per riga: sarebbe N+1 su un dato indicativo.
-        Map<String, long[]> billyCount = new LinkedHashMap<>();
-        Map<String, BigDecimal> billyTot = ricaviBillyPerGiorno(billyCount);
+        // Riscontro Billy: UNA query di aggregazione per pagina (giorno+conto+voce), poi l'aggancio
+        // si fa in memoria. Non è un join per riga: sarebbe N+1 su un dato indicativo.
+        Map<String, BillyGiorno> billy = ricaviBillyPerGiorno();
 
         List<TransitorioDTO> content = new ArrayList<>(rows.size());
         for (int i = 0; i < rows.size(); i++) {
@@ -234,32 +297,45 @@ public class ImportTriageService {
             Integer idSugg = codiciSugg.get(i) == null ? null : idByCodice.get(codiciSugg.get(i));
 
             // Solo sulle righe POS: altrove «cosa ha incassato Billy quel giorno» non vuol dire nulla.
-            String circuito = DescNormalizer.circuitoPos(descr);
+            // E un incasso POS è per definizione un'ENTRATA: senza questo filtro un addebito SDD
+            // verso Nexi ("ADDEBITO DIRETTO SDD … NEXI P.") veniva letto come riga POS e portava con
+            // sé il riscontro Billy di giornata — un confronto fra un COSTO e i ricavi del giorno.
+            String circuito = "ENTRATA".equals(r[1]) ? DescNormalizer.circuitoPos(descr) : null;
             TransitorioDTO.RiscontroBillyDTO riscontro = null;
             if (circuito != null && conto != null) {
-                String k = data + "|" + conto;
-                BigDecimal tot = billyTot.get(k);
-                if (tot != null) {
+                BillyGiorno g = billy.get(data + "|" + conto);
+                if (g != null) {
                     riscontro = new TransitorioDTO.RiscontroBillyDTO(
-                            billyCount.get(k)[0], tot, importo.subtract(tot));
+                            g.scontrini, g.totale, importo.subtract(g.totale), List.copyOf(g.voci));
                 }
             }
 
+            UUID fornitoreId = r[6] == null ? null : toUuid(r[6]);
+            // Il ramo proposto: prima quello che il motore aveva calcolato per QUESTA riga, poi il
+            // default in anagrafica del fornitore riconosciuto — che è anche l'unica fonte per i
+            // movimenti importati prima del 13/08 (le loro note non portano il ramo). Nessuno dei
+            // due viene applicato da solo: il wizard lo pre-seleziona e lo scrive a schermo, la
+            // conferma resta dell'operatore (R4/R6).
+            Short bu = buSugg.get(i) != null ? buSugg.get(i)
+                    : r[12] == null ? null : ((Number) r[12]).shortValue();
+
             content.add(new TransitorioDTO(
                     toUuid(r[0]), (String) r[1], importo, data, descr, (String) r[5],
-                    r[6] == null ? null : toUuid(r[6]), conto,
+                    fornitoreId, conto,
                     ent.ibanControparte(), controparte,
                     DescNormalizer.chiaveGruppo(controparte, descr),
                     DescNormalizer.dataOperazione(descr), circuito, riscontro,
                     idSugg,
-                    idSugg == null ? null : "l'hai già catalogata così una volta: la causale "
-                            + "contiene una firma che avevi insegnato al sistema"));
+                    idSugg == null ? null : perche.get(i),
+                    bu, (String) r[9], (String) r[10], (String) r[11],
+                    firmeDaImparare(descr, controparte, ent)));
         }
 
-        long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where)
+        long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + from + where)
                 .setParameter("tipo", tipo).getSingleResult()).longValue();
         return PagedResponse.of(content, page, size, total);
     }
+
 
     /** Mastri dei ricavi che nascono dagli scontrini Billy (spaccio/agriturismo). */
     private static final String COGE_RICAVI_BILLY = "30.03.";
@@ -274,19 +350,31 @@ public class ImportTriageService {
      * riscontro, con importi che non coincidono — per questo il DTO lo dichiara come indicativo.
      */
     @SuppressWarnings("unchecked")
-    private Map<String, BigDecimal> ricaviBillyPerGiorno(Map<String, long[]> conteggi) {
-        Map<String, BigDecimal> out = new LinkedHashMap<>();
+    private Map<String, BillyGiorno> ricaviBillyPerGiorno() {
+        Map<String, BillyGiorno> out = new LinkedHashMap<>();
+        // Il GROUP BY scende di un livello (anche per voce di bilancio): stessa query, stessa
+        // scansione, in più il DI CHE COSA era fatta la giornata. Il totale e il conteggio si
+        // ricompongono sommando le voci — una sola fonte, nessun rischio che raccontino due storie.
         for (Object[] r : (List<Object[]>) em.createNativeQuery(
-                "SELECT m.data_movimento, m.conto_bancario_id, COUNT(*), SUM(m.importo_lordo) " +
+                "SELECT m.data_movimento, m.conto_bancario_id, p.descrizione, COUNT(*), SUM(m.importo_lordo) " +
                 "FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id " +
                 "WHERE p.codice LIKE '" + COGE_RICAVI_BILLY + "%' AND m.stato <> 'ANNULLATO' " +
                 "  AND m.conto_bancario_id IS NOT NULL " +
-                "GROUP BY 1, 2").getResultList()) {
+                "GROUP BY 1, 2, 3 ORDER BY 5 DESC").getResultList()) {
             String k = ((java.sql.Date) r[0]).toLocalDate() + "|" + ((Number) r[1]).shortValue();
-            conteggi.put(k, new long[]{ ((Number) r[2]).longValue() });
-            out.put(k, (BigDecimal) r[3]);
+            BillyGiorno g = out.computeIfAbsent(k, x -> new BillyGiorno());
+            g.scontrini += ((Number) r[3]).longValue();
+            g.totale = g.totale.add((BigDecimal) r[4]);
+            g.voci.add(new TransitorioDTO.VoceBillyDTO((String) r[2], (BigDecimal) r[4]));
         }
         return out;
+    }
+
+    /** Che cosa ha incassato Billy in una giornata su un conto, e di che cosa era fatto. */
+    private static final class BillyGiorno {
+        long scontrini;
+        BigDecimal totale = BigDecimal.ZERO;
+        final List<TransitorioDTO.VoceBillyDTO> voci = new ArrayList<>();
     }
 
     /**
@@ -296,13 +384,17 @@ public class ImportTriageService {
      * dall'import — qui diventa una proposta col «perché» in chiaro, che l'utente conferma con un
      * click. Un target sul mastro riservato non si propone nemmeno (invariante DACLASS).
      */
-    private String suggerimentoKeyword(String descrizione, String tipo, Object contoBancarioId) {
+    private KeywordClassificazioneEngine.KeywordMatch suggerimentoKeyword(
+            String descrizione, String tipo, Object contoBancarioId) {
         Short conto = contoBancarioId == null ? null : ((Number) contoBancarioId).shortValue();
         String sorgente = conto == null ? Sorgente.CA
                 : (conto == 1 ? Sorgente.BPM : (conto == 2 ? Sorgente.CA : Sorgente.BILLY));
         return keywordEngine.valuta(descrizione, tipo, sorgente)
+                // Un target sul mastro riservato non si propone nemmeno (invariante DACLASS); un
+                // target sul TRANSITORIO neanche: proporre il conto su cui la riga già sta non è
+                // una proposta, è rumore.
                 .filter(m -> !m.conflitto() && !CogeRiservatoEventi.riservato(m.cogeCodice()))
-                .map(com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordClassificazioneEngine.KeywordMatch::cogeCodice)
+                .filter(m -> !CogeTransitorio.transitorio(m.cogeCodice()))
                 .orElse(null);
     }
 
@@ -321,16 +413,24 @@ public class ImportTriageService {
         Movimento m = em.find(Movimento.class, movimentoId);
         if (m == null) throw new ApiException(Response.Status.NOT_FOUND, "MOVIMENTO_NON_TROVATO", "Movimento " + movimentoId);
 
-        String cogeCorrente = (String) em.createNativeQuery(
-                "SELECT codice FROM piano_dei_conti_coge WHERE id = :id")
-                .setParameter("id", m.contoCoge).getSingleResult();
-        if (!COGE_RICAVI_DACLASS.equals(cogeCorrente) && !COGE_COSTI_DACLASS.equals(cogeCorrente)) {
-            throw new ApiException(Response.Status.CONFLICT, "NON_TRANSITORIO",
-                    "Il movimento non è su un conto transitorio (è su " + cogeCorrente + ")");
+        // R13 — La correzione resta SEMPRE aperta: fino al 12/08/2026 qui c'era un 409
+        // NON_TRANSITORIO che rendeva definitivo tutto ciò che il motore aveva scritto da solo.
+        // Ora catalogare e ri-catalogare sono la stessa operazione. Restano due confini:
+        //  · il movimento dev'essere nato da un import (un movimento manuale si corregge dalla
+        //    pagina Movimenti, che è la sua strada);
+        //  · un annullato è fuori da ogni lettura contabile: non si riclassifica.
+        if (m.fonteImportazioneId == null) {
+            throw new ApiException(Response.Status.CONFLICT, "NON_DA_IMPORT",
+                    "Questo movimento non viene da un import: si corregge dalla pagina Movimenti");
+        }
+        if ("ANNULLATO".equals(m.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "MOVIMENTO_ANNULLATO",
+                    "Il movimento è annullato: non è ricatalogabile");
         }
 
-        // Boundary sul conto scelto: deve esistere (senza, la FK darebbe un 500 illeggibile) e non
-        // può essere il mastro riservato agli eventi — la UI che lo nasconde è cortesia, non guardia.
+        // Boundary sul conto scelto: deve esistere (senza, la FK darebbe un 500 illeggibile), non
+        // può essere il mastro riservato agli eventi né uno dei due conti d'attesa dell'import —
+        // la UI che li nasconde è cortesia, non guardia.
         List<?> target = em.createNativeQuery(
                 "SELECT codice FROM piano_dei_conti_coge WHERE id = :id")
                 .setParameter("id", req.cogeId()).getResultList();
@@ -339,13 +439,17 @@ public class ImportTriageService {
                     "Conto CoGe inesistente: " + req.cogeId());
         }
         CogeRiservatoEventi.vieta((String) target.get(0));
+        CogeTransitorio.vieta((String) target.get(0));
+
+        // R17 — il voto sulla firma, PRIMA di riscrivere la nota (che è dove vive la proposta).
+        votaFirma(m, (String) target.get(0));
 
         m.contoCoge = req.cogeId();
         m.businessUnitId = req.businessUnitId();
         m.fornitoreId = req.fornitoreId();
-        if (req.nota() != null && !req.nota().isBlank()) {
-            m.note = (m.note == null ? "" : m.note + " | ") + req.nota();
-        }
+        // La proposta ha esaurito il suo compito: lasciarla nella nota farebbe leggere domani
+        // «proposta non applicata» su una riga che l'utente ha già deciso (R14: si riscrive).
+        m.note = aggiungiNota(Proposta.rimuovi(m.note), req.nota());
         em.merge(m);
 
         if (req.apprendiKeyword()) {
@@ -356,6 +460,179 @@ public class ImportTriageService {
 
         mvRefresh.requestRefreshAfterCommit();
     }
+
+    /**
+     * R17 — Confermare la proposta di una firma fa {@code usi_confermati++}; correggerla fa
+     * {@code usi_corretti++}, e una sola correzione le toglie per sempre la promozione (R18).
+     *
+     * <p>Quale firma? Quella che il motore keyword riconosce ADESSO su questa descrizione: è
+     * deterministica sullo stesso input, è la stessa che ha prodotto la proposta, ed è l'unica
+     * fonte che non richieda di persistere un puntatore (ADR 008). Se oggi nessuna firma matcha —
+     * la proposta veniva da un alias fornitore, o la firma è stata cancellata — non si vota:
+     * meglio nessun voto che il voto sulla firma sbagliata.
+     */
+    private void votaFirma(Movimento m, String cogeScelto) {
+        Proposta proposta = Proposta.leggi(m.note);
+        if (proposta == null) return;   // la riga non portava una proposta: niente da votare
+        String sorgente = m.contoBancarioId == null ? Sorgente.CA
+                : (m.contoBancarioId == 1 ? Sorgente.BPM : (m.contoBancarioId == 2 ? Sorgente.CA : Sorgente.BILLY));
+        var match = keywordEngine.valuta(m.descrizione, m.tipo, sorgente)
+                .filter(k -> !k.conflitto() && k.firmaId() != null)
+                .filter(k -> proposta.cogeCodice().equals(k.cogeCodice()));
+        if (match.isEmpty()) return;
+
+        boolean confermata = proposta.cogeCodice().equals(cogeScelto);
+        em.createNativeQuery("UPDATE keyword_firma SET "
+                + (confermata ? "usi_confermati = usi_confermati + 1" : "usi_corretti = usi_corretti + 1")
+                + ", updated_at = now() WHERE id = :id")
+                .setParameter("id", match.get().firmaId())
+                .executeUpdate();
+        keywordEngine.refresh();   // il voto conta solo se il motore lo vede al prossimo import
+    }
+
+    /** Concatena una nota utente a quella esistente, senza lasciare separatori orfani. */
+    private static String aggiungiNota(String esistente, String nuova) {
+        String base = esistente == null ? "" : esistente.trim();
+        String add = nuova == null ? "" : nuova.trim();
+        if (add.isEmpty()) return base.isEmpty() ? null : base;
+        return base.isEmpty() ? add : base + " | " + add;
+    }
+
+    // ── «Non è una spesa»: rimanda la riga alla coda giusta ──────────────────────
+
+    /**
+     * Sposta una riga bancaria dal transitorio alla coda che sa lavorarla: incassi evento o rate.
+     *
+     * <p><b>Perché serve.</b> Il motore riconosce gli incassi-evento da una keyword nella causale
+     * (Gate B). Una causale come {@code "8RIST 14/06/26"} non ne ha nessuna: la riga arriva fra le
+     * spese da sistemare, dove la risposta giusta <b>non esiste</b> — un ricavo-evento non si
+     * cataloga scegliendo un conto, nasce da {@code EventiService.registraPagamento} (invariante
+     * DACLASS) che aggiorna anche incassato/stato dell'evento e applica le guardie del
+     * percorso-soldi. Senza questa via d'uscita l'operatore ha due sole scelte: lasciarla in
+     * sospeso per sempre, o forzarla su un conto sbagliato.
+     *
+     * <p><b>Perché il movimento si CANCELLA e non si annulla.</b> Un movimento annullato esce da
+     * ogni bucket del contatore e apre un buco nell'invariante (§5): direbbe che quel denaro ha
+     * lasciato i libri, che è falso — è solo passato in un'altra coda. Cancellandolo, la riga
+     * cambia casa restando nello stesso bucket «da catalogare»: il totale non si muove, ed è
+     * esattamente ciò che R10 chiede. Il prima/dopo resta in {@code audit_log} (DELETE con
+     * {@code dati_precedenti}), come per il rollback di un import.
+     *
+     * <p><b>Conseguenza dichiarata:</b> finché la riga è in coda, il suo importo non è nel saldo
+     * del conto — lo stesso identico trattamento delle righe che l'import parcheggia da solo.
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
+    @Transactional
+    public void spostaInCoda(UUID movimentoId, SpostaRigaRequest req, UUID userId) {
+        Movimento m = em.find(Movimento.class, movimentoId);
+        if (m == null) throw new ApiException(Response.Status.NOT_FOUND, "MOVIMENTO_NON_TROVATO",
+                "Movimento " + movimentoId);
+        if (m.fonteImportazioneId == null) {
+            throw new ApiException(Response.Status.CONFLICT, "NON_DA_IMPORT",
+                    "Questo movimento non viene da un import: non c'è una coda a cui rimandarlo");
+        }
+        if ("ANNULLATO".equals(m.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "MOVIMENTO_ANNULLATO",
+                    "Il movimento è annullato: non è spostabile");
+        }
+        // Se una riga di coda punta già a questo movimento, quella riga È la sua casa: spostarlo
+        // lascerebbe un puntatore morto e il contatore conterebbe la riga due volte (una come coda
+        // risolta, una come nuova riga). Si risolve da lì, non da qui.
+        if (riferitoDaUnaCoda(movimentoId)) {
+            throw new ApiException(Response.Status.CONFLICT, "MOVIMENTO_GIA_IN_UNA_CODA",
+                    "Questa riga è già stata risolta da una coda: va corretta da quella schermata");
+        }
+
+        String dest = req.destinazione() == null ? "" : req.destinazione().toUpperCase();
+        switch (dest) {
+            case "EVENTO" -> accodaEvento(m, req.nota());
+            case "RICORRENTE" -> accodaRicorrente(m, req.nota());
+            default -> throw new ApiException(Response.Status.BAD_REQUEST, "DESTINAZIONE_NON_VALIDA",
+                    "Destinazione non valida: " + req.destinazione() + " (EVENTO | RICORRENTE)");
+        }
+
+        em.remove(m);
+        mvRefresh.requestRefreshAfterCommit();
+    }
+
+    private boolean riferitoDaUnaCoda(UUID movimentoId) {
+        for (String t : List.of("import_scartati", "import_ambiguita", "ricorrenti_da_riconciliare")) {
+            long n = ((Number) em.createNativeQuery(
+                    "SELECT count(*) FROM " + t + " WHERE movimento_id = :id")
+                    .setParameter("id", movimentoId).getSingleResult()).longValue();
+            if (n > 0) return true;
+        }
+        return false;
+    }
+
+    private void accodaEvento(Movimento m, String nota) {
+        EntitaEstratte ent = estraiEntita(m.descrizione, m.contoBancarioId);
+        String controparte = ent.beneficiario() != null ? ent.beneficiario() : ent.ordinante();
+        em.createNativeQuery(
+                "INSERT INTO eventi_da_riconciliare (id, import_log_id, fonte, data_movimento, " +
+                "importo, tipo, conto_bancario_id, descrizione_norm, controparte_nome, " +
+                "controparte_iban, data_evento_estratta, raw_data) " +
+                "VALUES (:id, :logId, 'IMPORT_BANCA', :data, :imp, :tipo, :conto, :descr, :nome, " +
+                ":iban, :dataEv, CAST(:raw AS jsonb))")
+                .setParameter("id", UUID.randomUUID())
+                .setParameter("logId", m.fonteImportazioneId)
+                .setParameter("data", m.dataMovimento)
+                .setParameter("imp", m.importo)
+                .setParameter("tipo", m.tipo)
+                .setParameter("conto", m.contoBancarioId)
+                .setParameter("descr", m.descrizione)
+                .setParameter("nome", controparte)
+                .setParameter("iban", ent.ibanControparte())
+                // La data evento si ri-estrae dalla causale con lo stesso parser del Gate B: senza,
+                // la coda non saprebbe proporre nessun evento (suggerisciEvento parte da lì).
+                .setParameter("dataEv", mappingEngine.extractEventoDate(m.descrizione, m.dataMovimento))
+                .setParameter("raw", rawRicostruito(m, nota))
+                .executeUpdate();
+    }
+
+    private void accodaRicorrente(Movimento m, String nota) {
+        em.createNativeQuery(
+                "INSERT INTO ricorrenti_da_riconciliare (id, import_log_id, fonte, data_movimento, " +
+                "importo, tipo, conto_bancario_id, descrizione_norm, tipo_presunto, raw_data, note) " +
+                "VALUES (:id, :logId, 'IMPORT_BANCA', :data, :imp, :tipo, :conto, :descr, :tipoP, " +
+                "CAST(:raw AS jsonb), :nota)")
+                .setParameter("id", UUID.randomUUID())
+                .setParameter("logId", m.fonteImportazioneId)
+                .setParameter("data", m.dataMovimento)
+                .setParameter("imp", m.importo)
+                .setParameter("tipo", m.tipo)
+                .setParameter("conto", m.contoBancarioId)
+                .setParameter("descr", m.descrizione)
+                .setParameter("tipoP", "ALTRO")
+                .setParameter("raw", rawRicostruito(m, nota))
+                .setParameter("nota", nota)
+                .executeUpdate();
+    }
+
+    /**
+     * Le code vogliono il grezzo, ma il grezzo dell'import NON è conservato sui movimenti
+     * contabilizzati (SPEC §7). Si ricostruisce dai campi del movimento e si marca come tale:
+     * chi lo rilegge deve sapere che non è la riga com'era nel CSV.
+     */
+    private String rawRicostruito(Movimento m, String nota) {
+        Map<String, String> raw = new LinkedHashMap<>();
+        raw.put("_ricostruito", "true");
+        raw.put("_origine", "spostata a mano dal wizard spese");
+        raw.put("CAUSALE", m.descrizione == null ? "" : m.descrizione);
+        raw.put("DATA", String.valueOf(m.dataMovimento));
+        raw.put("IMPORTO", m.importo == null ? "" : m.importo.toPlainString());
+        if (nota != null && !nota.isBlank()) raw.put("_nota_triage", nota.trim());
+        try {
+            return objectMapper.writeValueAsString(raw);
+        } catch (Exception e) {
+            return "{}";
+        }
+    }
+
+    @Inject MovimentoMappingEngineImpl mappingEngine;
 
     // ── Pannello BU dell'import (docs/adr/006) ───────────────────────────────────
     //
@@ -480,6 +757,29 @@ public class ImportTriageService {
     }
 
     /** Ri-estrae IBAN/nome dalla descrizione del movimento (sorgente dedotta dal conto). */
+    /**
+     * Che cosa imparerebbe il sistema confermando questa riga — la stessa cosa che scriverà
+     * {@code KeywordLearningService.apprendi}, perché è lo stesso estrattore sulla stessa
+     * {@code EntitaEstratte}.
+     *
+     * <p><b>Lista vuota = da qui non si impara</b>, e il wizard deve dirlo invece di tacere. La
+     * condizione è la stessa che il client applicava da solo (`apprendiKeyword` solo con una
+     * controparte vera): da «EFFETTI RITIRATI» o da una causale POS nascerebbe una firma spuria
+     * che dirotterebbe tutte le righe simili dei prossimi import. La regola vive qui, dove sta il
+     * dato, non nel componente Angular.
+     */
+    private List<TransitorioDTO.FirmaDaImparareDTO> firmeDaImparare(
+            String descrizione, String controparte, EntitaEstratte ent) {
+        if (controparte == null || controparte.isBlank()) return List.of();
+        List<TransitorioDTO.FirmaDaImparareDTO> out = new ArrayList<>();
+        for (var f : KeywordExtractor.estraiFirme(
+                descrizione, ent, keywordEngine.stopwords(), keywordEngine.domainTokens())) {
+            out.add(new TransitorioDTO.FirmaDaImparareDTO(
+                    new ArrayList<>(f.valori()), f.natura().name()));
+        }
+        return out;
+    }
+
     private EntitaEstratte estraiEntita(String descrizione, Short contoBancarioId) {
         String sorgente = contoBancarioId == null ? Sorgente.CA
                 : (contoBancarioId == 1 ? Sorgente.BPM : (contoBancarioId == 2 ? Sorgente.CA : Sorgente.BILLY));
@@ -491,11 +791,26 @@ public class ImportTriageService {
     @SuppressWarnings("unchecked")
     public PagedResponse<EventoParcheggiatoDTO> listEventi(String stato, int page, int size) {
         String where = "FROM eventi_da_riconciliare WHERE (CAST(:stato AS VARCHAR) IS NULL OR stato = :stato)";
+        // C2 — il gemello a libro, cercato UNA volta per tutta la pagina con una LATERAL:
+        // stesso importo, stessa data finanziaria, stesso conto. È la stessa terna con cui il
+        // titolare riconosce «questo bonifico l'ho già messo dentro», e serve PRIMA di scegliere
+        // l'evento — oggi il doppione si scopre solo quando il server rifiuta, cioè dopo.
+        // Costo misurato (SPEC §C, EXPLAIN ANALYZE 14/08): l'analisi dell'intera coda ≈ 1,06 ms,
+        // quanto un singolo controllo di riga ⇒ gate §9.0: nessun indice nuovo, nessuna cache.
+        // Conto NULL da una parte o dall'altra ⇒ nessun match (NULL = NULL è «unknown»): stessa
+        // scelta fail-open della guardia alla conferma, ADR 009.
         List<Object[]> rows = em.createNativeQuery(
-                "SELECT id, fonte, chiave_aggancio, data_movimento, importo, tipo, conto_bancario_id, " +
-                "descrizione_norm, tipo_evento_presunto, keyword_match, controparte_nome, controparte_iban, " +
-                "data_evento_estratta, stato " + where +
-                " ORDER BY data_movimento, id LIMIT :size OFFSET :offset")
+                "SELECT e.id, e.fonte, e.chiave_aggancio, e.data_movimento, e.importo, e.tipo, e.conto_bancario_id, " +
+                "e.descrizione_norm, e.tipo_evento_presunto, e.keyword_match, e.controparte_nome, e.controparte_iban, " +
+                "e.data_evento_estratta, e.stato, g.created_at, g.nome " +
+                "FROM eventi_da_riconciliare e " +
+                "LEFT JOIN LATERAL (" +
+                "  SELECT m.created_at, ev.nome FROM movimenti m JOIN eventi ev ON ev.id = m.evento_id " +
+                "   WHERE m.stato <> 'ANNULLATO' AND m.importo_lordo = e.importo " +
+                "     AND m.data_finanziaria = e.data_movimento AND m.conto_bancario_id = e.conto_bancario_id " +
+                "   ORDER BY m.created_at LIMIT 1) g ON true " +
+                "WHERE (CAST(:stato AS VARCHAR) IS NULL OR e.stato = :stato)" +
+                " ORDER BY e.data_movimento, e.id LIMIT :size OFFSET :offset")
                 .setParameter("stato", stato)
                 .setParameter("size", size)
                 .setParameter("offset", (long) page * size)
@@ -513,7 +828,8 @@ public class ImportTriageService {
                     (String) r[7], (String) r[8], (String) r[9], (String) r[10], (String) r[11],
                     dataEv, (String) r[13],
                     sugg == null ? null : (UUID) sugg[0],
-                    sugg == null ? null : (String) sugg[1]));
+                    sugg == null ? null : (String) sugg[1],
+                    toLocalDate(r[14]), (String) r[15]));
         }
 
         long total = ((Number) em.createNativeQuery("SELECT COUNT(*) " + where)
@@ -602,7 +918,9 @@ public class ImportTriageService {
 
         String azione = req.azione() == null ? "" : req.azione().toUpperCase();
         switch (azione) {
-            case "SCARTA" -> aggiornaStatoEvento(eventoParkId, "SCARTATO", null, req.nota());
+            // R9: motivo scritto obbligatorio — l'incasso resta fuori dai conti, si deve sapere perché.
+            case "SCARTA" -> aggiornaStatoEvento(eventoParkId, "SCARTATO", null,
+                    EsclusioneMotivata.obbligatorio(req.nota()));
 
             // Invariante DACLASS: le voci evento parcheggiate NON generano MAI movimenti —
             // il ricavo evento nasce solo dal modulo Eventi (registrazione pagamenti).
@@ -721,7 +1039,8 @@ public class ImportTriageService {
 
         eventiService.registraPagamento(eventoId,
                 new com.agostinelli.gestionale.eventi.dto.PagamentoRequest(
-                        tipo, importo, dataMov, req.nota(), METODO_BONIFICO, conto, req.cogeId()),
+                        tipo, importo, dataMov, req.nota(), METODO_BONIFICO, conto, req.cogeId(),
+                        controparte),
                 userId);
 
         aggiornaStatoEvento(parkId, "RICONCILIATO", eventoId, req.nota());
@@ -861,10 +1180,12 @@ public class ImportTriageService {
             case "COLLEGA" -> collegaRicorrente(id, r, req, userId);
             case "CONFERMA" -> confermaRicorrente(id, r, req, userId);
             case "IGNORA" -> {
+                // R9: la rata resta fuori dai conti solo con un motivo scritto.
                 int claimed = em.createNativeQuery(
                         "UPDATE ricorrenti_da_riconciliare SET stato = 'IGNORATA', note = :nota, " +
                         "risolto_at = now(), risolto_by = :uid WHERE id = :id AND stato = 'DA_RICONCILIARE'")
-                        .setParameter("nota", req.nota()).setParameter("uid", userId).setParameter("id", id).executeUpdate();
+                        .setParameter("nota", EsclusioneMotivata.obbligatorio(req.nota()))
+                        .setParameter("uid", userId).setParameter("id", id).executeUpdate();
                 if (claimed == 0) {
                     throw new ApiException(Response.Status.CONFLICT, "RICORRENTE_GIA_RISOLTA",
                             "La voce è già stata risolta");
@@ -1054,7 +1375,8 @@ public class ImportTriageService {
         }
         String azione = req.azione() == null ? "" : req.azione().toUpperCase();
         switch (azione) {
-            case "IGNORA" -> claimScartato(id, "IGNORATA", userId);
+            // R9: chiudere una riga bancaria senza contabilizzarla richiede un motivo scritto.
+            case "IGNORA" -> claimScartato(id, "IGNORATA", userId, EsclusioneMotivata.obbligatorio(req.nota()));
             case "CONTABILIZZA" -> contabilizzaScartato(id, toUuid(r[1]),
                     ((Number) r[2]).intValue(), (String) r[3], req.cogeId(), userId);
             default -> throw new ApiException(Response.Status.BAD_REQUEST, "AZIONE_NON_VALIDA",
@@ -1077,6 +1399,9 @@ public class ImportTriageService {
         }
         // Guard-rail §7.6: un ricavo-evento senza evento collegato non compare in nessun bilancio.
         CogeRiservatoEventi.vieta((String) coge.get(0)[1]);
+        // NB: qui il transitorio è una destinazione LEGITTIMA e non va vietato (≠
+        // classificaTransitorio, vedi CogeTransitorio): la riga entra nei libri e diventa «da
+        // catalogare». È un passo avanti vero — il denaro smette di stare fuori dai conti.
 
         var n = rinormalizza(rawJson, riga);
         if (n == null || n.contoBancarioId() == null || n.dataMovimento() == null
@@ -1110,12 +1435,17 @@ public class ImportTriageService {
         mvRefresh.requestRefreshAfterCommit();
     }
 
-    /** Transizione di stato con predicato: è l'unico guard concorrenza-safe (row-lock). */
     private void claimScartato(UUID id, String nuovoStato, UUID userId) {
+        claimScartato(id, nuovoStato, userId, null);
+    }
+
+    /** Transizione di stato con predicato: è l'unico guard concorrenza-safe (row-lock). */
+    private void claimScartato(UUID id, String nuovoStato, UUID userId, String nota) {
         int claimed = em.createNativeQuery(
-                "UPDATE import_scartati SET stato = :stato, risolto_at = now(), risolto_by = :uid " +
-                "WHERE id = :id AND stato = 'DA_VEDERE'")
+                "UPDATE import_scartati SET stato = :stato, risolto_at = now(), risolto_by = :uid, " +
+                "note = COALESCE(:nota, note) WHERE id = :id AND stato = 'DA_VEDERE'")
                 .setParameter("stato", nuovoStato).setParameter("uid", userId)
+                .setParameter("nota", nota)
                 .setParameter("id", id).executeUpdate();
         if (claimed == 0) {
             throw new ApiException(Response.Status.CONFLICT, "SCARTATO_GIA_RISOLTO",
@@ -1129,15 +1459,10 @@ public class ImportTriageService {
      */
     private com.agostinelli.gestionale.movimenti.importlayer.model.RawMovimento rinormalizza(
             String rawJson, int riga) {
-        try {
-            Map<String, String> campi = objectMapper.readValue(rawJson,
-                    new com.fasterxml.jackson.core.type.TypeReference<Map<String, String>>() {});
-            return normalizer.normalize(
-                    new com.agostinelli.gestionale.movimenti.importlayer.model.RawRow(riga, campi));
-        } catch (Exception e) {
-            return null;
-        }
+        return contatore.rinormalizza(rawJson, riga);
     }
+
+    @Inject ContatoreImportService contatore;
 
     /** Il «perché» detto in italiano: il codice motivo non spiega niente a chi deve decidere. */
     private String motivoLeggibile(String motivo) {

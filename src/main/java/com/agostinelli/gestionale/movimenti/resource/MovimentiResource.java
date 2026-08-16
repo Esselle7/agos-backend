@@ -39,6 +39,7 @@ public class MovimentiResource {
     @Inject com.agostinelli.gestionale.movimenti.importlayer.ImportTriageService triageService;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService keywordService;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.MatchingDifferitiService matchingDifferitiService;
+    @Inject com.agostinelli.gestionale.movimenti.importlayer.ContatoreImportService contatoreService;
     // AUDIT-TEMP: registro decisionale dell'import su file. Vedi ImportAuditLog per come si spegne
     // e si cancella tutto (questi 3 endpoint spariscono insieme alla classe).
     @Inject com.agostinelli.gestionale.movimenti.importlayer.ImportAuditLog auditLog;
@@ -254,6 +255,14 @@ public class MovimentiResource {
         return triageService.getKpi();
     }
 
+    /** I badge della console Import in una risposta sola: vedi il javadoc di ImportBadgeDTO. */
+    @GET
+    @Path("/import/badge")
+    @RolesAllowed("ADMIN")
+    public com.agostinelli.gestionale.movimenti.dto.ImportBadgeDTO importBadge() {
+        return triageService.getBadge();
+    }
+
     @GET
     @Path("/import/eventi/analisi-duplicati")
     @RolesAllowed("ADMIN")
@@ -315,6 +324,19 @@ public class MovimentiResource {
     }
 
     /** Rami storicamente usati per ogni conto: il wizard chiede la BU solo quando ce n'è più d'uno. */
+    // «Non è una spesa»: rimanda la riga alla coda che sa lavorarla (incassi evento / rate).
+    // Serve perché per un incasso-evento la risposta giusta non è un conto: il ricavo nasce dal
+    // modulo Eventi, e qui non si può (né si deve) aggirare quell'invariante.
+    @PUT
+    @Path("/import/transitori/{movimentoId}/sposta")
+    @RolesAllowed("ADMIN")
+    public Response spostaInCoda(@PathParam("movimentoId") UUID movimentoId,
+                                 SpostaRigaRequest req, @Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        triageService.spostaInCoda(movimentoId, req, userId);
+        return Response.noContent().build();
+    }
+
     @GET
     @Path("/import/bu-per-coge")
     @RolesAllowed("ADMIN")
@@ -470,6 +492,38 @@ public class MovimentiResource {
 
     // La vista Effetti/RiBa separata è cancellata (audit §7.7): quelle righe sono uscite da
     // catalogare come le altre e ora compaiono in /import/transitori.
+
+    // ── Il contatore dell'import (SPEC import-v2 §5/§6, R7–R10) ─────────────────────────
+    // Quanto è uscito dalle banche e dove si trova adesso, al centesimo e per direzione.
+    // È l'oracolo contro cui il titolare verifica l'estratto conto: sola lettura, nessuno stato.
+    @GET
+    @Path("/import/{importLogId}/contatore")
+    @RolesAllowed("ADMIN")
+    public com.agostinelli.gestionale.movimenti.dto.ContatoreImportDTO contatore(
+            @PathParam("importLogId") UUID importLogId) {
+        return contatoreService.calcola(importLogId);
+    }
+
+    // ── Registro di TUTTE le righe dell'import (R21/R22) ────────────────────────────────
+    // Sola lettura: nessuna azione inline. Il denaro si muove da una strada sola, il wizard
+    // (principio 6 di PRODUCT.md). Cliccando una riga la UI apre il wizard su QUELLA riga.
+    @GET
+    @Path("/import/{importLogId}/righe")
+    @RolesAllowed("ADMIN")
+    public com.agostinelli.gestionale.movimenti.dto.RegistroImportDTO righeImport(
+            @PathParam("importLogId") UUID importLogId,
+            @QueryParam("stato") String stato,
+            @QueryParam("conto") Short conto,
+            @QueryParam("da") String da,
+            @QueryParam("a") String a,
+            @QueryParam("q") String cerca,
+            @QueryParam("page") @DefaultValue("0") int page,
+            @QueryParam("size") @DefaultValue("50") int size) {
+        return contatoreService.registro(importLogId, stato, conto,
+                da == null || da.isBlank() ? null : java.time.LocalDate.parse(da),
+                a == null || a.isBlank() ? null : java.time.LocalDate.parse(a),
+                cerca, page, Math.min(Math.max(size, 1), MAX_TRIAGE_SIZE));
+    }
 
     // ── Pannello di quadratura di periodo (sostituisce "Incassi POS da ripartire") ──────
     // PROMPT-RICONCILIAZIONE-PERIODO §5: i ricavi POS nascono da Billy; qui si mostra solo il

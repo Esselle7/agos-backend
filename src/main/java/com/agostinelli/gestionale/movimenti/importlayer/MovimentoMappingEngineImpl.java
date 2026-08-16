@@ -2,7 +2,9 @@ package com.agostinelli.gestionale.movimenti.importlayer;
 
 import com.agostinelli.gestionale.movimenti.dto.MovimentoCreateRequest;
 import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
+import com.agostinelli.gestionale.movimenti.importlayer.model.Confidenza;
 import com.agostinelli.gestionale.movimenti.importlayer.model.MappingResult;
+import com.agostinelli.gestionale.movimenti.importlayer.model.Proposta;
 import com.agostinelli.gestionale.movimenti.importlayer.model.ParkEvento;
 import com.agostinelli.gestionale.movimenti.importlayer.model.RawMovimento;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordClassificazioneEngine;
@@ -115,6 +117,15 @@ public class MovimentoMappingEngineImpl {
         String note;                // es. "Incasso Alveare (Stripe)"
         String motivo;              // se valorizzato → AMBIGUOUS
         String keywordConflittoSig; // se valorizzato → conflitto keyword di MATCH (riga su transitorio)
+        /** R1/R3: quanto il motore SA. Default IGNOTA — la certezza va guadagnata, non assunta. */
+        Confidenza confidenza = Confidenza.IGNOTA;
+        /** R6: il perché in chiaro, quando la confidenza è PROPOSTA. */
+        String perche;
+
+        Classify certa() { this.confidenza = Confidenza.CERTA; return this; }
+        Classify proposta(String perche) {
+            this.confidenza = Confidenza.PROPOSTA; this.perche = perche; return this;
+        }
     }
 
     public MappingResult map(RawMovimento n) {
@@ -132,16 +143,19 @@ public class MovimentoMappingEngineImpl {
         String via; // traccia del percorso decisionale (per il log per-import)
         if (rule != null && !"MAP".equals(rule.azione())) {
             return switch (rule.azione()) {
+                // Le esclusioni deterministiche sono CERTE (nessun conto proposto da confermare);
+                // rate ed eventi sono PROPOSTE: la coda chiede all'utente a cosa attaccarli (§1).
                 case "SKIP_POS" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_POS, n)
-                        .withTrace("REGOLA DATA-DRIVEN → SKIP_POS");
+                        .with(Confidenza.CERTA, null).withTrace("REGOLA DATA-DRIVEN → SKIP_POS");
                 case "SKIP_GIROCONTO" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_GIROCONTO, n)
-                        .withTrace("REGOLA DATA-DRIVEN → SKIP_GIROCONTO");
+                        .with(Confidenza.CERTA, null).withTrace("REGOLA DATA-DRIVEN → SKIP_GIROCONTO");
                 case "SKIP_RICORRENTE" -> MappingResult.skip(MappingResult.MappingOutcome.SKIP_RICORRENTE, n)
-                        .withTrace("REGOLA DATA-DRIVEN → SKIP_RICORRENTE");
+                        .with(Confidenza.PROPOSTA, null).withTrace("REGOLA DATA-DRIVEN → SKIP_RICORRENTE");
                 case "PARK_EVENTO" -> MappingResult.parkEvento(
                         buildPark(safe(n.descrizione()), safe(n.descCompact()), n.dataMovimento()), n)
-                        .withTrace("REGOLA DATA-DRIVEN → PARK_EVENTO");
+                        .with(Confidenza.PROPOSTA, null).withTrace("REGOLA DATA-DRIVEN → PARK_EVENTO");
                 default -> MappingResult.ambiguous("AZIONE_REGOLA_SCONOSCIUTA", n)
+                        .with(Confidenza.IGNOTA, null)
                         .withTrace("REGOLA DATA-DRIVEN → azione sconosciuta: " + rule.azione());
             };
         }
@@ -150,17 +164,23 @@ public class MovimentoMappingEngineImpl {
             cl.cogeId = coge(rule.cogeCodice());
             cl.bu = rule.buId();
             cl.metodoCodiceOverride = rule.metodoCodice();
+            // R3: EQUALS/IN_LIST leggono un campo, non indovinano su una sottostringa.
+            if (rule.strutturale()) cl.certa();
+            else cl.proposta("la regola «" + rule.matchType() + " " + rule.pattern() + "» ha fatto match");
             via = "REGOLA DATA-DRIVEN MAP (coge=" + rule.cogeCodice() + ", bu=" + rule.buId() + ")";
         } else {
             // ── GATE A — esclusioni deterministiche (ETL v2 §4) ──
             MappingResult.MappingOutcome skip = gateA(n, sorgente);
             if (skip != null) {
-                return MappingResult.skip(skip, n).withTrace("GATE A → " + skip);
+                return MappingResult.skip(skip, n)
+                        .with(skip == MappingResult.MappingOutcome.SKIP_RICORRENTE
+                                ? Confidenza.PROPOSTA : Confidenza.CERTA, null)
+                        .withTrace("GATE A → " + skip);
             }
             // ── Giroconti / versamenti contanti → CoGe patrimoniale 10.03.x (dopo il Gate A:
             // la precedenza SKIP_POS di Satispay resta intatta) ──
             if (n.girosalto() != null) {
-                cl = classifyGirosalto(n, sorgente);
+                cl = classifyGirosalto(n, sorgente).certa();   // R3: marcato dal normalizzatore
                 via = "GIROSALTO → " + n.girosalto();
                 audit.passo("[3] GIRO", "riga marcata come " + n.girosalto()
                         + " → conto patrimoniale " + codeOf(cl.cogeId) + " (fuori P&L)");
@@ -175,7 +195,7 @@ public class MovimentoMappingEngineImpl {
                           + ", data evento estratta=" + park.dataEventoEstratta()
                           + " (la controparte la legge la coda dal movimento normalizzato)");
                 if (park != null) {
-                    return MappingResult.parkEvento(park, n).withTrace(
+                    return MappingResult.parkEvento(park, n).with(Confidenza.PROPOSTA, null).withTrace(
                             "GATE B → PARK_EVENTO (kw=" + park.keywordMatch()
                             + ", tipo=" + park.tipoEventoPresunto() + ")");
                 }
@@ -192,7 +212,8 @@ public class MovimentoMappingEngineImpl {
         }
 
         if (cl.motivo != null) {
-            return MappingResult.ambiguous(cl.motivo, n).withTrace(via + " → AMBIGUOUS: " + cl.motivo);
+            return MappingResult.ambiguous(cl.motivo, n).with(Confidenza.IGNOTA, null)
+                    .withTrace(via + " → AMBIGUOUS: " + cl.motivo);
         }
 
         // Metodo di pagamento: override (es. Stripe) o codice dal normalizzatore
@@ -205,7 +226,25 @@ public class MovimentoMappingEngineImpl {
                 ? "invarianti ok (metodo=" + metodoCodice + ")"
                 : "violata: " + motivo + " → la riga finisce in import_ambiguita");
         if (motivo != null) {
-            return MappingResult.ambiguous(motivo, n).withTrace(via + " → AMBIGUOUS (validazione): " + motivo);
+            return MappingResult.ambiguous(motivo, n).with(Confidenza.IGNOTA, null)
+                    .withTrace(via + " → AMBIGUOUS (validazione): " + motivo);
+        }
+
+        // ── R4/R5 — SCRITTURA SELETTIVA: solo la CERTA finisce sul conto definitivo ──
+        // La PROPOSTA nasce sul transitorio con la proposta ALLEGATA e NON applicata. Il denaro
+        // resta a libro (saldo del conto invariato, §5: il denaro non si perde mai), ma la
+        // CATEGORIA la decide l'utente. Il dirottamento sta QUI, in un punto solo: l'orchestratore
+        // non deve sapere nulla di confidenza, e nessun ramo del motore può dimenticarsene.
+        Proposta proposta = null;
+        if (cl.confidenza == Confidenza.PROPOSTA) {
+            proposta = new Proposta(codeOf(cl.cogeId), cl.bu, cl.fornitoreId, cl.perche);
+            cl.cogeId = coge("ENTRATA".equals(n.tipo()) ? COGE_RICAVI_DACLASS : COGE_COSTI_DACLASS);
+            cl.bu = BU_TRANSITORIO;
+            cl.aliquota = IVA_00;
+            // Il perché arriva AL DATO (R1), non solo al file di audit: è la frase che l'operatore
+            // legge nel wizard accanto alla riga, insieme al conto proposto.
+            cl.note = (cl.note == null ? "" : cl.note + " | ")
+                    + proposta.marcatore() + " " + proposta.perche();
         }
 
         MovimentoCreateRequest req = new MovimentoCreateRequest(
@@ -231,8 +270,12 @@ public class MovimentoMappingEngineImpl {
                 n.fonte(),
                 null                       // allegatoPath
         );
-        MappingResult res = MappingResult.success(req, n).withTrace(
-                via + " → BOOK (coge=" + codeOf(cl.cogeId) + ", bu=" + cl.bu
+        MappingResult res = MappingResult.success(req, n)
+                .with(cl.confidenza, proposta)
+                .withTrace(via + " → " + cl.confidenza
+                + (proposta == null ? " BOOK" : " PROPOSTA non applicata (" + proposta.cogeCodice()
+                        + ": " + proposta.perche() + ") → transitorio")
+                + " (coge=" + codeOf(cl.cogeId) + ", bu=" + cl.bu
                 + (cl.fornitoreId != null ? ", fornitore" : "")
                 + (cl.keywordConflittoSig != null ? ", KEYWORD_CONFLITTO" : "")
                 + (cl.descrizioneOverride != null ? ", tag ALVEARE" : "") + ")");
@@ -276,7 +319,7 @@ public class MovimentoMappingEngineImpl {
 
         String motivo = validateArricchito(n, conto, metodoCodice, metodoId, cogeId, bu);
         if (motivo != null) {
-            return MappingResult.ambiguous(motivo, n)
+            return MappingResult.ambiguous(motivo, n).with(Confidenza.IGNOTA, null)
                     .withTrace("CONGIUNTO " + d.esito() + " → AMBIGUOUS (validazione): " + motivo);
         }
 
@@ -299,8 +342,11 @@ public class MovimentoMappingEngineImpl {
                 n.riferimentoEsterno(),
                 n.fonte(),
                 null);
-        return MappingResult.success(req, n).withTrace(
-                "CONGIUNTO " + d.esito() + " → BOOK (coge=" + cogeCodice + ", bu=" + bu
+        // R3: una riga POS con lo scontrino Billy agganciato su (DEL + importo) è un campo, non
+        // un'ipotesi — l'aggancio è deterministico. Senza scontrino resta IGNOTA sul transitorio.
+        Confidenza conf = categorizzato ? Confidenza.CERTA : Confidenza.IGNOTA;
+        return MappingResult.success(req, n).with(conf, null).withTrace(
+                "CONGIUNTO " + d.esito() + " → " + conf + " BOOK (coge=" + cogeCodice + ", bu=" + bu
                 + (categorizzato ? "" : ", TRANSITORIO") + ", conto=" + conto + ", metodo=" + metodoCodice + ")");
     }
 
@@ -650,19 +696,19 @@ public class MovimentoMappingEngineImpl {
             if (agri) {
                 if (isPosIncasso(desc) || "SATISPAY".equals(n.metodoPagamentoCodice())) {
                     cl.cogeId = coge(COGE_AGRITURISMO); cl.bu = 1; cl.aliquota = IVA_10;
-                } else {
-                    cl.cogeId = coge(COGE_RICAVI_DACLASS); cl.bu = 5; cl.aliquota = IVA_00;
+                    return cl.certa();   // campo strutturale Billy, non un indovinello
                 }
+                cl.cogeId = coge(COGE_RICAVI_DACLASS); cl.bu = 5; cl.aliquota = IVA_00;
                 return cl;
             }
 
             if ("SATISPAY".equals(n.metodoPagamentoCodice())) {
-                if (altro) { cl.cogeId = coge(COGE_CARNE_10); cl.bu = 3; cl.aliquota = IVA_10; }
-                else { cl.cogeId = coge(COGE_RICAVI_DACLASS); cl.bu = 5; cl.aliquota = IVA_00; }
+                if (altro) { cl.cogeId = coge(COGE_CARNE_10); cl.bu = 3; cl.aliquota = IVA_10; return cl.certa(); }
+                cl.cogeId = coge(COGE_RICAVI_DACLASS); cl.bu = 5; cl.aliquota = IVA_00;
                 return cl;
             }
-            if (altro && carne) { cl.cogeId = coge(COGE_CARNE_10); cl.bu = 3; cl.aliquota = IVA_10; return cl; }
-            if (altro && orto) { cl.cogeId = coge(COGE_ORTOFRUTTA_4); cl.bu = 3; cl.aliquota = IVA_04; return cl; }
+            if (altro && carne) { cl.cogeId = coge(COGE_CARNE_10); cl.bu = 3; cl.aliquota = IVA_10; return cl.certa(); }
+            if (altro && orto) { cl.cogeId = coge(COGE_ORTOFRUTTA_4); cl.bu = 3; cl.aliquota = IVA_04; return cl.certa(); }
             // fallback Billy → transitorio (non più BU_AMBIGUA): il dato c'è, si rifinisce in triage
             cl.cogeId = coge(COGE_RICAVI_DACLASS); cl.bu = 5; cl.aliquota = IVA_00;
             return cl;
@@ -677,18 +723,18 @@ public class MovimentoMappingEngineImpl {
             // R3 — tag Alveare: origine esplicita nel movimento (descrizione + note)
             cl.descrizioneOverride = "[ALVEARE] " + desc;
             cl.note = "Incasso Alveare (Stripe)";
-            return cl;
+            return cl.certa();   // R3: mittente scritto in causale
         }
 
         // C4 — partite speciali (entrate non operative)
         if (desc.contains("ORGANISMO PAGATORE") || desc.contains("AGEA")
                 || desc.contains("REGIME DI PAGAMENTO UNICO")) {
             cl.cogeId = coge(COGE_CONTRIBUTI); cl.bu = 1; cl.aliquota = IVA_00;
-            return cl;
+            return cl.certa();   // R3: mittente scritto in causale (AGEA / organismo pagatore)
         }
         if (desc.contains("VERSAMENTO SOCIO") || desc.contains("VERSAMENTO SOCI")) {
             cl.cogeId = coge(COGE_VERSAMENTO_SOCI); cl.bu = 5; cl.aliquota = IVA_00;
-            return cl;
+            return cl.certa();   // R3: mittente scritto in causale (versamento soci)
         }
         // Rimborso/storno su carta (es. reso o chargeback): NON è un ricavo di vendita. Lo si lascia
         // sul transitorio ricavi ma marcato, così l'operatore lo riconduce al costo originario.
@@ -725,10 +771,24 @@ public class MovimentoMappingEngineImpl {
         }
         Integer cogeId = coge(m.cogeCodice());
         if (cogeId == null || m.bu() == null) return false; // target non risolvibile → fallback
+        // Una firma appresa da una riga che era ANCORA sul transitorio punta al transitorio: la
+        // «proposta» sarebbe «ti propongo di lasciarla dov'è», cioè rumore che l'operatore deve
+        // leggere e scartare a ogni riga. Non è una proposta, è l'assenza di risposta → IGNOTA.
+        // Misurato su agosdb il 13/08/2026: 1 riga su 40 (firma «AZIENDA+PANZERI+VIVAI», 492,80 €).
+        if (COGE_RICAVI_DACLASS.equals(m.cogeCodice()) || COGE_COSTI_DACLASS.equals(m.cogeCodice())) {
+            return false;
+        }
         cl.cogeId = cogeId;
         cl.bu = m.bu();
         cl.fornitoreId = m.fornitoreId();
         if ("ENTRATA".equals(n.tipo())) cl.aliquota = IVA_00;
+        // R5/R18: una firma appresa è un'ipotesi su un NOME (ENEL, SOGEGROSS, una persona fisica),
+        // non un campo strutturale → si propone. Torna CERTA DA SOLA quando accumula conferme
+        // senza correzioni (§4/R18): finché N = ∞ nessuna firma è promossa, e la classe CERTA
+        // resta l'elenco chiuso di R3.
+        if (m.promossa()) cl.certa();
+        else cl.proposta("la firma keyword «" + m.firmaLeggibile() + "» ("
+                + m.natura().name().toLowerCase() + ") l'hai già catalogata così");
         return true;
     }
 
@@ -743,7 +803,7 @@ public class MovimentoMappingEngineImpl {
         if ("ADDEBITO_CONTO".equals(n.metodoPagamentoCodice())) {
             cl.cogeId = coge(COGE_SPESE_BANCA);
             cl.bu = 5;
-            return cl;
+            return cl.certa();   // R3: il metodo ADDEBITO_CONTO è il segnale, non un'ipotesi
         }
 
         boolean sdd = causale.contains("SDD") || "PAGAMENTO UTENZE".equals(causale);
@@ -752,17 +812,17 @@ public class MovimentoMappingEngineImpl {
             cl.bu = 5;
             AliasRule nexi = matchAlias(desc);
             if (nexi != null) cl.fornitoreId = nexi.fornitoreId();
-            return cl;
+            return cl.certa();   // R3: CoGe 40.02.* da causale strutturata
         }
         if (desc.contains("BOLLO E/C") || desc.contains("CANONE") || desc.contains("COMMISSIONI")) {
             cl.cogeId = coge(COGE_SPESE_BANCA);
             cl.bu = 5;
-            return cl;
+            return cl.certa();   // R3: CoGe 40.02.* da causale strutturata
         }
         if ("COMMISSIONI/SPESE".equals(causale)) {
             cl.cogeId = coge(COGE_SPESE_BANCA);
             cl.bu = 5;
-            return cl;
+            return cl.certa();   // R3: CoGe 40.02.* da causale strutturata
         }
 
         // Keyword apprese (§4.6): sostituiscono la vecchia rubrica controparti (IBAN). Consultate
@@ -777,7 +837,8 @@ public class MovimentoMappingEngineImpl {
             cl.cogeId = alias.cogeDefaultId();
             cl.bu = alias.buDefaultId();
             cl.fornitoreId = alias.fornitoreId();
-            return cl;
+            // R5: un alias è un'ipotesi su un NOME di fornitore, non un campo → si propone.
+            return cl.proposta("l'alias fornitore «" + alias.pattern() + "» compare nella causale");
         }
         // Fornitore non bloccante (ETL v2 §6 C3/§7): uscita senza match →
         // transitorio "Costi da classificare" (fornitore già attaccato se controparte trovata).

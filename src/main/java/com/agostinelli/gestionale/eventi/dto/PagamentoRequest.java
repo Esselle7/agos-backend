@@ -32,5 +32,12 @@ public record PagamentoRequest(
          * Conto COGE di destinazione (opzionale).
          * Se null, il service seleziona automaticamente il primo conto ricavi (30.xx).
          */
-        Integer contoCoge
+        Integer contoCoge,
+
+        /**
+         * Ordinante del bonifico, come letto dall'estratto conto (A4). Lo passa l'import
+         * ({@code ImportTriageService.riconciliaEvento}); dalla scheda evento è null, e in quel
+         * caso la guardia anti-doppione resta quella di prima — fail-closed.
+         */
+        String controparte
 ) {}

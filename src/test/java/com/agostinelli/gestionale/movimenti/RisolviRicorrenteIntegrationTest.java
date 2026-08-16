@@ -152,7 +152,7 @@ class RisolviRicorrenteIntegrationTest {
         long prima = movimentiConDescr(DESCR_PREFIX + "_IGNOREME");
 
         given().contentType(ContentType.JSON)
-            .body("{\"azione\":\"IGNORA\"}")
+            .body("{\"azione\":\"IGNORA\",\"nota\":\"non e' una rata di un nostro piano\"}")
             .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
             .then().statusCode(204);
 

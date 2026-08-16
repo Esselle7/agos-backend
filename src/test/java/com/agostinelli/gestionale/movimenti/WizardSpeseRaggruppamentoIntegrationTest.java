@@ -171,9 +171,13 @@ class WizardSpeseRaggruppamentoIntegrationTest {
         assertEquals(r.cogeCodiceAttuale(), cogeDi(r.id()));
     }
 
-    /** Happy path + la guardia esistente: una riga si cataloga una volta sola. */
+    /**
+     * Happy path: catalogare toglie la riga dalla coda. E ri-catalogarla è LEGITTIMO (SPEC
+     * import-v2 R13, decisione n.4 del 12/08/2026): fino a quel giorno la seconda chiamata dava
+     * 409 NON_TRANSITORIO, cioè quello che il motore aveva scritto restava definitivo.
+     */
     @Test
-    void catalogareTogliLaRigaDallaCoda_eNonSiRipete() throws Exception {
+    void catalogareTogliLaRigaDallaCoda_eResaCorreggibile() throws Exception {
         importaCongiunto();
         TransitorioDTO r = primaRiga();
         int quante = triageService.listTransitori(null, 0, 2000).content().size();
@@ -185,9 +189,13 @@ class WizardSpeseRaggruppamentoIntegrationTest {
         assertEquals("40.05.002", cogeDi(r.id()));
         assertEquals(quante - 1, triageService.listTransitori(null, 0, 2000).content().size());
 
-        ApiException e = assertThrows(ApiException.class, () -> triageService.classificaTransitorio(
-                r.id(), new ClassificaTransitorioRequest(coge, (short) 2, null, false, null)));
-        assertEquals("NON_TRANSITORIO", e.getCode());
+        // Seconda passata: la riga non è più sul transitorio, ma la correzione resta aperta.
+        Integer altro = cogeId("40.02.002");
+        triageService.classificaTransitorio(r.id(),
+                new ClassificaTransitorioRequest(altro, (short) 5, null, false, "mi ero sbagliato"));
+        assertEquals("40.02.002", cogeDi(r.id()), "la ricatalogazione riscrive il movimento");
+        assertEquals(quante - 1, triageService.listTransitori(null, 0, 2000).content().size(),
+                "e non lo rimette in coda");
     }
 
     // ── helper ──────────────────────────────────────────────────────────────────

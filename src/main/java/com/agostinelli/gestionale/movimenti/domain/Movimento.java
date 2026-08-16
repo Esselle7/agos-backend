@@ -120,6 +120,14 @@ public class Movimento {
     @Column(name = "riferimento_esterno", length = 255)
     public String riferimentoEsterno;
 
+    /**
+     * Ordinante/beneficiario come letto dall'estratto conto (V34). Valorizzato solo sui
+     * pagamenti-evento nati dall'import: è il discriminante fra due incassi veri identici
+     * nello stesso giorno e un doppione. NULL = ignoto (registrazione manuale).
+     */
+    @Column(name = "controparte", columnDefinition = "text")
+    public String controparte;
+
     @Column(name = "allegato_path", length = 500)
     public String allegatoPath;
 

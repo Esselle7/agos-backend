@@ -253,6 +253,83 @@ class ImportEventiAttribuzioneIntegrationTest {
         Assertions.assertEquals("30.02.001", cogeDelPagamento(evento, "CAPARRA"), "la caparra ha il suo conto");
     }
 
+    // ── C2/C3: il segnale «già a libro» sulla coda ─────────────────────────────────
+
+    /**
+     * C2 — la lista dice, <b>al caricamento</b>, quali righe hanno già un gemello a libro
+     * (stesso importo, stessa data finanziaria, stesso conto), con il giorno di inserimento e
+     * l'evento su cui è registrato. Prima di questo, il doppione si scopriva solo quando il
+     * server rifiutava, cioè dopo aver già scelto l'evento.
+     */
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void codaEventi_segnalaLeRigheCheHannoGiaUnGemelloALibro() {
+        UUID evento = eventoReale("Cena C2", "2026-07-19", "3000.00");
+        UUID gia    = parcheggiato("ROSSI MARIO", "2026-07-14", "500.00", "2026-07-19", "ACCONTO");
+        risolvi(gia, evento, "ACCONTO", 204);
+
+        UUID sospetta = parcheggiato("ROSSI MARIO", "2026-07-14", "500.00", "2026-07-19", "ACCONTO");
+        UUID pulita   = parcheggiato("BIANCHI ANNA", "2026-07-14", "700.00", "2026-07-19", "ACCONTO");
+
+        var res = given().when().get("/api/movimenti/import/eventi?size=100")
+                .then().statusCode(200).extract();
+
+        Assertions.assertNotNull(res.path("content.find { it.id == '" + sospetta + "' }.gemelloInseritoIl"),
+                "stesso importo, stessa data, stesso conto: la riga va segnalata");
+        Assertions.assertEquals(MARKER + "Cena C2",
+                res.path("content.find { it.id == '" + sospetta + "' }.gemelloEventoNome"),
+                "il segnale dice anche SU QUALE evento il gemello è già registrato");
+        Assertions.assertNull(res.path("content.find { it.id == '" + pulita + "' }.gemelloInseritoIl"),
+                "importo diverso: nessun gemello, nessun segnale");
+    }
+
+    /**
+     * C3 — il segnale è <b>informazione, non permesso</b>, in tutte e due le direzioni.
+     *
+     * <p>(a) una riga segnalata resta confermabile: lo stesso importo su un altro evento è una
+     * cosa diversa, e potrebbe essere una seconda tranche vera (ADR 003).
+     * <p>(b) una riga NON segnalata può comunque essere respinta: qui il gemello nasce dopo il
+     * caricamento della lista, e la conferma prende 409 lo stesso — perché la guardia che conta
+     * legge nella stessa transazione che scrive, mentre la lista è una fotografia.
+     */
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void ilSegnale_nonEUnPermesso_neLaSuaAssenzaUnVialibera() {
+        UUID eventoX = eventoReale("Festa X C3", "2026-07-19", "3000.00");
+        UUID eventoY = eventoReale("Festa Y C3", "2026-07-26", "3000.00");
+        UUID primo   = parcheggiato("VERDI LUCA", "2026-07-15", "400.00", "2026-07-19", "ACCONTO");
+        UUID secondo = parcheggiato("VERDI LUCA", "2026-07-15", "400.00", "2026-07-19", "ACCONTO");
+        UUID terzo   = parcheggiato("VERDI LUCA", "2026-07-15", "400.00", "2026-07-19", "ACCONTO");
+
+        // La fotografia: nessuna delle tre righe ha un gemello, perché a libro non c'è nulla.
+        var prima = given().when().get("/api/movimenti/import/eventi?size=100")
+                .then().statusCode(200).extract();
+        Assertions.assertNull(prima.path("content.find { it.id == '" + secondo + "' }.gemelloInseritoIl"),
+                "prima che il gemello esista, la riga non è segnalata");
+
+        risolvi(primo, eventoX, "ACCONTO", 204);
+
+        // (b) il gemello è nato DOPO la lettura della lista: la conferma viene respinta lo stesso.
+        risolvi(secondo, eventoX, "ACCONTO", 409);
+
+        // (a) la stessa riga, ora segnalata, resta confermabile su un evento diverso.
+        var dopo = given().when().get("/api/movimenti/import/eventi?size=100")
+                .then().statusCode(200).extract();
+        Assertions.assertNotNull(dopo.path("content.find { it.id == '" + terzo + "' }.gemelloInseritoIl"),
+                "ora il gemello c'è: la riga è segnalata");
+        risolvi(terzo, eventoY, "ACCONTO", 204);
+
+        Assertions.assertEquals(1, contaMovimenti(eventoX), "sull'evento X un solo incasso");
+        Assertions.assertEquals(1, contaMovimenti(eventoY), "il segnale non ha impedito l'attribuzione vera");
+    }
+
+    private void risolvi(UUID parkId, UUID eventoId, String tipo, int atteso) {
+        given().contentType(ContentType.JSON)
+            .body("{\"azione\":\"RICONCILIA\",\"eventoId\":\"" + eventoId + "\",\"tipo\":\"" + tipo + "\"}")
+            .when().put("/api/movimenti/import/eventi/" + parkId + "/risolvi")
+            .then().statusCode(atteso);
+    }
+
     // ── helper ────────────────────────────────────────────────────────────────────
 
     private String cogeDelPagamento(UUID eventoId, String tipo) {

@@ -196,10 +196,10 @@ class WizardRateIntegrationTest {
         RicorrenteParcheggiataDTO rata = rataMaggioMutuo();
 
         triageService.risolviRicorrente(rata.id(),
-                new RisolviRicorrenteRequest("IGNORA", null, null, null, null), TEST_USER);
+                new RisolviRicorrenteRequest("IGNORA", null, null, null, "non e' una rata di un nostro piano"), TEST_USER);
 
         ApiException e = assertThrows(ApiException.class, () -> triageService.risolviRicorrente(
-                rata.id(), new RisolviRicorrenteRequest("IGNORA", null, null, null, null), TEST_USER));
+                rata.id(), new RisolviRicorrenteRequest("IGNORA", null, null, null, "non e' una rata di un nostro piano"), TEST_USER));
         assertEquals("RICORRENTE_GIA_RISOLTA", e.getCode());
     }
 

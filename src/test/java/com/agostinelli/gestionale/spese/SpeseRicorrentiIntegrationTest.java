@@ -179,8 +179,14 @@ class SpeseRicorrentiIntegrationTest {
     @Test
     @Order(13)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
-    void testCreaPiano_cogeNonPassivita_400() {
-        // cerca un conto COSTO (non PASSIVITA)
+    /**
+     * REGOLA CAMBIATA (08/08/2026, docs/specs/ricorrenti-match-strutturato.md): un CoGe di COSTO
+     * su un piano FLAT ora è LEGITTIMO — bollette, canoni e assicurazioni sono costi d'esercizio,
+     * non rimborsi di debito. Col vecchio vincolo "solo PASSIVITA", 5 delle 10 spese ricorrenti
+     * reali non erano rappresentabili se non forzandole su «Debiti verso fornitori».
+     * Resta vietato sui FINANZIAMENTO, dove la quota capitale deve scaricarsi sul patrimoniale.
+     */
+    void testCreaPiano_cogeCosto_ammessoSuFlat_vietatoSuFinanziamento() {
         Number costoId;
         try {
             costoId = (Number) em.createNativeQuery(
@@ -188,9 +194,9 @@ class SpeseRicorrentiIntegrationTest {
                     .getSingleResult();
         } catch (Exception e) { return; } // skip se non esiste
 
-        String body = """
+        String flat = """
             {
-              "descrizione": "Errore coge sbagliato",
+              "descrizione": "Bolletta luce (costo d'esercizio)",
               "contoBancarioId": 1,
               "contoCoge": %d,
               "importoRata": 100.00,
@@ -201,12 +207,37 @@ class SpeseRicorrentiIntegrationTest {
               "dataInizio": "2026-01-01"
             }
             """.formatted(costoId.intValue());
-
-        given()
-            .contentType(ContentType.JSON).body(body)
+        given().contentType(ContentType.JSON).body(flat)
             .when().post(BASE + "/piani")
-            .then()
-                .statusCode(400);
+            .then().statusCode(201);
+
+        Number onereId;
+        try {
+            onereId = (Number) em.createNativeQuery(
+                    "SELECT id FROM piano_dei_conti_coge WHERE tipo = 'ONERE_FINANZIARIO' LIMIT 1")
+                    .getSingleResult();
+        } catch (Exception e) { return; }
+
+        String finanziamento = """
+            {
+              "descrizione": "Mutuo su conto di costo (vietato)",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 100.00,
+              "variazionePct": 0,
+              "giornoDelMese": 1,
+              "frequenza": "MENSILE",
+              "numeroRate": 3,
+              "dataInizio": "2026-01-01",
+              "tipoPiano": "FINANZIAMENTO",
+              "importoDebitoIniziale": 1000.00,
+              "tassoInteresseAnnuo": 3.5,
+              "contoCogeInteressiId": %d
+            }
+            """.formatted(costoId.intValue(), onereId.intValue());
+        given().contentType(ContentType.JSON).body(finanziamento)
+            .when().post(BASE + "/piani")
+            .then().statusCode(400).body("code", equalTo("COGE_NON_PASSIVITA"));
     }
 
     @Test

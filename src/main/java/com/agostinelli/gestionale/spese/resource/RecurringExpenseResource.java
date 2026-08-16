@@ -48,6 +48,17 @@ public class RecurringExpenseResource {
         return service.getPlanDetail(id);
     }
 
+    /**
+     * Modifica anagrafica + riconoscimento del piano (descrizione, conto, riferimento in estratto
+     * conto, note). Gli importi NON si toccano da qui: vedi {@code RecurringExpenseService#updatePlan}.
+     */
+    @PUT
+    @Path("/piani/{id}")
+    public RecurringExpensePlanDetailDTO update(@PathParam("id") UUID id,
+                                                @Valid RecurringExpensePlanUpdateRequest req) {
+        return service.updatePlan(id, req);
+    }
+
     @POST
     @Path("/piani/{id}/liquida")
     public RecurringExpensePlanDetailDTO liquidate(@PathParam("id") UUID id,
@@ -110,16 +121,19 @@ public class RecurringExpenseResource {
         return Response.noContent().build();
     }
 
-    // ── Lookup: conti COGE PASSIVITA per il form ───────────────────────────────
+    // ── Lookup: conti COGE ammessi su un piano ─────────────────────────────────
+    // PASSIVITA (rate di debito) + COSTO (canoni, utenze, assicurazioni). Il `tipo` viaggia nella
+    // risposta perché il form lo usa per restringere a sole PASSIVITA quando il piano è un
+    // FINANZIAMENTO — stessa regola che il server applica in validateCogePiano.
 
     @GET
     @Path("/conti-coge")
     @Transactional
     @SuppressWarnings("unchecked")
-    public List<Object[]> contiCogePassivita() {
+    public List<Object[]> contiCogePiano() {
         return em.createNativeQuery(
-                "SELECT id, codice, descrizione FROM piano_dei_conti_coge " +
-                "WHERE tipo = 'PASSIVITA' AND is_active = true ORDER BY codice")
+                "SELECT id, codice, descrizione, tipo FROM piano_dei_conti_coge " +
+                "WHERE tipo IN ('PASSIVITA','COSTO') AND is_active = true ORDER BY tipo DESC, codice")
                 .getResultList();
     }
 

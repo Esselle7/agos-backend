@@ -30,13 +30,27 @@ public record EtlImportResponse(
          * NON sono state persistite come nuovi movimenti (evita doppia registrazione): l'utente
          * le risolve dalla sezione "Matching differiti" dello smistamento (COLLEGA/IGNORA).
          */
-        int matchingDifferiti
+        int matchingDifferiti,
+        /**
+         * I passi che l'elaborazione ha davvero eseguito, in ordine, con la durata misurata di
+         * ognuno: è ciò che la schermata mostra all'utente mentre e dopo l'import
+         * ({@link FaseImportDTO}). Vuota per i flussi che non la valorizzano.
+         */
+        List<FaseImportDTO> fasi
 ) {
-    /** Costruttore di compatibilità per i chiamanti che non valorizzano il nuovo campo. */
+    /** Costruttore di compatibilità per i chiamanti che non valorizzano i campi nuovi. */
     public EtlImportResponse(UUID importLogId, int importati, int duplicati, int ambigui,
                              int scartati, int parcheggiati, int ricorrenti,
                              List<EtlRowError> errori, List<EtlRowError> avvisi) {
         this(importLogId, importati, duplicati, ambigui, scartati, parcheggiati, ricorrenti,
-                errori, avvisi, 0);
+                errori, avvisi, 0, List.of());
+    }
+
+    public EtlImportResponse(UUID importLogId, int importati, int duplicati, int ambigui,
+                             int scartati, int parcheggiati, int ricorrenti,
+                             List<EtlRowError> errori, List<EtlRowError> avvisi,
+                             int matchingDifferiti) {
+        this(importLogId, importati, duplicati, ambigui, scartati, parcheggiati, ricorrenti,
+                errori, avvisi, matchingDifferiti, List.of());
     }
 }

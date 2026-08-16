@@ -19,10 +19,10 @@ import static org.junit.jupiter.api.Assertions.*;
 class KeywordClassificazioneEngineTest {
 
     static Firma dominio(String coge, short bu, String tipo, String... token) {
-        return new Firma(UUID.randomUUID(), Natura.DOMINIO, tipo, "*", bu, coge, null, "sig", Set.of(token));
+        return new Firma(UUID.randomUUID(), Natura.DOMINIO, tipo, "*", bu, coge, null, "sig", Set.of(token), 0, 0);
     }
     static Firma identita(String coge, short bu, UUID forn, String tipo, String... token) {
-        return new Firma(UUID.randomUUID(), Natura.IDENTITA, tipo, "*", bu, coge, forn, "sig", Set.of(token));
+        return new Firma(UUID.randomUUID(), Natura.IDENTITA, tipo, "*", bu, coge, forn, "sig", Set.of(token), 0, 0);
     }
 
     @Test

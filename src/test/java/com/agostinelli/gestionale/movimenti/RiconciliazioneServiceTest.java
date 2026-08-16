@@ -76,23 +76,32 @@ class RiconciliazioneServiceTest {
         assertEquals(0, ds.quadratura().assegnatoCa().compareTo(ds2.quadratura().assegnatoCa()));
     }
 
+    /**
+     * REGRESSION (2026-08-09) — le banche sono l'ossatura: ogni riga POS bancaria diventa un
+     * movimento con il SUO conto e il SUO importo. Prima di questo fix i ricavi nascevano dagli
+     * scontrini Billy con banca assegnata per riempimento proporzionale: BPM riceveva 72,00 e CA
+     * 48,00 (cioè né l'una né l'altra il proprio incasso reale) e le righe banca sparivano.
+     */
     @Test
-    void ripartizione_proporzionale_spalmaLoScartoSuEntrambeLeBanche() {
-        // 10 scontrini da 12,00 = 120,00 di ricavi. Banche: BPM 90, CA 50 (Σtot=140 > 120: residuo 20).
-        // Target proporzionale BPM = 120 * 90/140 = 77,14 → greedy riempie BPM con 6 scontrini (72,00),
-        // i 4 restanti a CA (48,00). Ripartizione GREEDY-Σ avrebbe dato BPM 84 / CA 36 (CA tutto lo scarto):
-        // qui invece ENTRAMBE finiscono sotto il loro POS lordo (72<90 e 48<50).
+    void banchePos_sonoLOssatura_importoEContoRestanoQuelliDellaBanca() {
         List<RawMovimento> scontrini = new ArrayList<>();
         for (int i = 0; i < 10; i++) scontrini.add(billyEle(D, "12.00", "carne", "s" + i));
         RawMovimento bpm = bankPos((short) 1, "90.00", D, D.plusDays(1));
         RawMovimento ca = bankPos((short) 2, "50.00", D, D.plusDays(1));
 
-        QuadraturaPeriodo q = svc.riconcilia(scontrini, List.of(bpm), List.of(ca)).quadratura();
+        DatasetRiconciliato ds = svc.riconcilia(scontrini, List.of(bpm), List.of(ca));
+        QuadraturaPeriodo q = ds.quadratura();
 
-        assertEquals(0, new BigDecimal("72.00").compareTo(q.assegnatoBpm()), "BPM = target proporzionale (6×12)");
-        assertEquals(0, new BigDecimal("48.00").compareTo(q.assegnatoCa()), "CA = resto (4×12)");
-        assertTrue(q.assegnatoBpm().compareTo(q.sigmaBpm()) < 0, "BPM sotto il suo POS lordo");
-        assertTrue(q.assegnatoCa().compareTo(q.sigmaCa()) < 0, "CA sotto il suo POS lordo (scarto spalmato)");
+        // Ogni banca porta a libro ESATTAMENTE il proprio incasso POS, non una quota calcolata.
+        assertEquals(0, new BigDecimal("90.00").compareTo(q.assegnatoBpm()), "BPM = il suo POS reale");
+        assertEquals(0, new BigDecimal("50.00").compareTo(q.assegnatoCa()), "CA = il suo POS reale");
+        assertEquals(0, q.assegnatoBpm().compareTo(q.sigmaBpm()), "niente scarto: la riga banca è il movimento");
+        assertEquals(0, q.assegnatoCa().compareTo(q.sigmaCa()), "niente scarto: la riga banca è il movimento");
+        assertEquals(2, ds.stat().ricaviPos(), "entrambe le righe POS bancarie sono contabilizzate");
+
+        // Nessuno scontrino Billy elettronico diventa un movimento bancario: solo le righe banca.
+        long daBanca = ds.daMappare().stream().filter(a -> a.isArricchito()).count();
+        assertEquals(2, daBanca, "esattamente le 2 righe POS bancarie, nessuno scontrino Billy");
     }
 
     @Test
@@ -141,6 +150,10 @@ class RiconciliazioneServiceTest {
         DatasetRiconciliato ds = svc.riconcilia(List.of(scontrino), List.of(core, testa), List.of());
 
         assertEquals(1, ds.stat().testaEsclusa());
+        // F1 (audit 2026-08-11): la riga esclusa esce NOMINATA, non solo contata — l'orchestratore
+        // la scrive in import_scartati. Prima spariva: 230,00 € di accredito vero fuori da ogni coda.
+        assertEquals(1, ds.codaTesta().size(), "la riga esclusa deve restare visibile");
+        assertEquals(0, new BigDecimal("230.00").compareTo(ds.codaTesta().get(0).importo()));
         QuadraturaPeriodo q = ds.quadratura();
         assertEquals(2026, q.anno());
         assertEquals(0, new BigDecimal("230.00").compareTo(q.codaTesta()));
@@ -167,17 +180,25 @@ class RiconciliazioneServiceTest {
         assertEquals(0, new BigDecimal("10.00").compareTo(ds.quadratura().billyContabilizzato()));
     }
 
+    /**
+     * REGRESSION (2026-08-09) — a libro va l'incasso REALE della banca, non il totale Billy.
+     * Il campo residuoCore è stato rimosso l'11/08 (era ≡ 0 per costruzione: guardia vacua,
+     * audit §8 #9); lo scarto che può davvero divergere — POS banca − Billy spaccio — resta
+     * esposto come nota informativa, e questo test lo presidia.
+     */
     @Test
-    void quadratura_residuoCore_eScomposizione() {
-        // Billy 100 (tutto entro maxDEL), banca POS core 120 → residuo core +20 (es. agri-a-POS)
+    void quadratura_aLibroVaLIncassoDellaBanca_eLoScartoConBillyResta() {
+        // Billy 100 (tutto entro maxDEL), banca POS core 120: la banca porta a libro 120.
         RawMovimento s = billyEle(D, "100.00", "carne", "s");
         RawMovimento banca = bankPos((short) 1, "120.00", D, D.plusDays(1));
 
         QuadraturaPeriodo q = svc.riconcilia(List.of(s), List.of(banca), List.of()).quadratura();
 
-        assertEquals(0, new BigDecimal("20.00").compareTo(q.residuoCore()));
-        assertFalse(q.note().isEmpty(), "il pannello elenca le cause del residuo");
-        assertTrue(q.note().stream().anyMatch(n -> n.contains("Satispay")), "menziona Satispay netto/lordo");
+        assertEquals(0, new BigDecimal("120.00").compareTo(q.billyContabilizzato()),
+                "a libro va l'incasso reale della banca (120), non il totale Billy (100)");
+        // Lo scarto POS-banca vs Billy resta esposto come informazione, senza toccare i saldi.
+        assertTrue(q.note().stream().anyMatch(n -> n.contains("Scarto informativo")),
+                "il pannello espone lo scarto POS banca − Billy spaccio");
     }
 
     @Test

@@ -43,16 +43,43 @@ public class KeywordClassificazioneEngine {
 
     /** Firma BOOK in memoria (package-private per i test del risolutore puro). */
     record Firma(UUID id, KeywordExtractor.Natura natura, String tipoMovimento, String sorgente,
-                 Short bu, String cogeCodice, UUID fornitoreId, String signatureHash, Set<String> token) {}
+                 Short bu, String cogeCodice, UUID fornitoreId, String signatureHash, Set<String> token,
+                 int usiConfermati, int usiCorretti) {
+
+        /**
+         * R18 — una firma è CERTA quando ha accumulato abbastanza conferme e nessuna correzione.
+         *
+         * <p><b>N non si sceglie adesso</b>: si fissa quando ci sono almeno 3 mesi di conferme, sul
+         * dato. Fino ad allora N = ∞ (nessuna promozione) e la classe CERTA resta l'elenco chiuso
+         * di R3. Il contatore però gira da subito: quando arriverà il momento di scegliere N ci
+         * sarà lo storico su cui sceglierlo, invece di dover aspettare altri 3 mesi.
+         */
+        boolean promossa() {
+            return usiCorretti == 0 && usiConfermati >= SOGLIA_PROMOZIONE;
+        }
+    }
+
+    /** N di R18. Integer.MAX_VALUE = ∞: nessuna firma si promuove finché il dato non dice quanto. */
+    static final int SOGLIA_PROMOZIONE = Integer.MAX_VALUE;
 
     /** Vista del target appreso per la riga (o conflitto da risolvere). */
     public record KeywordMatch(boolean conflitto, String cogeCodice, Short bu, UUID fornitoreId,
-                               UUID firmaId, KeywordExtractor.Natura natura, String signatureHash) {
+                               UUID firmaId, KeywordExtractor.Natura natura, String signatureHash,
+                               /** I token della firma: sono il «perché» leggibile della proposta (R6). */
+                               Set<String> token,
+                               /** R18: la firma ha guadagnato il diritto di contabilizzare da sola. */
+                               boolean promossa) {
         static KeywordMatch target(Firma f) {
-            return new KeywordMatch(false, f.cogeCodice(), f.bu(), f.fornitoreId(), f.id(), f.natura(), f.signatureHash());
+            return new KeywordMatch(false, f.cogeCodice(), f.bu(), f.fornitoreId(), f.id(), f.natura(),
+                    f.signatureHash(), Set.copyOf(f.token()), f.promossa());
         }
         static KeywordMatch inConflitto(String signatureHash) {
-            return new KeywordMatch(true, null, null, null, null, null, signatureHash);
+            return new KeywordMatch(true, null, null, null, null, null, signatureHash, Set.of(), false);
+        }
+
+        /** «GIANNI+ROSSI»: la firma detta all'operatore, non l'hash. */
+        public String firmaLeggibile() {
+            return token.stream().sorted().collect(java.util.stream.Collectors.joining("+"));
         }
     }
 
@@ -86,7 +113,8 @@ public class KeywordClassificazioneEngine {
         // Firme BOOK ATTIVE → indice invertito.
         Map<UUID, Firma> byId = new HashMap<>();
         for (Object[] r : (List<Object[]>) em.createNativeQuery(
-                "SELECT id, natura, tipo_movimento, sorgente, bu_id, coge_codice, fornitore_id, signature_hash " +
+                "SELECT id, natura, tipo_movimento, sorgente, bu_id, coge_codice, fornitore_id, signature_hash, " +
+                "usi_confermati, usi_corretti " +
                 "FROM keyword_firma WHERE stato = 'ATTIVA' AND azione = 'BOOK'").getResultList()) {
             UUID id = toUuid(r[0]);
             byId.put(id, new Firma(id,
@@ -95,7 +123,8 @@ public class KeywordClassificazioneEngine {
                     r[4] == null ? null : ((Number) r[4]).shortValue(),
                     (String) r[5],
                     r[6] == null ? null : toUuid(r[6]),
-                    (String) r[7], new HashSet<>()));
+                    (String) r[7], new HashSet<>(),
+                    ((Number) r[8]).intValue(), ((Number) r[9]).intValue()));
         }
         for (Object[] r : (List<Object[]>) em.createNativeQuery(
                 "SELECT t.firma_id, t.token FROM keyword_token t " +

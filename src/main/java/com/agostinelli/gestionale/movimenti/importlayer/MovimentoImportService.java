@@ -2,6 +2,7 @@ package com.agostinelli.gestionale.movimenti.importlayer;
 
 import com.agostinelli.gestionale.movimenti.dto.EtlImportResponse;
 import com.agostinelli.gestionale.movimenti.dto.EtlRowError;
+import com.agostinelli.gestionale.movimenti.dto.FaseImportDTO;
 import com.agostinelli.gestionale.movimenti.dto.MovimentoCreateRequest;
 import com.agostinelli.gestionale.movimenti.importlayer.model.MappingResult;
 import com.agostinelli.gestionale.movimenti.importlayer.model.RawMovimento;
@@ -50,111 +51,15 @@ public class MovimentoImportService {
     @Inject MovimentiRepository repo;
     @Inject MvRefreshService mvRefresh;
     @Inject MovimentoMappingEngineImpl mappingEngine;
-    @Inject ImportStrategyFactory strategyFactory;
+    @Inject com.agostinelli.gestionale.movimenti.importlayer.parser.BillyParser billyParser;
+    @Inject com.agostinelli.gestionale.movimenti.importlayer.parser.BancaBpmParser bpmParser;
+    @Inject com.agostinelli.gestionale.movimenti.importlayer.parser.BancaCaParser caParser;
+    @Inject MovimentoNormalizerImpl normalizer;
     @Inject RiconciliazioneService riconciliazione;
     @Inject ObjectMapper objectMapper;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService keywordLearning;
     @Inject MatchingDifferitiService matchingDifferitiService;
-
-    @CacheInvalidateAll(cacheName = "dashboard-kpi")
-    @CacheInvalidateAll(cacheName = "dashboard-andamento")
-    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
-    @CacheInvalidateAll(cacheName = "import-kpi")
-    @Transactional
-    public EtlImportResponse importFile(InputStream file, String filename, String fonteStr, UUID userId) {
-        ImportStrategy strategy = strategyFactory.get(fonteStr);
-        String dbFonte = strategy.fonte();
-
-        // Recepisce eventuali alias fornitore aggiunti da classificazioni precedenti.
-        mappingEngine.refreshLookups();
-
-        UUID importLogId = creaImportLog(dbFonte, filename, userId);
-
-        List<RawRow> rows = strategy.parserFor(fonteStr).parse(file);
-
-        int importati = 0, duplicati = 0, ambigui = 0, scartati = 0, parcheggiati = 0;
-        List<EtlRowError> errori = new ArrayList<>();
-        Set<String> rifEsistenti = repo.findRifimentiEsterniByFonte(dbFonte);
-
-        // Feature 2 — Matching differiti: indice in memoria (O(1) lookup per riga) dei movimenti
-        // DA_LIQUIDARE aperti, per riconoscere righe banca che corrispondono a un movimento già
-        // presente in gestionale (match su importo al centesimo + descrizione) ed evitare doppia
-        // registrazione. L'indice è piccolo (decine di righe) e si carica una sola volta.
-        var idxDifferiti = matchingDifferitiService.buildIndiceDifferitiAperti();
-        int matchingDifferiti = 0;
-
-        for (RawRow raw : rows) {
-            try {
-                RawMovimento norm = strategy.getNormalizer().normalize(raw);
-                MappingResult mapped = mappingEngine.map(norm);
-
-                // Gate A: esclusioni deterministiche tracciate in import_scartati
-                if (mapped.outcome().isSkip()) {
-                    salvaScartato(importLogId, raw, norm, mapped.motivoAmbiguita(), dbFonte);
-                    scartati++;
-                    continue;
-                }
-
-                // Gate B: voci evento parcheggiate (dedup cross-sorgente su chiave_aggancio)
-                if (mapped.outcome() == MappingResult.MappingOutcome.PARK_EVENTO) {
-                    if (salvaEventoParcheggiato(importLogId, raw, norm, mapped.park(), dbFonte)) {
-                        parcheggiati++;
-                    } else {
-                        duplicati++;
-                    }
-                    continue;
-                }
-
-                if (mapped.outcome() == MappingResult.MappingOutcome.AMBIGUOUS
-                        || mapped.outcome() == MappingResult.MappingOutcome.ERROR) {
-                    salvaAmbiguita(importLogId, raw, norm, mapped.motivoAmbiguita(), dbFonte);
-                    ambigui++;
-                    continue;
-                }
-
-                MovimentoCreateRequest req = mapped.request();
-                String rif = req.riferimentoEsterno();
-                if (rif != null && !rif.isBlank() && rifEsistenti.contains(rif)) {
-                    duplicati++;
-                    continue;
-                }
-
-                // Feature 2 — Matching differiti: se la riga banca combacia con un movimento
-                // DA_LIQUIDARE esistente (stesso importo al centesimo + stessa descrizione), NON
-                // viene persistita come nuovo movimento. Si salva in matching_differiti e l'utente
-                // risolve dallo smistamento (COLLEGA liquida l'esistente, IGNORA crea comunque).
-                UUID movEsistenteId = matchingDifferitiService.trovaMatch(
-                        idxDifferiti, req.importo(), req.descrizione());
-                if (movEsistenteId != null) {
-                    matchingDifferitiService.salvaMatch(importLogId, movEsistenteId, req,
-                            dbFonte, raw.riga());
-                    matchingDifferiti++;
-                    continue;
-                }
-
-                movimentiService.createMovimentoImport(req, userId, importLogId);
-                if (MovimentoNormalizerImpl.VERSAMENTO_CONTANTI.equals(norm.girosalto())) {
-                    creaContropartitaCassaVersamento(req, userId, importLogId);
-                    importati++;
-                }
-                if (rif != null && !rif.isBlank()) rifEsistenti.add(rif);
-                importati++;
-
-            } catch (Exception e) {
-                log.warnf("Import riga %d fallita: %s", raw.riga(), e.getMessage());
-                errori.add(new EtlRowError(raw.riga(), e.getMessage(), raw.campi()));
-            }
-        }
-
-        String statoFinale = statoFinale(errori.size(), ambigui, rows.size());
-        chiudiImportLog(importLogId, rows.size(), importati, errori.size(), duplicati, ambigui,
-                scartati, parcheggiati, 0, matchingDifferiti, statoFinale, errori);
-
-        if (importati > 0) mvRefresh.requestRefreshAfterCommit();
-
-        return new EtlImportResponse(importLogId, importati, duplicati, ambigui, scartati, parcheggiati,
-                0, errori, List.of(), matchingDifferiti);
-    }
+    @Inject ImportAuditLog audit;   // AUDIT-TEMP: traccia decisionale su file, vedi ImportAuditLog
 
     /**
      * Import ETL CONGIUNTO (REFACTOR-IMPORT-CONGIUNTO §FASE4): i 3 file (Billy + BPM + CA)
@@ -186,24 +91,58 @@ public class MovimentoImportService {
         UUID importLogId = creaImportLog("IMPORT_CONGIUNTO", fileLabel(fnBilly, fnBpm, fnCa), userId);
 
         // ── [1] PARSE + NORMALIZE (invariato) ──
-        ImportStrategy billyStrat = strategyFactory.get("IMPORT_BILLY");
-        ImportStrategy bancaStrat = strategyFactory.get("IMPORT_BANCA_BPM");
-        MovimentoNormalizer norm = bancaStrat.getNormalizer();
+        // Parser scelti a compile time: le 3 fonti sono fisse e note qui. C'era una
+        // ImportStrategy + Factory + @All risolta con stringhe letterali ("IMPORT_BILLY", …):
+        // astrazione senza guadagno, rimossa il 2026-08-11 (audit §6.2/5, intervento §8 #10).
+        // Il normalizzatore è lo stesso oggetto per tutte e 3 le sorgenti (era già così).
 
         List<RawMovimento> normBilly = new ArrayList<>();
         List<RawMovimento> normBpm = new ArrayList<>();
         List<RawMovimento> normCa = new ArrayList<>();
         List<EtlRowError> errori = new ArrayList<>();
 
-        List<RawRow> billyRows = billyStrat.parserFor("IMPORT_BILLY").parse(billy);
-        List<RawRow> bpmRows = bancaStrat.parserFor("IMPORT_BANCA_BPM").parse(bpm);
-        List<RawRow> caRows = bancaStrat.parserFor("IMPORT_BANCA_CA").parse(ca);
-        normalizeAll(billyStrat.getNormalizer(), billyRows, normBilly, errori);
-        normalizeAll(norm, bpmRows, normBpm, errori);
-        normalizeAll(norm, caRows, normCa, errori);
+        // I passi che l'utente vede a schermo (FaseImportDTO): cronometrati QUI, nei punti che li
+        // eseguono davvero. Se un giorno una fase sparisce dal codice, sparisce anche dalla
+        // schermata — che è l'unico modo perché quello che si mostra resti vero.
+        List<FaseImportDTO> fasi = new ArrayList<>(4);
+        long tFase = System.nanoTime();
+
+        List<RawRow> billyRows = billyParser.parse(billy);
+        List<RawRow> bpmRows = bpmParser.parse(bpm);
+        List<RawRow> caRows = caParser.parse(ca);
+        normalizeAll(normalizer, billyRows, normBilly, errori);
+        normalizeAll(normalizer, bpmRows, normBpm, errori);
+        normalizeAll(normalizer, caRows, normCa, errori);
+        tFase = fase(fasi, "Lettura dei tre file", (billyRows.size() + bpmRows.size() + caRows.size())
+                + " righe lette · Billy " + billyRows.size() + " · BPM " + bpmRows.size()
+                + " · CA " + caRows.size(), tFase);
+
+        // ── UNIVERSO DEL CONTATORE (SPEC import-v2 §5, R7) ──
+        // Misurato QUI, sulle righe banca normalizzate, PRIMA di qualunque mapping: è il termine
+        // sinistro dell'invariante. Derivarlo dalla somma dei destini lo renderebbe vero per
+        // costruzione — una guardia vacua che non può fallire. Billy resta fuori dall'universo.
+        long bancaEntrate = 0, bancaUscite = 0;
+        for (List<RawMovimento> banca : List.of(normBpm, normCa)) {
+            for (RawMovimento r : banca) {
+                long c = r.importo() == null ? 0 : ContatoreImportService.cents(r.importo());
+                if ("ENTRATA".equals(r.tipo())) bancaEntrate += c; else bancaUscite += c;
+            }
+        }
+        int righeBanca = normBpm.size() + normCa.size();
+
+        audit.inizia(importLogId, fnBilly, fnBpm, fnCa);
+        audit.fase("PARSE", "righe lette: Billy " + billyRows.size() + " · BPM " + bpmRows.size()
+                + " · CA " + caRows.size() + " (normalizzate: " + normBilly.size() + "/"
+                + normBpm.size() + "/" + normCa.size() + ", errori " + errori.size() + ")");
 
         // ── [2] RICONCILIAZIONE A PERIODO (funzione pura, Billy = verità) ──
         DatasetRiconciliato ds = riconciliazione.riconcilia(normBilly, normBpm, normCa);
+        audit.fase("RICONCILIAZIONE POS a periodo (Billy = verità)",
+                "da mappare " + ds.daMappare().size() + " · eventi attesi " + ds.eventiAttesi().size()
+                + " · in attesa accredito " + ds.inAttesaAccredito().size());
+        tFase = fase(fasi, "Riconciliazione degli incassi POS",
+                ds.stat().righeBancaPos() + " accrediti POS confrontati con gli scontrini Billy · "
+                + ds.inAttesaAccredito().size() + " in attesa di accredito", tFase);
 
         // ── [3]+[4] MAP (gate riusato) + PERSIST ──
         int importati = 0, duplicati = 0, ambigui = 0, scartati = 0, parcheggiati = 0, ricorrenti = 0;
@@ -222,37 +161,67 @@ public class MovimentoImportService {
             RawMovimento n = a.banca();
             RawRow raw = n.rawOriginale();
             try {
+                audit.iniziaRiga(n.fonte(), raw.riga(), raw.campi());
+                audit.passo("[NORM]", "data=" + n.dataMovimento() + " · tipo=" + n.tipo()
+                        + " · importo=" + n.importo() + " · conto=" + n.contoBancarioId()
+                        + " · metodo=" + n.metodoPagamentoCodice()
+                        + " · girosalto=" + (n.girosalto() == null ? "no" : n.girosalto())
+                        + " · rif.esterno=" + n.riferimentoEsterno());
+                audit.passo("[NORM]", "descrizione normalizzata: \"" + n.descrizione() + "\"");
+
                 MappingResult mapped = mappingEngine.map(a);
 
                 if (mapped.outcome() == MappingResult.MappingOutcome.SKIP_RICORRENTE) {
                     // Spese ricorrenti/finanziamenti: parcheggiate (NON contabilizzate, gestite a mano).
                     salvaRicorrenteParcheggiata(importLogId, raw, n, n.fonte());
                     ricorrenti++;
+                    audit.esito("PARCHEGGIATA in ricorrenti_da_riconciliare",
+                            "nessun movimento creato: la rata la decide l'operatore dallo smistamento");
                     continue;
                 }
                 if (mapped.outcome().isSkip()) {
                     salvaScartato(importLogId, raw, n, mapped.motivoAmbiguita(), n.fonte());
                     scartati++;
+                    audit.esito("SCARTATA (" + mapped.outcome() + ")",
+                            "traccia: " + mapped.trace());
                     continue;
                 }
                 if (mapped.outcome() == MappingResult.MappingOutcome.PARK_EVENTO) {
                     boolean ins = salvaEventoParcheggiato(importLogId, raw, n, mapped.park(), n.fonte());
-                    if (ins) parcheggiati++; else duplicati++;
+                    if (ins) {
+                        parcheggiati++;
+                    } else {
+                        // R8: la duplicata lascia una traccia. Prima spariva incrementando un contatore.
+                        salvaScartato(importLogId, raw, n, "DUPLICATA", n.fonte(), "DUPLICATA");
+                        duplicati++;
+                    }
+                    audit.esito(ins ? "PARCHEGGIATA in eventi_da_riconciliare"
+                                    : "SCARTATA come duplicato di un incasso-evento già in coda",
+                            ins ? "l'incasso va attribuito a un evento dallo smistamento" : "dedup su chiave_aggancio");
                     continue;
                 }
                 if (mapped.outcome() == MappingResult.MappingOutcome.AMBIGUOUS
                         || mapped.outcome() == MappingResult.MappingOutcome.ERROR) {
                     salvaAmbiguita(importLogId, raw, n, mapped.motivoAmbiguita(), n.fonte());
                     ambigui++;
+                    audit.esito("AMBIGUA → import_ambiguita", mapped.motivoAmbiguita());
                     continue;
                 }
 
                 MovimentoCreateRequest req = mapped.request();
                 String rif = req.riferimentoEsterno();
                 if (rif != null && !rif.isBlank() && rifEsistenti.contains(rif)) {
+                    // R8: traccia visibile. Fino al 12/08/2026 la riga spariva qui dentro senza
+                    // lasciare nulla — denaro bancario vero che nessuna schermata poteva mostrare.
+                    salvaScartato(importLogId, raw, n, "DUPLICATA", n.fonte(), "DUPLICATA");
                     duplicati++;
+                    audit.passo("[8] DEDUP", "riferimento esterno «" + rif + "» già importato");
+                    audit.esito("SCARTATA come duplicato", "stessa riga già presente da un import precedente");
                     continue;
                 }
+                audit.passo("[8] DEDUP", rif == null || rif.isBlank()
+                        ? "nessun riferimento esterno da confrontare"
+                        : "riferimento esterno «" + rif + "» mai visto");
 
                 // Feature 2 — Matching differiti: riga banca che combacia con un movimento
                 // DA_LIQUIDARE già presente in gestionale (importo al centesimo + descrizione
@@ -264,12 +233,17 @@ public class MovimentoImportService {
                     matchingDifferitiService.salvaMatch(importLogId, movEsistenteId, req,
                             n.fonte(), raw.riga());
                     matchingDifferiti++;
+                    audit.passo("[8] DIFFERITI", "combacia con un movimento DA_LIQUIDARE già a libro "
+                            + "(stesso importo e stessa descrizione)");
+                    audit.esito("MESSA IN «Già a libro»",
+                            "non si crea un doppione: l'operatore collega la riga al movimento esistente");
                     continue;
                 }
+                audit.passo("[8] DIFFERITI", "nessun movimento DA_LIQUIDARE corrispondente");
 
                 var creato = movimentiService.createMovimentoImport(req, userId, importLogId);
-                if (MovimentoNormalizerImpl.VERSAMENTO_CONTANTI.equals(n.girosalto())) {
-                    creaContropartitaCassaVersamento(req, userId, importLogId);
+                if (MovimentoNormalizerImpl.VERSAMENTO_CONTANTI.equals(n.girosalto())
+                        && creaContropartitaCassaVersamento(req, userId, importLogId)) {
                     importati++;
                 }
                 // Conflitto keyword di MATCH (§4.6): la riga è booked sul transitorio; registra il
@@ -279,12 +253,36 @@ public class MovimentoImportService {
                 }
                 if (rif != null && !rif.isBlank()) rifEsistenti.add(rif);
                 importati++;
+                audit.esito("CONTABILIZZATA (movimento " + creato.id() + ")", mapped.trace());
 
             } catch (Exception e) {
                 log.warnf("Import congiunto riga %d (%s) fallita: %s", raw.riga(), n.fonte(), e.getMessage());
                 errori.add(new EtlRowError(raw.riga(), e.getMessage(), raw.campi()));
+                audit.esito("ERRORE", e.getMessage());
             }
         }
+
+        // ── CODA TESTA — righe POS bancarie con DEL dell'anno precedente ──
+        // Restano NON contabilizzate (il criterio è l'anno solare del DEL), ma non spariscono più:
+        // ognuna lascia una riga in import_scartati, dove l'operatore la vede e decide. Fino al
+        // 2026-08-11 l'unica traccia era una nota dentro quadratura_periodo.note, che nessun
+        // contatore obbliga ad aprire: 230,00 € di accredito bancario vero fuori dai conti e da
+        // ogni coda (audit-catena-import-2026-08-11.md §2, FINDING F1).
+        for (RawMovimento t : ds.codaTesta()) {
+            RawRow rawTesta = t.rawOriginale();
+            audit.iniziaRiga(t.fonte(), rawTesta.riga(), rawTesta.campi());
+            audit.passo("[2] RICONCILIAZIONE", "riga POS con DEL " + t.dataIncassoPos()
+                    + ", cioè dell'anno precedente al periodo importato");
+            salvaScartato(importLogId, rawTesta, t, "SKIP_CODA_TESTA", t.fonte());
+            scartati++;
+            audit.esito("SCARTATA (SKIP_CODA_TESTA) → import_scartati",
+                    "accredito di un incasso dell'anno prima: non contabilizzato qui, ma tracciato "
+                    + "perché è denaro vero — va guardato, non perso");
+        }
+
+        tFase = fase(fasi, "Classificazione e scrittura",
+                importati + " righe messe a libro · " + (parcheggiati + ricorrenti + matchingDifferiti)
+                + " in coda per te · " + (scartati + ambigui + duplicati) + " fuori dai conti", tFase);
 
         // AVVISI non bloccanti (≠ errori, ≠ movimenti): (1) scontrini agriturismo pagati a POS →
         // incasso-evento atteso (il ricavo arriva dal bonifico parcheggiato); (2) coda fondo →
@@ -303,26 +301,53 @@ public class MovimentoImportService {
         }
         log.infof("Import congiunto %s (anno %d): righePOS=%d, testaEsclusa=%d, ricaviPOS=%d "
                         + "(BPM=%d,CA=%d), contanti=%d, eventiAttesi=%d, inAttesa=%d, bancaNonPOS=%d | "
-                        + "Σ_BPM=%s Σ_CA=%s residuoCore=%s",
+                        + "Σ_BPM=%s Σ_CA=%s",
                 importLogId, ds.quadratura().anno(), ds.stat().righeBancaPos(), ds.stat().testaEsclusa(),
                 ds.stat().ricaviPos(), ds.stat().assegnatiBpm(), ds.stat().assegnatiCa(), ds.stat().contanti(),
                 ds.stat().eventiAttesi(), ds.stat().inAttesaAccredito(), ds.stat().bancaNonPos(),
-                ds.quadratura().sigmaBpm(), ds.quadratura().sigmaCa(), ds.quadratura().residuoCore());
+                ds.quadratura().sigmaBpm(), ds.quadratura().sigmaCa());
 
         salvaQuadratura(importLogId, ds.quadratura(), ds.inAttesaAccredito());
 
         int totali = billyRows.size() + bpmRows.size() + caRows.size();
-        String statoFinale = statoFinale(errori.size(), ambigui, totali);
+        String statoFinale = statoFinale(errori.size(), ambigui, scartati, totali);
         // import_log: errori reali (qui 0); gli avvisi restano in errori_dettaglio per tracciabilità.
         List<EtlRowError> diagnostica = new ArrayList<>(errori);
         diagnostica.addAll(avvisi);
         chiudiImportLog(importLogId, totali, importati, errori.size(), duplicati, ambigui,
-                scartati, parcheggiati, ricorrenti, matchingDifferiti, statoFinale, diagnostica);
+                scartati, parcheggiati, ricorrenti, matchingDifferiti, statoFinale, diagnostica,
+                righeBanca, ContatoreImportService.euro(bancaEntrate), ContatoreImportService.euro(bancaUscite));
+
+        audit.chiudi("righe totali " + totali + " · contabilizzate " + importati
+                + " · parcheggiate eventi " + parcheggiati + " · parcheggiate ricorrenti " + ricorrenti
+                + " · ambigue " + ambigui + " · scartate " + scartati + " · duplicate " + duplicati
+                + " · già a libro " + matchingDifferiti + " · errori " + errori.size()
+                + " → stato " + statoFinale);
 
         if (importati > 0) mvRefresh.requestRefreshAfterCommit();
 
+        fase(fasi, "Quadratura dell'estratto conto",
+                righeBanca + " righe bancarie · entrate " + euroIt(bancaEntrate)
+                + " · uscite " + euroIt(bancaUscite), tFase);
+
         return new EtlImportResponse(importLogId, importati, duplicati, ambigui, scartati, parcheggiati,
-                ricorrenti, errori, avvisi);
+                ricorrenti, errori, avvisi, matchingDifferiti, List.copyOf(fasi));
+    }
+
+    /**
+     * Il numero è il messaggio (PRODUCT.md §5): questa cifra la legge il titolare accanto
+     * all'estratto conto, quindi si scrive come la scrive la banca — 42.359,14 €, non 42359.14.
+     */
+    private static String euroIt(long cents) {
+        return String.format(java.util.Locale.ITALY, "%,.2f €",
+                ContatoreImportService.euro(cents));
+    }
+
+    /** Chiude una fase col tempo davvero speso e restituisce il nuovo istante di partenza. */
+    private static long fase(List<FaseImportDTO> fasi, String nome, String dettaglio, long da) {
+        long ora = System.nanoTime();
+        fasi.add(new FaseImportDTO(nome, dettaglio, (int) ((ora - da) / 1_000_000L)));
+        return ora;
     }
 
     private void normalizeAll(MovimentoNormalizer norm, List<RawRow> rows,
@@ -345,9 +370,13 @@ public class MovimentoImportService {
         return (s == null || s.isBlank()) ? "?" : s;
     }
 
-    private String statoFinale(int errori, int ambigui, int totali) {
+    /**
+     * Regola §7.4 n.3: se restano righe fuori dai conti, l'import NON è «completato» — c'è denaro
+     * bancario in attesa di una decisione, e un'etichetta verde lo farebbe dimenticare.
+     */
+    private String statoFinale(int errori, int ambigui, int scartati, int totali) {
         if (totali > 0 && errori > totali * 0.5) return "ERRORE";
-        if (ambigui > 0 || errori > 0) return "COMPLETATO_CON_AMBIGUITA";
+        if (ambigui > 0 || errori > 0 || scartati > 0) return "COMPLETATO_CON_AMBIGUITA";
         return "COMPLETATO";
     }
 
@@ -442,9 +471,9 @@ public class MovimentoImportService {
         em.createNativeQuery(
                         "INSERT INTO quadratura_periodo (id, import_log_id, anno, billy_elettronico_non_agri, " +
                         "billy_contabilizzato, pos_banca_totale, pos_banca_core, sigma_bpm, sigma_ca, " +
-                        "assegnato_bpm, assegnato_ca, coda_testa, coda_fondo, residuo_core, max_del_banca, " +
+                        "assegnato_bpm, assegnato_ca, coda_testa, coda_fondo, max_del_banca, " +
                         "note, in_attesa) VALUES (:id, :logId, :anno, :bena, :bcon, :ptot, :pcore, :sbpm, :sca, " +
-                        ":abpm, :aca, :testa, :fondo, :res, :maxdel, CAST(:note AS jsonb), CAST(:attesa AS jsonb))")
+                        ":abpm, :aca, :testa, :fondo, :maxdel, CAST(:note AS jsonb), CAST(:attesa AS jsonb))")
                 .setParameter("id", UUID.randomUUID())
                 .setParameter("logId", importLogId)
                 .setParameter("anno", q.anno())
@@ -458,7 +487,6 @@ public class MovimentoImportService {
                 .setParameter("aca", q.assegnatoCa())
                 .setParameter("testa", q.codaTesta())
                 .setParameter("fondo", q.codaFondo())
-                .setParameter("res", q.residuoCore())
                 .setParameter("maxdel", q.maxDelBanca())
                 .setParameter("note", toJson(q.note()))
                 .setParameter("attesa", toJson(attesa))
@@ -468,13 +496,18 @@ public class MovimentoImportService {
     private void chiudiImportLog(UUID id, int totali, int importate, int errore, int duplicate,
                                  int ambigue, int scartate, int parcheggiate, int ricorrenti,
                                  int matchingDifferiti,
-                                 String stato, List<EtlRowError> errori) {
+                                 String stato, List<EtlRowError> errori,
+                                 int righeBanca, BigDecimal bancaEntrate, BigDecimal bancaUscite) {
         em.createNativeQuery(
                         "UPDATE import_log SET righe_totali = :tot, righe_importate = :imp, " +
                         "righe_errore = :err, righe_duplicate = :dup, righe_ambigue = :amb, " +
                         "righe_scartate = :sca, righe_parcheggiate = :par, righe_ricorrenti = :ric, " +
                         "righe_matching_differiti = :mat, " +
+                        "righe_banca = :rb, banca_entrate = :be, banca_uscite = :bu, " +
                         "stato = :stato, errori_dettaglio = CAST(:json AS jsonb) WHERE id = :id")
+                .setParameter("rb", righeBanca)
+                .setParameter("be", bancaEntrate)
+                .setParameter("bu", bancaUscite)
                 .setParameter("tot", totali)
                 .setParameter("imp", importate)
                 .setParameter("err", errore)
@@ -634,11 +667,53 @@ public class MovimentoImportService {
      * conto corrente, qui esce lo stesso importo dalla Cassa contanti (stesso CoGe 10.03.003,
      * liquidità totale invariata). Il rif ":CASSA" è solo tracciabilità: al re-import la riga
      * banca viene deduplicata prima, quindi la contropartita non si rigenera.
+     *
+     * <p><b>Guardia anti-doppione</b> (SPEC modulo-contanti R8): dal modulo Contanti il titolare
+     * può aver già registrato a mano il deposito, e il dedup per {@code riferimento_esterno} non
+     * copre il caso — la riga manuale non ha il rif della banca. Se una gamba cassa manuale con lo
+     * stesso CoGe e lo stesso importo esiste già a ±5 giorni, la contropartita <b>non</b> si crea:
+     * altrimenti il cassetto si scaricherebbe due volte.
+     *
+     * @return true se la contropartita è stata creata, false se era già a libro a mano.
      */
-    private void creaContropartitaCassaVersamento(MovimentoCreateRequest bancario, UUID userId, UUID importLogId) {
+    private boolean creaContropartitaCassaVersamento(MovimentoCreateRequest bancario, UUID userId, UUID importLogId) {
         Short contoCassa = ((Number) em.createNativeQuery(
                 "SELECT id FROM conti_bancari WHERE tipo = 'CASSA' AND is_active = true ORDER BY id LIMIT 1")
                 .getSingleResult()).shortValue();
+
+        // Il CoGe della gamba banca è 10.03.003 per costruzione (MovimentoMappingEngineImpl
+        // .classifyGirosalto): la contropartita userebbe lo stesso, quindi è anche il discriminante.
+        LocalDate dataBanca = bancario.dataFinanziaria() != null
+                ? bancario.dataFinanziaria() : bancario.dataMovimento();
+        // ponytail: nessun partition pruning su `movimenti` (partizionata per anno su data_movimento,
+        // il filtro è su COALESCE). N è dell'ordine delle decine — si aggiunge
+        // AND m.data_movimento BETWEEN data-40 AND data+40 solo se un profilo lo chiede.
+        List<?> giaAMano = em.createNativeQuery("""
+                SELECT COALESCE(m.data_finanziaria, m.data_movimento)
+                FROM movimenti m
+                WHERE m.conto_bancario_id = :conto
+                  AND m.stato <> 'ANNULLATO'
+                  AND m.fonte = 'MANUALE'
+                  AND m.conto_coge_id = :coge
+                  AND m.importo_lordo = :importo
+                  AND COALESCE(m.data_finanziaria, m.data_movimento) BETWEEN :da AND :a
+                LIMIT 1
+                """)
+                .setParameter("conto", contoCassa)
+                .setParameter("coge", bancario.contoCoge())
+                .setParameter("importo", bancario.importo())
+                .setParameter("da", dataBanca.minusDays(5))
+                .setParameter("a", dataBanca.plusDays(5))
+                .getResultList();
+        if (!giaAMano.isEmpty()) {
+            Object d = giaAMano.get(0);
+            LocalDate quando = d instanceof java.sql.Date sd ? sd.toLocalDate() : (LocalDate) d;
+            audit.passo("[CASSA]", "contropartita già registrata a mano il "
+                    + quando.format(java.time.format.DateTimeFormatter.ofPattern("dd/MM"))
+                    + " — non duplicata");
+            return false;
+        }
+
         Integer metodoContanti = ((Number) em.createNativeQuery(
                 "SELECT id FROM metodi_pagamento WHERE codice = 'CONTANTI'")
                 .getSingleResult()).intValue();
@@ -653,13 +728,25 @@ public class MovimentoImportService {
                 bancario.riferimentoEsterno() == null ? null : bancario.riferimentoEsterno() + ":CASSA",
                 bancario.fonte(), null);
         movimentiService.createMovimentoImport(mirror, userId, importLogId);
+        return true;
     }
 
     private void salvaScartato(UUID importLogId, RawRow raw, RawMovimento norm, String motivo, String fonte) {
+        salvaScartato(importLogId, raw, norm, motivo, fonte, "DA_VEDERE");
+    }
+
+    /**
+     * @param stato DA_VEDERE = coda che l'operatore deve lavorare; DUPLICATA = traccia di una riga
+     *              già importata (R8), fuori dalla coda perché non c'è nulla da decidere.
+     */
+    private void salvaScartato(UUID importLogId, RawRow raw, RawMovimento norm, String motivo,
+                               String fonte, String stato) {
         em.createNativeQuery(
                         "INSERT INTO import_scartati (id, import_log_id, riga_numero, fonte, motivo, " +
-                        "chiave_aggancio, data_movimento, importo, causale, raw_data) " +
-                        "VALUES (:id, :logId, :riga, :fonte, :motivo, :chiave, :data, :importo, :causale, CAST(:raw AS jsonb))")
+                        "chiave_aggancio, data_movimento, importo, causale, raw_data, stato) " +
+                        "VALUES (:id, :logId, :riga, :fonte, :motivo, :chiave, :data, :importo, :causale, " +
+                        "CAST(:raw AS jsonb), :stato)")
+                .setParameter("stato", stato)
                 .setParameter("id", UUID.randomUUID())
                 .setParameter("logId", importLogId)
                 .setParameter("riga", raw.riga())

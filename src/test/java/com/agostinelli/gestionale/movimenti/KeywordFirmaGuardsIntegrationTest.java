@@ -71,4 +71,17 @@ class KeywordFirmaGuardsIntegrationTest {
         given().when().delete("/api/movimenti/keyword/" + NIL)
             .then().statusCode(404).body("code", equalTo("FIRMA_NON_TROVATA"));
     }
+
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void createFirma_versoRicaviEvento_409() {
+        // Invariante DACLASS (V29, audit §6.2/2 e §7.6): nessuna firma può catalogare su 30.02.*,
+        // altrimenti nasce un ricavo-evento senza evento collegato — 6 casi / 3.425,60 € in 6 mesi.
+        given().contentType(ContentType.JSON)
+            .body("""
+                {"natura":"IDENTITA","azione":"BOOK","cogeCodice":"30.02.002","buId":1,"token":["ZZKW9"]}
+                """)
+            .when().post("/api/movimenti/keyword")
+            .then().statusCode(409).body("code", equalTo("COGE_RISERVATO_EVENTI"));
+    }
 }

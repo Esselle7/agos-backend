@@ -20,6 +20,7 @@ public record RecurringExpensePlanDetailDTO(
     LocalDate   dataPrimaRata,
     String      stato,
     String      note,
+    String      riferimentoEstrattoConto,
     BigDecimal  totalePagato,
     BigDecimal  totaleResiduo,
     BigDecimal  totalePiano,

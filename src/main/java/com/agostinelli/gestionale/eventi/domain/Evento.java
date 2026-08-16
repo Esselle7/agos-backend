@@ -73,6 +73,13 @@ public class Evento {
     @Column(name = "business_unit_id")
     public Short businessUnitId;
 
+    /**
+     * V25 — contenitore temporaneo di un incasso non ancora attribuito a un evento reale.
+     * Escluso da calendario e lista eventi, incluso nel bilancio eventi.
+     */
+    @Column(name = "is_segnaposto", nullable = false)
+    public boolean isSegnaposto;
+
     @Column(name = "contatto_nome", length = 255)
     public String contattoNome;
 

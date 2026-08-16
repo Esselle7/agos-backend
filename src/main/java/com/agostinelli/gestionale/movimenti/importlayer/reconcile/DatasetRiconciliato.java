@@ -17,6 +17,9 @@ import java.util.List;
  *                          ora, segnalate; verranno bookate al prossimo import (dedup su DCW).
  * @param eventiAttesi      scontrini Billy elettronici agriturismo → incasso-evento atteso
  *                          (il ricavo arriva dal bonifico parcheggiato): nessun ricavo spaccio.
+ * @param codaTesta         righe POS bancarie con DEL dell'anno precedente: NON contabilizzate,
+ *                          da tracciare in import_scartati (motivo SKIP_CODA_TESTA). Sono accrediti
+ *                          bancari veri — prima del 2026-08-11 uscivano dalla pipeline senza traccia.
  * @param quadratura        pannello di quadratura di periodo (informativo).
  * @param stat              contatori per il log/diagnostica.
  */
@@ -25,6 +28,7 @@ public record DatasetRiconciliato(
         List<RawMovimento> billyContabilizzati,
         List<RawMovimento> inAttesaAccredito,
         List<RawMovimento> eventiAttesi,
+        List<RawMovimento> codaTesta,
         QuadraturaPeriodo quadratura,
         Statistiche stat
 ) {

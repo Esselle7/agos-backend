@@ -20,3 +20,6 @@ src/main/resources/application-local.properties
 
 # Log per-import ETL (un .txt per import)
 logs/
+
+# AUDIT-TEMP: traccia decisionale dell'import (file usa-e-getta)
+audit-import/

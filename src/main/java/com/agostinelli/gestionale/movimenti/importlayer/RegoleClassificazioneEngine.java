@@ -25,8 +25,19 @@ public class RegoleClassificazioneEngine {
     private volatile boolean loaded = false;
     private final List<Regola> regole = new ArrayList<>();
 
-    /** Esito di un match di regola (i campi MAP sono null per le azioni SKIP/PARK). */
-    public record Match(String azione, String cogeCodice, Short buId, String metodoCodice) {}
+    /**
+     * Esito di un match di regola (i campi MAP sono null per le azioni SKIP/PARK).
+     * {@code matchType} serve alla confidenza (SPEC import-v2 R3): EQUALS/IN_LIST sono un campo
+     * strutturale ⇒ CERTA; CONTAINS/REGEX/STARTS_WITH sono un'euristica sul testo ⇒ PROPOSTA.
+     */
+    public record Match(String azione, String cogeCodice, Short buId, String metodoCodice,
+                        String matchType, String pattern) {
+
+        /** true se il match è su un campo esatto, non su una sottostringa. */
+        public boolean strutturale() {
+            return "EQUALS".equals(matchType) || "IN_LIST".equals(matchType);
+        }
+    }
 
     private record Regola(String sorgente, String tipoMovimento, String campo, String matchType,
                           String pattern, String[] patternList, String azione,
@@ -68,7 +79,8 @@ public class RegoleClassificazioneEngine {
             String value = fieldValue(n, r.campo());
             if (value == null) continue;
             if (matches(r, value)) {
-                return new Match(r.azione(), r.cogeCodice(), r.buId(), r.metodoCodice());
+                return new Match(r.azione(), r.cogeCodice(), r.buId(), r.metodoCodice(),
+                        r.matchType(), r.pattern());
             }
         }
         return null;

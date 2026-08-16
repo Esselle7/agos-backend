@@ -1,5 +1,6 @@
 package com.agostinelli.gestionale.eventi;
 
+import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.security.TestSecurity;
 import io.restassured.http.ContentType;
@@ -627,10 +628,15 @@ class EventiIntegrationTest {
                 .body("code", equalTo("EVENTO_SALDATO"));
     }
 
+    /**
+     * I3 (rivisto 2026-08-08): una caparra pagata in due tranche è legittima — il vincolo
+     * "max 1 CAPARRA/ACCONTO/SALDO per evento" è stato rimosso. Il test difende sia
+     * l'accettazione sia la somma: due CAPARRA devono sommarsi, non sovrascriversi.
+     */
     @Test
     @Order(77)
     @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
-    void doppiaCaparra_409() {
+    void doppiaCaparra_ammessa_eSiSomma() {
         String id = creaEventoConfermato("Evento Doppia Caparra", "2000");
         given().contentType(ContentType.JSON)
                 .body(buildPagamentoRequest("CAPARRA", "500.00"))
@@ -641,8 +647,321 @@ class EventiIntegrationTest {
             .body(buildPagamentoRequest("CAPARRA", "300.00"))
             .when().post("/api/eventi/" + id + "/pagamenti")
             .then()
+                .statusCode(201)
+                .body("tipo", equalTo("CAPARRA"));
+
+        given()
+            .when().get("/api/eventi/" + id)
+            .then()
+                .body("importoIncassato", equalTo(800.0f))
+                .body("importoResiduo",   equalTo(1200.0f))
+                .body("stato",            equalTo("CONFERMATO"));
+
+        // Terza tranche che chiude il residuo: l'auto-transizione a SALDATO resta viva
+        // anche con più pagamenti dello stesso tipo.
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("CAPARRA", "1200.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        given()
+            .when().get("/api/eventi/" + id)
+            .then()
+                .body("importoIncassato", equalTo(2000.0f))
+                .body("stato",            equalTo("SALDATO"));
+    }
+
+    /**
+     * L'unicità è caduta, il tetto sul residuo no: la quarta tranche che sfonda il
+     * preventivato deve continuare a essere rifiutata (guardia percorso-soldi).
+     */
+    @Test
+    @Order(78)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void tranceMultipleOltreIlResiduo_409() {
+        String id = creaEventoConfermato("Evento Tranche Oltre Residuo", "1000");
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("ACCONTO", "600.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("ACCONTO", "500.00"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
                 .statusCode(409)
-                .body("code", equalTo("PAGAMENTO_GIA_PRESENTE"));
+                .body("code", equalTo("IMPORTO_SUPERA_RESIDUO"));
+    }
+
+    /**
+     * Doppione vero: stesso evento, stesso tipo, stesso importo, stessa data, stesso conto.
+     * È il caso reale di «Greg» (14/08/2026) — lo stesso bonifico da 1.500,00 registrato prima
+     * a mano dalla scheda evento e poi di nuovo dal wizard incassi-evento, che aveva portato
+     * l'incassato a 3.000,00 con un solo bonifico realmente arrivato.
+     *
+     * <p>Da distinguere da {@link #doppiaCaparra_ammessa_eSiSomma}: due tranche vere differiscono
+     * almeno per importo o per data, e restano ammesse (ADR 003).
+     */
+    @Test
+    @Order(79)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void stessoPagamentoDueVolte_409_eNonAlteraLIncassato() {
+        String id = creaEventoConfermato("Evento Doppione Identico", "5000");
+
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("ACCONTO", "1500.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        // Il secondo, identico in tutto, viene rifiutato: il messaggio NOMINA il gemello.
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("ACCONTO", "1500.00"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(409)
+                .body("code",    equalTo("PAGAMENTO_DUPLICATO"))
+                // Il messaggio NOMINA il gemello, con importi e date leggibili dal titolare.
+                .body("message", containsString("acconto"))
+                .body("message", containsString("1.500,00 €"))
+                .body("message", containsString("01/08/2026"));
+
+        // E soprattutto: il rifiuto non ha lasciato metà scrittura dietro di sé.
+        given()
+            .when().get("/api/eventi/" + id)
+            .then()
+                .body("importoIncassato", equalTo(1500.0f))
+                .body("importoResiduo",   equalTo(3500.0f))
+                .body("pagamenti.size()", equalTo(1));
+
+        // Stesso tipo ma importo diverso: è una seconda tranche vera, resta ammessa (ADR 003).
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("ACCONTO", "200.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+    }
+
+    /**
+     * A1 — su un evento SENZA capienza scattano entrambe le guardie, e quella che parla per prima
+     * detta la diagnosi. Deve parlare l'anti-doppione: IMPORTO_SUPERA_RESIDUO manderebbe a
+     * correggere il preventivo, cioè a fare spazio a un incasso che non esiste.
+     *
+     * <p>Caso reale del 14/08/2026: «18esimo Erica balzaretti», 550 € su 1.050 preventivati e già
+     * incassati per 550 — rifiutato con la diagnosi sbagliata. Falsificabile: rimettendo la guardia
+     * sotto il tetto sul residuo questo test torna rosso (409 IMPORTO_SUPERA_RESIDUO).
+     */
+    @Test
+    @Order(160)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void doppioneSenzaCapienza_diagnosiDuplicato_nonResiduo() {
+        String id = creaEventoConfermato("Evento Doppione Senza Capienza", "1050");
+
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("ACCONTO", "550.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        // Residuo ora 500,00: il doppione da 550,00 lo sfonda. Deve vincere PAGAMENTO_DUPLICATO.
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("ACCONTO", "550.00"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("PAGAMENTO_DUPLICATO"));
+
+        given().when().get("/api/eventi/" + id)
+                .then().body("importoIncassato", equalTo(550.0f))
+                       .body("pagamenti.size()", equalTo(1));
+    }
+
+    /**
+     * A2 — il messaggio del tetto sul residuo non manda più a correggere il preventivo: la prima
+     * domanda è sul doppione, la seconda via è l'extra a consuntivo (che lascia intatto il
+     * pattuito). Seguire il vecchio suggerimento su un doppione produceva preventivo falso
+     * <b>e</b> ricavo fantasma.
+     */
+    @Test
+    @Order(161)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void importoSuperaResiduo_messaggioNonMandaACorreggereIlPreventivo() {
+        String id = creaEventoConfermato("Evento Messaggio Residuo", "500");
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("ACCONTO", "999.00"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(409)
+                .body("code",    equalTo("IMPORTO_SUPERA_RESIDUO"))
+                .body("message", startsWith("È lo stesso pagamento già registrato?"))
+                .body("message", containsString("extra a consuntivo"))
+                .body("message", not(containsStringIgnoringCase("correggi il preventivo")));
+    }
+
+    /**
+     * A4 — la controparte è il sesto campo del confronto: due bonifici di persone diverse con
+     * stesso importo, stesso giorno e stesso evento sono due incassi veri, non un doppione.
+     * Caso misurato: 07/07/2026, due caparre da 20,00 € sull'evento del 25/09 (INDUNI RENATA e
+     * DE AGOSTINI M RCO, estratto Crédit Agricole righe 55-56).
+     *
+     * <p>Il confronto resta <b>fail-closed</b> sul NULL: una controparte ignota non distingue
+     * nulla, quindi il gemello scatta lo stesso.
+     */
+    @Test
+    @Order(162)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void controparteDiversa_dueIncassiVeri_stessaOAssente_409() {
+        String id = creaEventoConfermato("Evento Due Caparre da 20", "1000");
+
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("CAPARRA", "20.00", "2026-07-07", "INDUNI RENATA"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        // Stesso importo, stesso giorno, stesso conto — persona diversa: passa.
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("CAPARRA", "20.00", "2026-07-07", "DE AGOSTINI M RCO"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        // Stessa persona: doppione.
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("CAPARRA", "20.00", "2026-07-07", "INDUNI RENATA"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("PAGAMENTO_DUPLICATO"));
+
+        // Controparte assente (registrazione dalla scheda evento): non distingue → si rifiuta.
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("CAPARRA", "20.00", "2026-07-07", null))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("PAGAMENTO_DUPLICATO"));
+
+        given().when().get("/api/eventi/" + id)
+                .then().body("importoIncassato", equalTo(40.0f))
+                       .body("pagamenti.size()", equalTo(2));
+    }
+
+    /**
+     * A4, non-regressione sul caso «Greg»: prima a mano dalla scheda evento (senza controparte),
+     * poi dal wizard con la controparte letta dall'estratto. È la coppia che ha prodotto il
+     * doppione reale da 1.500,00 €. Con un confronto {@code controparte = ?} secco il secondo
+     * inserimento passerebbe — qui deve continuare a essere rifiutato.
+     */
+    @Test
+    @Order(163)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void manualeSenzaControparte_poiImportConControparte_409() {
+        String id = creaEventoConfermato("Evento Greg", "5000");
+
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("ACCONTO", "1500.00", "2026-07-02", null))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("ACCONTO", "1500.00", "2026-07-02", "PASCHETTO"))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then()
+                .statusCode(409)
+                .body("code", equalTo("PAGAMENTO_DUPLICATO"));
+
+        given().when().get("/api/eventi/" + id)
+                .then().body("importoIncassato", equalTo(1500.0f));
+    }
+
+    /**
+     * A3 — «extra a consuntivo»: chi incassa più del pattuito registra l'eccedenza come voce con
+     * preventivo 0 e consuntivo pari all'eccedenza. Il tetto sul pagamento si allarga (I4), il
+     * preventivo — che è il pattuito — resta intatto (I2).
+     *
+     * <p>Copre anche il criterio 1: il 409 non deve creare voci per conto suo. In automatico
+     * questa voce avrebbe assorbito in silenzio il doppione da 1.500 € di «Greg».
+     */
+    @Test
+    @Order(164)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void extraAConsuntivo_allargaIlTetto_eLasciaIlPreventivoIntatto() {
+        // L'evento creato con un preventivato nasce già con la sua voce: aggiungerne un'altra
+        // qui raddoppierebbe il pattuito e il test misurerebbe un'altra cosa.
+        String id = creaEventoConfermato("Evento Extra Consuntivo", "1000");
+
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("ACCONTO", "900.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        given().when().get("/api/eventi/" + id).then()
+                .body("importoTotalePreviventivato", equalTo(1000.0f))
+                .body("importoIncassato",            equalTo(900.0f))
+                .body("importoResiduo",              equalTo(100.0f));
+
+        // Residuo 100,00: l'eccedenza da 300,00 non entra…
+        given().contentType(ContentType.JSON)
+            .body(buildPagamentoRequest("ACCONTO", "300.00", "2026-08-02", null))
+            .when().post("/api/eventi/" + id + "/pagamenti")
+            .then().statusCode(409).body("code", equalTo("IMPORTO_SUPERA_RESIDUO"));
+
+        // …e il rifiuto non ha creato nessuna voce di comodo (criterio 1).
+        given().when().get("/api/eventi/" + id + "/voci").then().body("size()", equalTo(1));
+
+        // L'extra a consuntivo è un'azione esplicita: la registra l'utente, dalla data evento.
+        dataEventoAIeri(id);
+        aggiungiVoce(id, "Extra A3", "300.00", "0", "1");
+
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("ACCONTO", "300.00", "2026-08-02", null))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+
+        given()
+            .when().get("/api/eventi/" + id)
+            .then()
+                // il pattuito NON è stato gonfiato per far entrare il pagamento (I2)
+                .body("importoTotalePreviventivato", equalTo(1000.0f))
+                .body("importoIncassato",            equalTo(1200.0f));
+    }
+
+    /**
+     * A3 criterio 2, non-regressione: il tetto usa il MAGGIORE fra preventivo e consuntivo.
+     * Con il consuntivo secco, un evento le cui voci sono state consuntivate al ribasso
+     * (servizio non erogato) rifiuterebbe un pagamento del tutto legittimo.
+     */
+    @Test
+    @Order(165)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void consuntivoMinoreDelPreventivo_nonStringeIlTetto() {
+        String id = creaEventoConfermato("Evento Consuntivo Minore", "1000");
+        dataEventoAIeri(id);
+        // consuntivo 400,00 su preventivo 1.000,00
+        String voceId = given().when().get("/api/eventi/" + id + "/voci")
+                .then().statusCode(200).extract().path("[0].id").toString();
+        given().contentType(ContentType.JSON)
+                .body("{\"quantitaConsuntivo\":0.4}")
+                .when().put("/api/eventi/voci/" + voceId).then().statusCode(200);
+
+        // 900,00 > 400,00 di consuntivo, ma ≤ 1.000,00 di preventivo: deve passare.
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest("ACCONTO", "900.00"))
+                .when().post("/api/eventi/" + id + "/pagamenti").then().statusCode(201);
+    }
+
+    /**
+     * A3 criterio 3 — una voce extra a consuntivo NON è un ricavo: i ricavi del P&L nascono dai
+     * movimenti (`importoConsuntivo` è letto solo dentro EventiService e dal suo DTO). Senza
+     * questo test, «allargare il tetto» potrebbe silenziosamente diventare doppio conteggio.
+     */
+    @Test
+    @Order(166)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void voceExtraAConsuntivo_nonMuoveIlContoEconomico() {
+        String id = creaEventoConfermato("Evento Extra No PL", "500");
+        dataEventoAIeri(id);
+
+        java.math.BigDecimal prima = ricaviAnno(2026);
+        aggiungiVoce(id, "Extra A3 pl", "250.00", "0", "1");
+        java.math.BigDecimal dopo = ricaviAnno(2026);
+
+        assertEquals(0, prima.compareTo(dopo),
+                "una voce a consuntivo non genera ricavo: il P&L legge i movimenti");
     }
 
     // ── 9. Pagamenti – RIMBORSO ───────────────────────────────────────────────
@@ -1278,5 +1597,43 @@ class EventiIntegrationTest {
                 {"tipo":"%s","importo":%s,"data":"2026-08-01",
                  "metodoPagamentoId":%d,"contoBancarioId":%d}
                 """.formatted(tipo, importo, metodoPagamentoId, contoBancarioId);
+    }
+
+    /** Voce di preventivo (e, se {@code qtaConsuntivo} != null, anche di consuntivo). */
+    private void aggiungiVoce(String eventoId, String label, String prezzo,
+                              String qtaPreventivo, String qtaConsuntivo) {
+        String consuntivo = qtaConsuntivo == null ? "" : ",\"quantitaConsuntivo\":" + qtaConsuntivo;
+        given().contentType(ContentType.JSON)
+                .body("{\"label\":\"%s\",\"prezzoUnitario\":%s,\"quantitaPreventivo\":%s%s}"
+                        .formatted(label, prezzo, qtaPreventivo, consuntivo))
+                .when().post("/api/eventi/" + eventoId + "/voci")
+                .then().statusCode(201);
+    }
+
+    /**
+     * Il consuntivo è compilabile solo dalla data evento (`assertConsuntivabile`), e la creazione
+     * di un evento rifiuta le date passate: l'unico modo di avere un evento consuntivabile è
+     * spostargli la data da sotto. È setup, non comportamento sotto test.
+     */
+    private void dataEventoAIeri(String eventoId) {
+        QuarkusTransaction.requiringNew().run(() -> em.createNativeQuery(
+                "UPDATE eventi SET data_evento = current_date - 1 WHERE id = CAST(:i AS uuid)")
+                .setParameter("i", eventoId).executeUpdate());
+    }
+
+    private java.math.BigDecimal ricaviAnno(int anno) {
+        em.createNativeQuery("SELECT fn_refresh_all_mv()").getSingleResult();
+        return (java.math.BigDecimal) em.createNativeQuery(
+                "SELECT COALESCE(sum(ricavi),0) FROM mv_conto_economico_mensile WHERE anno = :a")
+                .setParameter("a", anno).getSingleResult();
+    }
+
+    /** Variante A4: data del bonifico e controparte espliciti (null = registrazione manuale). */
+    private String buildPagamentoRequest(String tipo, String importo, String data, String controparte) {
+        return """
+                {"tipo":"%s","importo":%s,"data":"%s",
+                 "metodoPagamentoId":%d,"contoBancarioId":%d,"controparte":%s}
+                """.formatted(tipo, importo, data, metodoPagamentoId, contoBancarioId,
+                              controparte == null ? "null" : "\"" + controparte + "\"");
     }
 }

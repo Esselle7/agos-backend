@@ -54,6 +54,14 @@ public class RecurringExpensePlan {
     @Column(name = "note", columnDefinition = "text")
     public String note;
 
+    /**
+     * Testo da cercare nella descrizione bancaria per riconoscere l'addebito di questa rata
+     * (mandato SDD, nome del creditore, n. contratto). NULL = si usano i token del nome del piano.
+     * Vedi docs/specs/ricorrenti-match-strutturato.md.
+     */
+    @Column(name = "riferimento_estratto_conto", length = 120)
+    public String riferimentoEstrattoConto;
+
     @Column(name = "created_by", nullable = false, columnDefinition = "uuid", updatable = false)
     public UUID createdBy;
 

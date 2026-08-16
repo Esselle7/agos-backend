@@ -153,4 +153,67 @@ public final class DescNormalizer {
     private static String agenziaEntrate(String s) {
         return F24.matcher(s).find() ? "AGENZIA DELLE ENTRATE" : null;
     }
+
+    // ── Chiave di raggruppamento del wizard «Che spesa è questa?» (audit §7.1) ────────────
+    //
+    // 177 righe da catalogare non sono 177 decisioni: 48 sono incassi POS tutti della stessa
+    // forma, e gli stessi esercenti tornano più volte. La chiave serve a chiedere UNA volta
+    // per esercente. È anche l'etichetta mostrata a schermo: deve restare leggibile.
+
+    /** Coda di rumore bancario attaccata al nome: da lì in poi si taglia. */
+    private static final Pattern CODA_RUMORE = Pattern.compile(
+            "\\s*(?:RIF\\.?\\s*CRO|NROSUPCBI|V/ORDINE|ANTICIPO\\s+FATT|PROGETTO\\s+KAIROS|SPESA)\\b.*$");
+    /** Località/nazione in coda ai pagamenti carta ("… MONTANO LUCIN ITA"). */
+    private static final Pattern CODA_LOCALITA = Pattern.compile("\\s+(?:I\\s*TA|ITA)$");
+    /** Forme societarie: non distinguono l'esercente per chi deve dire "che spesa è". */
+    private static final Pattern FORMA_SOCIETARIA = Pattern.compile(
+            "\\b(?:S\\s?R\\s?L|S\\s?P\\s?A|S\\s?N\\s?C|S\\s?A\\s?S|SOCIETA|SOC|SPA|SRLS|COOP)\\b");
+    /**
+     * Chiave del gruppo di una riga da catalogare, o <b>null quando la riga va decisa da sola</b>.
+     *
+     * <p>Si raggruppa <b>solo su una controparte vera</b> (l'esercente estratto dalla causale):
+     * lì «sistema anche quella» dice qualcosa di sensato, perché è lo stesso fornitore. Non si
+     * raggruppa mai su parole della causale — misurato sul corpus: gli incassi POS hanno tutti la
+     * stessa forma ma sono giornate, importi e circuiti diversi, e le righe EFFETTI/RIBA sono
+     * pagamenti a fornitori <b>distinti</b>. Metterli insieme farebbe applicare una voce sola a
+     * cose diverse: è il difetto che questa firma esiste per evitare.
+     *
+     * @return la chiave (ed etichetta) del gruppo, oppure null = questa riga è una decisione a sé
+     */
+    public static String chiaveGruppo(String controparte, String descrizione) {
+        if (controparte == null || controparte.isBlank()) return null;
+        String k = CODA_RUMORE.matcher(controparte.toUpperCase()).replaceFirst("");
+        k = k.replace('&', 'E').replaceAll("[^A-Z0-9 ]", " ").replaceAll("\\s+", " ").trim();
+        k = CODA_LOCALITA.matcher(k).replaceFirst("").trim();
+        k = FORMA_SOCIETARIA.matcher(k).replaceAll(" ").replaceAll("\\s+", " ").trim();
+        return k.isEmpty() ? null : k;
+    }
+
+    /** Data dell'operazione letta dalla causale ("… DEL 10/01/26"), o null. */
+    private static final Pattern DATA_OPERAZIONE = Pattern.compile("\\bDEL\\s+(\\d{2}/\\d{2}/\\d{2,4})");
+
+    /**
+     * La data in cui la vendita è avvenuta, quando la causale la dichiara: sugli accrediti POS la
+     * banca acconta a giorni di distanza, e chi guarda la riga deve vedere <b>quale giornata</b>
+     * sta guardando, non solo quando è arrivato il denaro.
+     */
+    public static String dataOperazione(String descrizione) {
+        if (descrizione == null) return null;
+        Matcher m = DATA_OPERAZIONE.matcher(descrizione.toUpperCase());
+        return m.find() ? m.group(1) : null;
+    }
+
+    // "POS" come SOTTOSTRINGA aggancia "VOSTRA DISPOSIZIONE" (DIS-POS-IZIONE): serve il confine
+    // di parola, altrimenti un bonifico diventa un incasso POS. Trovato dal test sul corpus reale.
+    private static final Pattern E_UN_POS = Pattern.compile("\\bP\\.?O\\.?S\\b|\\bNUMIA\\b|\\bNEXI\\b");
+    private static final Pattern CIRCUITO = Pattern.compile("\\b(NUMIA-[A-Z]+|NEXI(?:\\s+CORE)?)\\b");
+
+    /** Circuito dell'incasso POS letto dalla causale (NEXI, NUMIA-INTER…), o null se non è un POS. */
+    public static String circuitoPos(String descrizione) {
+        if (descrizione == null) return null;
+        String d = descrizione.toUpperCase();
+        if (!E_UN_POS.matcher(d).find()) return null;
+        Matcher m = CIRCUITO.matcher(d);
+        return m.find() ? m.group(1).trim() : "POS";
+    }
 }

@@ -24,7 +24,6 @@ public record QuadraturaPeriodoDTO(
         BigDecimal assegnatoCa,
         BigDecimal codaTesta,
         BigDecimal codaFondo,
-        BigDecimal residuoCore,
         LocalDate maxDelBanca,
         List<String> note,
         List<String> approssimazioni,

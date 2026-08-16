@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * </ul>
  *
  * Copertura intenzionale (vedi commento di ogni test): scenari M1-M9 (movimenti
- * manuali), E1-E5 (eventi), F1-F5 (FLAT), R1-R6 (FINANZIAMENTO), C1-C2 (cassa).
+ * manuali), E1-E5 (eventi), F1-F5 (FLAT), R1-R6 (FINANZIAMENTO), C1-C2 (giroconti 10.03.x).
  *
  * Strategia d'isolamento: ogni test usa un (anno, mese, BU) o (anno, mese, conto
  * bancario) unico nell'anno 2099 (partizione default di movimenti), in modo da
@@ -536,8 +536,8 @@ class AggregatiPlCashFlowIntegrationTest {
     @Test @Order(50)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void c1_prelievo_giroconto_non_in_pl_ne_cf_operativo() throws Exception {
-        // Inserisce direttamente un movimento bancario con conto_coge = giroconto
-        // (replica esattamente quello che fa CassaService.createMovimentoBancaCollegato)
+        // Inserisce direttamente un movimento con conto_coge = giroconto (10.03.x): è la forma
+        // che producono il modulo Contanti e la contropartita cassa dell'import.
         int anno = 2098, mese = 7;
         short buId = 1;
         insertMovimento(

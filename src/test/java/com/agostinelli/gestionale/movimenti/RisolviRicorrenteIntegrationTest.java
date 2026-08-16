@@ -152,7 +152,7 @@ class RisolviRicorrenteIntegrationTest {
         long prima = movimentiConDescr(DESCR_PREFIX + "_IGNOREME");
 
         given().contentType(ContentType.JSON)
-            .body("{\"azione\":\"IGNORA\"}")
+            .body("{\"azione\":\"IGNORA\",\"nota\":\"non e' una rata di un nostro piano\"}")
             .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
             .then().statusCode(204);
 
@@ -237,6 +237,78 @@ class RisolviRicorrenteIntegrationTest {
         assertEquals(movId, movimentoDiRata(rata), "riga e rata puntano allo STESSO movimento");
         // la data del movimento è quella dell'addebito in banca, non la scadenza né oggi
         assertEquals(DATA, dataMovimento(movId), "il movimento usa la data reale dell'addebito");
+    }
+
+    // ── SPEC ricorrenti-importo-reale-da-import: l'estratto conto vince sul previsionale ──
+
+    /**
+     * R2 — Il piano è il previsionale, l'addebito è la verità: se il canone reale è 520,00 dove il
+     * piano prevedeva 500,00, il movimento vale 520,00 e la rata viene riscritta.
+     */
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void collegaRata_importoRealeSovrascriveIlPrevisto() {
+        accreditaConto1("REALE");
+        UUID piano = creaPianoMensile(DESCR_PREFIX + "_PIANO_REALE", new BigDecimal("500.00"));
+        UUID rata  = primaRataPending(piano);
+        UUID ric   = seedRicorrenteImporto("USCITA", DESCR_PREFIX + "_CANONE INDICIZZATO", (short) 1, "520.00");
+
+        given().contentType(ContentType.JSON)
+            .body("{\"azione\":\"COLLEGA\",\"pianoId\":\"" + piano + "\",\"rataId\":\"" + rata + "\"}")
+            .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
+            .then().statusCode(204);
+
+        UUID movId = movimentoDiRata(rata);
+        assertEquals(0, new BigDecimal("520.00").compareTo(importoMovimento(movId)),
+                "il movimento vale l'addebito reale, non la stima del piano");
+        assertEquals(0, new BigDecimal("520.00").compareTo(importoRata(rata)),
+                "la rata registra il fatto: 500,00 previsto -> 520,00 reale");
+    }
+
+    /**
+     * R3 — FINANZIAMENTO: la quota CAPITALE resta quella del piano, lo scarto va tutto sugli
+     * interessi. È ciò che tiene in piedi l'ammortamento: il debito continua a estinguersi come
+     * previsto e le rate successive non vanno rigenerate.
+     */
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void collegaRataFinanziamento_scartoTuttoSugliInteressi() {
+        accreditaConto1("FIN");
+        UUID piano = creaPianoFinanziamento(DESCR_PREFIX + "_MUTUO", new BigDecimal("900.00"));
+        UUID rata  = primaRataPending(piano);
+        BigDecimal capitalePrima = quoteRata(rata)[0];
+
+        UUID ric = seedRicorrenteImporto("USCITA", DESCR_PREFIX + "_RATA MUTUO", (short) 1, "918.17");
+        given().contentType(ContentType.JSON)
+            .body("{\"azione\":\"COLLEGA\",\"pianoId\":\"" + piano + "\",\"rataId\":\"" + rata + "\"}")
+            .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
+            .then().statusCode(204);
+
+        BigDecimal[] q = quoteRata(rata);
+        assertEquals(0, capitalePrima.compareTo(q[0]),
+                "la quota capitale NON si tocca: e' cio' che mantiene valido l'ammortamento");
+        assertEquals(0, new BigDecimal("918.17").subtract(capitalePrima).compareTo(q[1]),
+                "lo scarto e' assorbito dagli interessi");
+        assertEquals(0, new BigDecimal("918.17").compareTo(importoRata(rata)));
+        assertEquals(0, q[0].add(q[1]).compareTo(importoRata(rata)),
+                "invariante: importo = quota capitale + quota interessi");
+    }
+
+    /** R4 — Sotto la quota capitale gli interessi sarebbero negativi: si rifiuta, non si inventa. */
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void collegaRataFinanziamento_sottoLaQuotaCapitale_400() {
+        accreditaConto1("FIN_KO");
+        UUID piano = creaPianoFinanziamento(DESCR_PREFIX + "_MUTUO_KO", new BigDecimal("900.00"));
+        UUID rata  = primaRataPending(piano);
+        UUID ric   = seedRicorrenteImporto("USCITA", DESCR_PREFIX + "_RATA SBAGLIATA", (short) 1, "10.00");
+
+        given().contentType(ContentType.JSON)
+            .body("{\"azione\":\"COLLEGA\",\"pianoId\":\"" + piano + "\",\"rataId\":\"" + rata + "\"}")
+            .when().put("/api/movimenti/import/ricorrenti/" + ric + "/risolvi")
+            .then().statusCode(400).body("code", equalTo("IMPORTO_SOTTO_QUOTA_CAPITALE"));
+
+        assertEquals("PENDING", statoRata(rata), "nessuna scrittura: la rata resta com'era");
     }
 
     // ── (l) COLLEGA su rata GIÀ PAID: nessun movimento nuovo. È la chiusura del doppio conteggio ──
@@ -421,6 +493,54 @@ class RisolviRicorrenteIntegrationTest {
         return id;
     }
 
+    /** Riga parcheggiata con un importo scelto: serve a far divergere il reale dal previsto. */
+    @Transactional
+    UUID seedRicorrenteImporto(String tipo, String descr, Short conto, String importo) {
+        ensureImportLog();
+        UUID id = UUID.randomUUID();
+        em.createNativeQuery(
+                "INSERT INTO ricorrenti_da_riconciliare (id, import_log_id, fonte, data_movimento, importo, tipo, " +
+                "conto_bancario_id, descrizione_norm, tipo_presunto, stato, raw_data) " +
+                "VALUES (:id, :log, 'IMPORT_BANCA', :data, CAST(:imp AS numeric), :tipo, :conto, :descr, 'ALTRO', " +
+                "'DA_RICONCILIARE', CAST('{}' AS jsonb))")
+                .setParameter("id", id).setParameter("log", IMPORT_LOG).setParameter("data", DATA)
+                .setParameter("imp", importo)
+                .setParameter("tipo", tipo).setParameter("conto", conto).setParameter("descr", descr)
+                .executeUpdate();
+        return id;
+    }
+
+    /** Piano FINANZIAMENTO: la rata si divide in quota capitale + quota interessi. */
+    UUID creaPianoFinanziamento(String descrizione, BigDecimal importoRata) {
+        String body = "{\"descrizione\":\"" + descrizione + "\",\"contoBancarioId\":1,"
+                + "\"contoCoge\":" + cogeId("20.01.001") + ",\"importoRata\":" + importoRata + ","
+                + "\"giornoDelMese\":15,\"frequenza\":\"MENSILE\",\"numeroRate\":12,"
+                + "\"dataInizio\":\"" + DATA + "\",\"tipoPiano\":\"FINANZIAMENTO\","
+                + "\"importoDebitoIniziale\":10000.00,\"tassoInteresseAnnuo\":3.5,"
+                + "\"contoCogeInteressiId\":" + cogeId("60.01.001") + "}";
+        return UUID.fromString(given().contentType(ContentType.JSON).body(body)
+                .when().post("/api/spese-ricorrenti/piani")
+                .then().log().ifValidationFails().statusCode(201).extract().path("id"));
+    }
+
+    BigDecimal importoRata(UUID rata) {
+        return (BigDecimal) em.createNativeQuery(
+                "SELECT importo FROM recurring_expense_installment WHERE id = :id")
+                .setParameter("id", rata).getSingleResult();
+    }
+
+    BigDecimal[] quoteRata(UUID rata) {
+        Object[] r = (Object[]) em.createNativeQuery(
+                "SELECT quota_capitale, quota_interessi FROM recurring_expense_installment WHERE id = :id")
+                .setParameter("id", rata).getSingleResult();
+        return new BigDecimal[]{ (BigDecimal) r[0], (BigDecimal) r[1] };
+    }
+
+    BigDecimal importoMovimento(UUID movId) {
+        return (BigDecimal) em.createNativeQuery("SELECT importo_lordo FROM movimenti WHERE id = :id")
+                .setParameter("id", movId).getSingleResult();
+    }
+
     @Transactional
     UUID seedRicorrenteSuLog(UUID log, String tipo, String descr, Short conto) {
         UUID id = UUID.randomUUID();
@@ -466,5 +586,14 @@ class RisolviRicorrenteIntegrationTest {
         em.createNativeQuery("DELETE FROM eventi_da_riconciliare WHERE import_log_id = :log")
                 .setParameter("log", IMPORT_LOG).executeUpdate();
         em.createNativeQuery("DELETE FROM import_log WHERE id = :log").setParameter("log", IMPORT_LOG).executeUpdate();
+        // I piani restavano nel DB di test condiviso: quelli FINANZIAMENTO fanno comparire nel
+        // previsionale le categorie RATA_RICORRENTE_CAPITALE/INTERESSI e rompevano l'invariante
+        // di ForecastingIntegrationTest a seconda dell'ordine di esecuzione.
+        em.createNativeQuery(
+                "DELETE FROM recurring_expense_installment WHERE piano_id IN "
+                + "(SELECT id FROM recurring_expense_plan WHERE descrizione LIKE :p)")
+                .setParameter("p", DESCR_PREFIX + "%").executeUpdate();
+        em.createNativeQuery("DELETE FROM recurring_expense_plan WHERE descrizione LIKE :p")
+                .setParameter("p", DESCR_PREFIX + "%").executeUpdate();
     }
 }

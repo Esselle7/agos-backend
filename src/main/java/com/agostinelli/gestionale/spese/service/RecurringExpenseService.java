@@ -11,6 +11,7 @@ import com.agostinelli.gestionale.spese.dto.RecurringExpenseInstallmentDTO;
 import com.agostinelli.gestionale.spese.dto.RecurringExpensePlanCreateRequest;
 import com.agostinelli.gestionale.spese.dto.RecurringExpensePlanDetailDTO;
 import com.agostinelli.gestionale.spese.dto.RecurringExpensePlanSummaryDTO;
+import com.agostinelli.gestionale.spese.dto.RecurringExpensePlanUpdateRequest;
 import com.agostinelli.gestionale.spese.dto.SkipInstallmentRequest;
 import com.agostinelli.gestionale.spese.dto.UpdateInstallmentRequest;
 import com.agostinelli.gestionale.spese.repository.RecurringExpenseInstallmentRepository;
@@ -45,9 +46,9 @@ public class RecurringExpenseService {
 
     @Transactional
     public RecurringExpensePlanDetailDTO createPlan(RecurringExpensePlanCreateRequest req, UUID userId) {
-        validateCogeIsPassivita(req.contoCoge());
-
         String tipoPiano = req.tipoPiano() != null ? req.tipoPiano() : "FLAT";
+        validateCogePiano(req.contoCoge(), tipoPiano);
+
         if ("FINANZIAMENTO".equals(tipoPiano)) {
             if (req.importoDebitoIniziale() == null || req.tassoInteresseAnnuo() == null
                     || req.contoCogeInteressiId() == null) {
@@ -69,6 +70,7 @@ public class RecurringExpenseService {
         plan.numeroRate            = req.numeroRate();
         plan.dataPrimaRata         = req.dataInizio().withDayOfMonth(req.giornoDelMese());
         plan.note                  = req.note();
+        plan.riferimentoEstrattoConto = blankToNull(req.riferimentoEstrattoConto());
         plan.createdBy             = userId;
         plan.tipoPiano             = tipoPiano;
         plan.importoDebitoIniziale = req.importoDebitoIniziale();
@@ -103,6 +105,46 @@ public class RecurringExpenseService {
         RecurringExpensePlan plan = findPlanOrThrow(planId);
         List<RecurringExpenseInstallment> rate = installmentRepo.findByPianoOrdered(planId);
         return buildDetail(plan, rate);
+    }
+
+    // ── UPDATE PLAN (solo anagrafica + riconoscimento) ────────────────────────
+
+    /**
+     * Modifica descrizione, conto bancario, riferimento in estratto conto e note di un piano
+     * esistente. Sono i campi che governano il RICONOSCIMENTO della rata nell'import
+     * (docs/specs/ricorrenti-match-strutturato.md): senza questo endpoint un riferimento
+     * sbagliato costringeva a cestinare e ricreare il piano.
+     *
+     * <p>Fuori: importo rata, numero rate, giorno, frequenza, tipo piano, CoGe. Cambiarli
+     * imporrebbe di rigenerare le rate — comprese quelle già PAID — e romperebbe l'invariante
+     * Σ quote capitale = debito iniziale. Per quelli esistono i percorsi dedicati (modifica della
+     * singola rata, liquidazione, annullamento).
+     */
+    @Transactional
+    public RecurringExpensePlanDetailDTO updatePlan(UUID planId, RecurringExpensePlanUpdateRequest req) {
+        RecurringExpensePlan plan = findPlanOrThrow(planId);
+        validateContoBancario(req.contoBancarioId());
+
+        plan.descrizione = req.descrizione().trim();
+        plan.contoBancarioId = req.contoBancarioId();
+        plan.riferimentoEstrattoConto = blankToNull(req.riferimentoEstrattoConto());
+        plan.note = blankToNull(req.note());
+        planRepo.persist(plan);
+
+        return buildDetail(plan, installmentRepo.findByPianoOrdered(planId));
+    }
+
+    private void validateContoBancario(Short contoBancarioId) {
+        Long n = ((Number) em.createNativeQuery("SELECT COUNT(*) FROM conti_bancari WHERE id = :id")
+                .setParameter("id", contoBancarioId).getSingleResult()).longValue();
+        if (n == 0) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "CONTO_BANCARIO_NON_TROVATO",
+                    "Conto bancario inesistente: " + contoBancarioId);
+        }
+    }
+
+    private static String blankToNull(String s) {
+        return s == null || s.isBlank() ? null : s.trim();
     }
 
     // ── UPDATE SINGLE INSTALLMENT ─────────────────────────────────────────────
@@ -193,7 +235,8 @@ public class RecurringExpenseService {
      * @return l'id del movimento a cui agganciare la riga (capitale, per i FINANZIAMENTO).
      */
     @Transactional
-    public UUID collegaRataDaImport(UUID planId, UUID installmentId, LocalDate dataAddebito, UUID userId) {
+    public UUID collegaRataDaImport(UUID planId, UUID installmentId, LocalDate dataAddebito,
+                                    BigDecimal importoReale, UUID userId) {
         RecurringExpensePlan plan = findActivePlanOrThrow(planId);
         RecurringExpenseInstallment rata = findInstallmentOrThrow(installmentId, planId);
 
@@ -209,27 +252,52 @@ public class RecurringExpenseService {
                     "La riga da collegare non ha una data di addebito");
         }
 
-        checkSaldo(plan.contoBancarioId, rata.importo);
+        // Il piano è il previsionale, l'estratto conto è la verità: se l'addebito reale differisce
+        // dalla stima, vince il reale e la rata viene riscritta (SPEC ricorrenti-importo-reale-da-import).
+        BigDecimal importo = importoReale != null ? importoReale : rata.importo;
 
-        if ("FINANZIAMENTO".equals(plan.tipoPiano) && rata.quotaCapitale != null) {
+        // FINANZIAMENTO: la quota CAPITALE resta quella del piano e lo scarto va tutto sugli
+        // interessi — è il comportamento di un tasso variabile. Così il debito continua a
+        // estinguersi esattamente come da ammortamento e le rate successive restano valide
+        // (invariante: Σ quote capitale = debito iniziale). ponytail: guardia money, non rimuovere.
+        boolean finanziamento = "FINANZIAMENTO".equals(plan.tipoPiano) && rata.quotaCapitale != null;
+        BigDecimal quotaInteressi = null;
+        if (finanziamento) {
+            quotaInteressi = importo.subtract(rata.quotaCapitale);
+            if (quotaInteressi.signum() <= 0) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "IMPORTO_SOTTO_QUOTA_CAPITALE",
+                        "L'addebito reale (€" + importo + ") non copre la quota capitale della rata (€"
+                        + rata.quotaCapitale + "): non è la rata di questo piano, oppure il piano va corretto.");
+            }
+        }
+
+        // NIENTE checkSaldo qui: collegare REGISTRA un addebito che la banca ha già eseguito, non
+        // autorizza un pagamento. Con la guardia, dopo il reset del go-live (saldo BPM 486,93 al
+        // 07/08) 3 collegamenti su 10 di luglio fallivano con SALDO_INSUFFICIENTE — fra cui la rata
+        // del mutuo da 2.501,17 — cioè l'app rifiutava di registrare un fatto già avvenuto.
+        // La guardia resta dov'è un'autorizzazione vera: payInstallment / liquidazione / penale.
+
+        if (finanziamento) {
             Movimento mCap = buildMovimento(plan, rata.quotaCapitale, dataAddebito, userId,
                     plan.descrizione + " – Rata " + rata.numeroRata + " (cap.)");
             em.persist(mCap);
-            Movimento mInt = buildMovimentoInteressi(plan, rata.quotaInteressi, dataAddebito, userId,
+            Movimento mInt = buildMovimentoInteressi(plan, quotaInteressi, dataAddebito, userId,
                     plan.descrizione + " – Rata " + rata.numeroRata + " (int.)");
             em.persist(mInt);
             em.flush();
+            rata.quotaInteressi       = quotaInteressi;
             rata.stato                = "PAID";
             rata.movimentoId          = mCap.id;
             rata.movimentoInteressiId = mInt.id;
         } else {
-            Movimento m = buildMovimento(plan, rata.importo, dataAddebito, userId,
+            Movimento m = buildMovimento(plan, importo, dataAddebito, userId,
                     plan.descrizione + " – Rata " + rata.numeroRata);
             em.persist(m);
             em.flush();
             rata.stato       = "PAID";
             rata.movimentoId = m.id;
         }
+        rata.importo = importo;   // la rata registra il fatto, non più la stima
 
         if (installmentRepo.findPendingByPiano(planId).isEmpty()) {
             plan.stato = "COMPLETATO";
@@ -462,14 +530,35 @@ public class RecurringExpenseService {
 
     // ── HELPERS ───────────────────────────────────────────────────────────────
 
-    private void validateCogeIsPassivita(Integer cogeId) {
+    /**
+     * CoGe ammesso per il piano, secondo il tipo:
+     * <ul>
+     *   <li><b>FINANZIAMENTO</b> → solo PASSIVITA: la rata rimborsa un debito, e la quota capitale
+     *       deve scaricarsi su un conto patrimoniale perché l'ammortamento resti valido.</li>
+     *   <li><b>FLAT</b> → PASSIVITA <i>oppure</i> COSTO: un canone, una bolletta o un premio
+     *       assicurativo sono costi d'esercizio, non rimborsi di debito. Col solo vincolo
+     *       PASSIVITA, 5 delle 10 spese ricorrenti reali (Enel, Telepass, TIM, Nexi, polizza)
+     *       non erano rappresentabili se non forzandole su «Debiti verso fornitori» — cioè
+     *       sbagliando la contabilità.</li>
+     * </ul>
+     */
+    private void validateCogePiano(Integer cogeId, String tipoPiano) {
         String tipo = (String) em.createNativeQuery(
                 "SELECT tipo FROM piano_dei_conti_coge WHERE id = :id")
                 .setParameter("id", cogeId)
                 .getSingleResult();
-        if (!"PASSIVITA".equals(tipo)) {
-            throw new ApiException(Response.Status.BAD_REQUEST, "COGE_NON_PASSIVITA",
-                    "Il conto COGE selezionato deve appartenere al ramo PASSIVITÀ E DEBITI (tipo PASSIVITA)");
+        if ("FINANZIAMENTO".equals(tipoPiano)) {
+            if (!"PASSIVITA".equals(tipo)) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "COGE_NON_PASSIVITA",
+                        "Su un piano FINANZIAMENTO il conto COGE deve appartenere al ramo "
+                        + "PASSIVITÀ E DEBITI (la quota capitale rimborsa un debito)");
+            }
+            return;
+        }
+        if (!"PASSIVITA".equals(tipo) && !"COSTO".equals(tipo)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "COGE_NON_AMMESSO",
+                    "Il conto COGE di una spesa ricorrente deve essere un COSTO (canoni, utenze, "
+                    + "assicurazioni) oppure una PASSIVITÀ (rate di debito)");
         }
     }
 
@@ -662,6 +751,12 @@ public class RecurringExpenseService {
                     " FROM conti_bancari cb" +
                     " LEFT JOIN movimenti m ON m.conto_bancario_id = cb.id" +
                     "   AND m.data_finanziaria IS NOT NULL" +
+                    // Mancava il filtro sugli ANNULLATI (le altre 3 formule ce l'hanno): la guardia
+                    // FONDI_INSUFFICIENTI autorizzava pagamenti su denaro storniato.
+                    "   AND m.stato <> 'ANNULLATO'" +
+                    // V24: "saldo AL giorno X" = conta solo ciò che si muove DOPO quel giorno.
+                    "   AND (cb.data_saldo_iniziale IS NULL" +
+                    "        OR COALESCE(m.data_finanziaria, m.data_movimento) > cb.data_saldo_iniziale)" +
                     " WHERE cb.id = :id" +
                     " GROUP BY cb.saldo_iniziale")
                     .setParameter("id", contoBancarioId)
@@ -709,6 +804,7 @@ public class RecurringExpenseService {
                 plan.contoCoge, lookupContoCogeDescrizione(plan.contoCoge),
                 plan.importoRata, plan.variazionePct, plan.giornoDelMese,
                 plan.frequenza, plan.numeroRate, plan.dataPrimaRata, plan.stato,
+                plan.riferimentoEstrattoConto,
                 (int) rate.stream().filter(r -> "PENDING".equals(r.stato)).count(),
                 (int) rate.stream().filter(r -> "PAID".equals(r.stato)).count(),
                 (int) rate.stream().filter(r -> "SKIPPED".equals(r.stato)).count(),
@@ -742,7 +838,7 @@ public class RecurringExpenseService {
                 plan.contoCoge, lookupContoCogeDescrizione(plan.contoCoge),
                 plan.importoRata, plan.variazionePct, plan.giornoDelMese,
                 plan.frequenza, plan.numeroRate, plan.dataPrimaRata, plan.stato,
-                plan.note, pagato, residuo, totale,
+                plan.note, plan.riferimentoEstrattoConto, pagato, residuo, totale,
                 totaleInteressi, totaleCapitale,
                 plan.tipoPiano, plan.tassoInteresseAnnuo, plan.importoDebitoIniziale,
                 plan.contoCogeInteressiId, cogeInteressiDesc,

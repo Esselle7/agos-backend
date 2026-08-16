@@ -23,15 +23,21 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Verifica l'aggancio cross-sorgente degli eventi SENZA chiave_aggancio (export nativi),
  * delegato a {@code EventoMatcher}. Caso forte e deterministico: re-importando lo stesso
- * file banca nativo, il matcher deve riconoscere gli eventi già in coda come duplicati e
- * NON crearne di nuovi, pur in assenza della chiave di registrazione.
+ * periodo, il matcher deve riconoscere gli eventi già in coda come duplicati e NON crearne
+ * di nuovi, pur in assenza della chiave di registrazione.
+ *
+ * <p>2026-08-11: passava da {@code importFile} (import single-file), cancellato insieme a
+ * ImportStrategy/Factory — l'unica modalità di import è quella congiunta (audit §8 #10). Il
+ * test è stato riportato sul percorso vero, {@code importCongiunto} sui 3 file storici.
  */
 @QuarkusTest
 class EtlDedupFallbackIntegrationTest {
 
     static final UUID TEST_USER = UUID.fromString("00000000-0000-0000-0000-000000000099");
-    static final Path NEW = Path.of("..", "esempi_input_per_ETL_new");
-    static final String CA_NATIVO = "Movimenti_in_tempo_reale_2026_06_10_115335.csv";
+    static final Path STORICI = Path.of("..", "esempi_dati_storici");
+    static final String BILLY = "corrispettivi-12.csv";
+    static final String BPM = "MovimentiCC_OnLine_10_06_2026_11.56.28.csv";
+    static final String CA = "Movimenti_in_tempo_reale_2026_06_10_115335.csv";
 
     @Inject MovimentoImportService importService;
     @Inject ImportTriageService triageService;
@@ -39,7 +45,10 @@ class EtlDedupFallbackIntegrationTest {
 
     @BeforeAll
     static void checkFixtures() {
-        Assumptions.assumeTrue(Files.isDirectory(NEW), "Cartella esempi_input_per_ETL_new assente: test saltato");
+        Assumptions.assumeTrue(Files.isDirectory(STORICI), "Cartella esempi_dati_storici assente: test saltato");
+        for (String f : new String[]{BILLY, BPM, CA}) {
+            Assumptions.assumeTrue(Files.isRegularFile(STORICI.resolve(f)), "Fixture assente: " + f);
+        }
     }
 
     @BeforeEach
@@ -50,13 +59,14 @@ class EtlDedupFallbackIntegrationTest {
     void cleanEtl() {
         QuarkusTransaction.requiringNew().run(() -> {
             em.createNativeQuery("DELETE FROM movimenti WHERE fonte_importazione_id IS NOT NULL").executeUpdate();
-            em.createNativeQuery("DELETE FROM import_log WHERE fonte IN ('IMPORT_BILLY','IMPORT_BANCA')").executeUpdate();
+            em.createNativeQuery("DELETE FROM import_log WHERE fonte IN "
+                    + "('IMPORT_CONGIUNTO','IMPORT_BILLY','IMPORT_BANCA')").executeUpdate();
         });
     }
 
     @Test
     void reimportNativo_dedupSenzaChiave() throws Exception {
-        EtlImportResponse ca1 = importFixture(CA_NATIVO, "IMPORT_BANCA_CA");
+        EtlImportResponse ca1 = importaCongiunto();
         assertTrue(ca1.parcheggiati() > 15,
                 "il CSV CA nativo deve parcheggiare diversi eventi (caparre/acconti/saldi)");
 
@@ -67,7 +77,7 @@ class EtlDedupFallbackIntegrationTest {
         long dopoPrimo = scalar("SELECT count(*) FROM eventi_da_riconciliare");
 
         // Re-import dello stesso file: il matcher deve riconoscere (quasi) tutto come duplicato.
-        EtlImportResponse ca2 = importFixture(CA_NATIVO, "IMPORT_BANCA_CA");
+        EtlImportResponse ca2 = importaCongiunto();
         long dopoSecondo = scalar("SELECT count(*) FROM eventi_da_riconciliare");
 
         assertTrue(ca2.duplicati() >= ca1.parcheggiati() * 0.8,
@@ -86,16 +96,6 @@ class EtlDedupFallbackIntegrationTest {
                 "  GROUP BY controparte_nome, data_evento_estratta, importo) g");
         assertEquals(1, maxRicchiDuplicati,
                 "nessun evento identificabile (nome+data-evento+importo) deve comparire due volte");
-    }
-
-    @Test
-    void bancheDiverse_nonFondonoEventiDistinti() throws Exception {
-        // CA e BPM sono conti diversi: gli eventi non si sovrappongono. Il matcher non deve
-        // mangiarli a vicenda (guardia contro falsi positivi di fusione).
-        EtlImportResponse ca = importFixture(CA_NATIVO, "IMPORT_BANCA_CA");
-        EtlImportResponse bpm = importFixture("MovimentiCC_OnLine_10_06_2026_11.56.28.csv", "IMPORT_BANCA_BPM");
-        assertTrue(bpm.parcheggiati() > 0,
-                "BPM porta eventi propri, non tutti assorbiti come duplicati di CA");
     }
 
     @Test
@@ -141,11 +141,11 @@ class EtlDedupFallbackIntegrationTest {
 
     // ── helpers ──────────────────────────────────────────────────────────────────
 
-    EtlImportResponse importFixture(String filename, String fonteStr) throws Exception {
-        Path p = NEW.resolve(filename);
-        Assumptions.assumeTrue(Files.isRegularFile(p), "File assente: " + p);
-        try (InputStream in = new FileInputStream(p.toFile())) {
-            return importService.importFile(in, filename, fonteStr, TEST_USER);
+    EtlImportResponse importaCongiunto() throws Exception {
+        try (InputStream b = new FileInputStream(STORICI.resolve(BILLY).toFile());
+             InputStream bpm = new FileInputStream(STORICI.resolve(BPM).toFile());
+             InputStream ca = new FileInputStream(STORICI.resolve(CA).toFile())) {
+            return importService.importCongiunto(b, bpm, ca, BILLY, BPM, CA, TEST_USER);
         }
     }
 

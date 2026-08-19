@@ -16,6 +16,7 @@ import jakarta.validation.Validator;
 import jakarta.ws.rs.core.Response;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.util.*;
 
@@ -124,6 +125,14 @@ public class MovimentiService {
         // la azzererebbe. Default a MANUALE come in createMovimento.
         if (m.fonte == null) {
             m.fonte = "MANUALE";
+        }
+
+        // Stessa trappola su dataCompetenza, ma silenziosa: mv_conto_economico_mensile
+        // filtra "data_competenza IS NOT NULL", quindi un PUT che la omette faceva
+        // sparire il movimento dal Conto Economico lasciandolo nei saldi. @PrePersist
+        // copre solo la creazione: qui si replica lo stesso default.
+        if (m.dataCompetenza == null) {
+            m.dataCompetenza = m.dataMovimento;
         }
 
         if (req.importoLordo() != null || req.aliquotaIva() != null) {
@@ -430,14 +439,24 @@ public class MovimentiService {
      * Calcola importoCommissione e importoIva dai valori opzionali forniti.
      * commissione: solo se importoLordo > importo (scenario POS/Satispay).
      * IVA: solo se aliquotaIva è presente (es. 0.10 per il 10%).
+     *
+     * <p><b>Scorporo, non sottrazione.</b> {@code m.importo} è il LORDO IVA inclusa
+     * (colonna {@code importo_lordo}: corrispettivo Billy, totale bonifico), quindi
+     * l'imponibile è {@code lordo / (1 + aliquota)}. Il vecchio calcolo
+     * {@code iva = lordo * aliquota} trattava lo stesso campo come imponibile nella
+     * prima riga e come lordo nella seconda: su 400,70 al 10% scriveva 40,07 di IVA
+     * invece di 36,43, cioè un'aliquota implicita dell'11,11%, e sottostimava i
+     * ricavi del P&L (che legge importo_imponibile) di ~0,9%.
+     * Invariante: {@code imponibile + iva = lordo} e {@code iva / imponibile = aliquota}.
      */
     private void applyDerivedAmounts(Movimento m, BigDecimal importoLordo, BigDecimal aliquotaIva) {
         if (importoLordo != null && importoLordo.compareTo(m.importo) > 0) {
             m.importoCommissione = importoLordo.subtract(m.importo);
         }
         if (aliquotaIva != null && aliquotaIva.compareTo(BigDecimal.ZERO) > 0) {
-            m.importoIva = m.importo.multiply(aliquotaIva);
-            m.importoImponibile = m.importo.subtract(m.importoIva);
+            m.importoImponibile = m.importo.divide(
+                    BigDecimal.ONE.add(aliquotaIva), 2, RoundingMode.HALF_UP);
+            m.importoIva = m.importo.subtract(m.importoImponibile);
         }
     }
 

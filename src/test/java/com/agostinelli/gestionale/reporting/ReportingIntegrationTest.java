@@ -156,8 +156,26 @@ class ReportingIntegrationTest {
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void kpiCustomRange_margineInvariant_entrateMinusUscite() {
         // INVARIANTE CORE: margine == totalEntrate - totalUscite
-        // Periodo aggiornato a maggio-luglio 2026 perché V26 ha rimosso i seed V9
-        // di gen-mar 2026 prima del reseed V27 (movimenti mag-lug 2026).
+        //
+        // Il test si crea il proprio ricavo e il proprio costo. Prima si appoggiava ai
+        // movimenti presenti nel range, ma il profilo %test carica solo db/migration
+        // (i seed stanno in db/seed/common): in mag-lug 2026 restavano due movimenti
+        // lasciati da altre classi di test, entrambi su un conto ATTIVITA. Il
+        // "totalEntrate > 0" era quindi verde solo finché la dashboard sommava anche i
+        // conti non economici — cioè grazie al difetto che questa suite ora impedisce.
+        String data = "2026-05-15";
+        int cogeRicavo = ((Number) em.createNativeQuery(
+                "SELECT id FROM piano_dei_conti_coge WHERE tipo = 'RICAVO' AND is_active ORDER BY id LIMIT 1")
+                .getSingleResult()).intValue();
+        int cogeCosto = ((Number) em.createNativeQuery(
+                "SELECT id FROM piano_dei_conti_coge WHERE tipo = 'COSTO' AND NOT is_capex AND is_active ORDER BY id LIMIT 1")
+                .getSingleResult()).intValue();
+        int metodo = ((Number) em.createNativeQuery(
+                "SELECT id FROM metodi_pagamento WHERE codice = 'BONIFICO'").getSingleResult()).intValue();
+
+        creaMovimento("ENTRATA", "1000.00", 1, cogeRicavo, metodo, data, "ZZ ricavo invariante margine");
+        creaMovimento("USCITA",   "400.00", 1, cogeCosto,  metodo, data, "ZZ costo invariante margine");
+
         Response r = given()
             .queryParam("period", "CUSTOM")
             .queryParam("from", "2026-05-01")
@@ -165,12 +183,12 @@ class ReportingIntegrationTest {
             .when().get("/api/dashboard/kpi")
             .then().statusCode(200).extract().response();
 
-        float totalEntrate = r.path("periodo.totalEntrate");
-        float totalUscite  = r.path("periodo.totalUscite");
-        float margine      = r.path("periodo.margine");
+        float totalEntrate = ((Number) r.path("periodo.totalEntrate")).floatValue();
+        float totalUscite  = ((Number) r.path("periodo.totalUscite")).floatValue();
+        float margine      = ((Number) r.path("periodo.margine")).floatValue();
 
         assertTrue(totalEntrate > 0,
-            "Con dati V27 mag-lug 2026 deve esserci almeno una entrata: totalEntrate=" + totalEntrate);
+            "il ricavo appena creato deve comparire nelle entrate: totalEntrate=" + totalEntrate);
         assertEquals(totalEntrate - totalUscite, margine, 0.02f,
             "margine deve essere esattamente totalEntrate - totalUscite");
     }
@@ -892,5 +910,90 @@ class ReportingIntegrationTest {
         if (o == null) return 0f;
         if (o instanceof Number n) return n.floatValue();
         return Float.parseFloat(o.toString());
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // KPI economici: solo conti RICAVO/COSTO (invariante DRY col P&L)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Un giroconto e' denaro che cambia tasca, non un ricavo ne' un costo: il P&L lo
+     * esclude via "pc.tipo IN ('RICAVO','COSTO')" (V3), la sezione "Performance
+     * Economica" della dashboard deve fare lo stesso. Misurato su agosdb prima del fix:
+     * dashboard entrate 32.631,14 contro ricavi P&L 32.159,41 nello stesso luglio 2026,
+     * di cui 300,00 erano UN SOLO giroconto CA->BPM contato sia come entrata sia come uscita.
+     * CoGe 10.03.001 = 'Giroconto da Credit Agricole a Banco BPM', tipo ATTIVITA (seed V4).
+     */
+    @Test
+    @Order(70)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void kpiEconomici_giroconto_nonEntraNeEntrateNeUscite() {
+        String oggi = java.time.LocalDate.now().toString();
+        String kpi = "/api/dashboard/kpi?from=%s&to=%s&period=CUSTOM".formatted(oggi, oggi);
+
+        double entratePre = kpiNum(kpi, "periodo.totalEntrate");
+        double uscitePre  = kpiNum(kpi, "periodo.totalUscite");
+
+        int cogeGiroconto = ((Number) em.createNativeQuery(
+                "SELECT id FROM piano_dei_conti_coge WHERE codice = '10.03.001'")
+                .getSingleResult()).intValue();
+        int metodo = ((Number) em.createNativeQuery(
+                "SELECT id FROM metodi_pagamento WHERE codice = 'BONIFICO'")
+                .getSingleResult()).intValue();
+
+        creaMovimento("USCITA",  "300.00", 2, cogeGiroconto, metodo, oggi, "ZZ giroconto uscita");
+        creaMovimento("ENTRATA", "300.00", 1, cogeGiroconto, metodo, oggi, "ZZ giroconto entrata");
+
+        assertEquals(entratePre, kpiNum(kpi, "periodo.totalEntrate"), 0.001,
+                "un giroconto ATTIVITA non e' un ricavo: non deve alzare le Entrate della dashboard");
+        assertEquals(uscitePre, kpiNum(kpi, "periodo.totalUscite"), 0.001,
+                "un giroconto ATTIVITA non e' un costo: non deve alzare le Uscite della dashboard");
+    }
+
+    /**
+     * Stessa grandezza, una sola verita': le Entrate/Uscite della sezione economica
+     * devono coincidere con ricavi/costi del Conto Economico sullo stesso periodo.
+     */
+    @Test
+    @Order(71)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void kpiEconomici_coincidonoColContoEconomico() throws Exception {
+        tx.begin();
+        em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_conto_economico_mensile").executeUpdate();
+        tx.commit();
+
+        java.time.LocalDate primo = java.time.LocalDate.now().withDayOfMonth(1);
+        java.time.LocalDate ultimo = primo.plusMonths(1).minusDays(1);
+        String kpi = "/api/dashboard/kpi?from=%s&to=%s&period=CUSTOM".formatted(primo, ultimo);
+
+        double ricaviPl = ((Number) em.createNativeQuery(
+                "SELECT COALESCE(SUM(ricavi),0) FROM mv_conto_economico_mensile WHERE anno = :a AND mese = :m")
+                .setParameter("a", primo.getYear()).setParameter("m", primo.getMonthValue())
+                .getSingleResult()).doubleValue();
+        double costiPl = ((Number) em.createNativeQuery(
+                "SELECT COALESCE(SUM(costi_operativi),0) FROM mv_conto_economico_mensile WHERE anno = :a AND mese = :m")
+                .setParameter("a", primo.getYear()).setParameter("m", primo.getMonthValue())
+                .getSingleResult()).doubleValue();
+
+        assertEquals(ricaviPl, kpiNum(kpi, "periodo.totalEntrate"), 0.011,
+                "Entrate dashboard e Ricavi del Conto Economico misurano la stessa cosa");
+        assertEquals(costiPl, kpiNum(kpi, "periodo.totalUscite"), 0.011,
+                "Uscite dashboard e Costi del Conto Economico misurano la stessa cosa");
+    }
+
+    private double kpiNum(String url, String path) {
+        return ((Number) given().when().get(url).then().statusCode(200).extract().path(path)).doubleValue();
+    }
+
+    private void creaMovimento(String tipo, String importo, int conto, int coge,
+                               int metodo, String data, String descrizione) {
+        given().contentType("application/json")
+            .body("""
+                    {"tipo":"%s","importo":%s,"dataMovimento":"%s","dataFinanziaria":"%s",
+                     "contoBancarioId":%d,"metodoPagamentoId":%d,"businessUnitId":1,
+                     "contoCoge":%d,"descrizione":"%s"}
+                    """.formatted(tipo, importo, data, data, conto, metodo, coge, descrizione))
+            .when().post("/api/movimenti")
+            .then().statusCode(201);
     }
 }

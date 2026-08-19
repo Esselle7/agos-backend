@@ -384,18 +384,35 @@ public class DashboardService {
     // WHY esclusione capex: la sezione è "Performance Economica" (competenza) — l'acquisto di un
     // cespite è un investimento patrimoniale, il suo impatto economico è solo l'ammortamento nel
     // P&L. L'impatto di cassa resta visibile nei saldi (Situazione Finanziaria).
+    //
+    // WHY le tre regole allineate a mv_conto_economico_mensile (V3): la sezione dichiara
+    // "competenza" e il cliente confronta questi numeri con quelli del Conto Economico.
+    // Misurato su agosdb, luglio 2026, PRIMA di questo allineamento: entrate 32.631,14 contro
+    // ricavi P&L 32.159,41 (Δ 471,73) e uscite 44.554,61 contro costi 44.254,61 (Δ 300,00),
+    // dove i 300,00 erano UN giroconto CA→BPM contato sia come ricavo sia come costo.
+    //   1. solo conti RICAVO/COSTO: ATTIVITA (giroconti, versamenti contanti) e PASSIVITA
+    //      (quota capitale delle rate, erogazioni) non sono economici — senza questo filtro
+    //      la quota capitale di un mutuo comparirebbe qui come costo e non nel P&L;
+    //   2. data_competenza, non data_movimento: è la data che governa il P&L;
+    //   3. imponibile quando c'è: il P&L legge COALESCE(importo_imponibile, importo_lordo).
+    // COUNT(*) resta su TUTTI i movimenti del periodo: è "quanti movimenti", non una grandezza
+    // economica.
     private Object[] queryKpiDirect(LocalDate from, LocalDate to) {
         return (Object[]) em.createNativeQuery(
                 "SELECT " +
-                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE 0 END),0), " +
-                "COALESCE(SUM(CASE WHEN m.tipo='USCITA' AND NOT COALESCE(pc.is_capex,false) THEN m.importo_lordo ELSE 0 END),0), " +
-                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo " +
-                "              WHEN NOT COALESCE(pc.is_capex,false) THEN -m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' AND pc.tipo='RICAVO' " +
+                "              THEN COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='USCITA' AND pc.tipo='COSTO' AND NOT COALESCE(pc.is_capex,false) " +
+                "              THEN COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' AND pc.tipo='RICAVO' " +
+                "              THEN COALESCE(m.importo_imponibile, m.importo_lordo) " +
+                "              WHEN m.tipo='USCITA' AND pc.tipo='COSTO' AND NOT COALESCE(pc.is_capex,false) " +
+                "              THEN -COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0), " +
                 "COUNT(*) " +
                 "FROM movimenti m " +
                 "LEFT JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
                 "WHERE m.stato != 'ANNULLATO' " +
-                "AND m.data_movimento >= :from AND m.data_movimento <= :to")
+                "AND m.data_competenza >= :from AND m.data_competenza <= :to")
                 .setParameter("from", from)
                 .setParameter("to", to)
                 .getSingleResult();

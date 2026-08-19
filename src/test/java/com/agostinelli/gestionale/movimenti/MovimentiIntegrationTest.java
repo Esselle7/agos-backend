@@ -728,4 +728,120 @@ class MovimentiIntegrationTest {
                 """.formatted(tipo, importo, validMetodoPagamento, validContoCoge,
                 descrizione, rif);
     }
+
+    // ── Scorporo IVA ──────────────────────────────────────────────────────────
+
+    /**
+     * L'importo del movimento e' il LORDO (IVA inclusa): l'imponibile si ottiene
+     * scorporando (lordo / (1 + aliquota)), non sottraendo lordo * aliquota.
+     * Valori presi da righe reali a DB: scontrino Billy 400,70 al 10% e 55,36 al 4%.
+     * Invariante di dominio: imponibile + iva = lordo, e iva/imponibile = aliquota.
+     */
+    @Test
+    @Order(130)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testScorporoIva10() {
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildCreateRequestConIva("ENTRATA", "400.70", "0.10"))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(201)
+                .body("importoImponibile", equalTo(364.27f))
+                .body("importoIva", equalTo(36.43f));
+    }
+
+    @Test
+    @Order(131)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testScorporoIva4() {
+        given()
+            .contentType(ContentType.JSON)
+            .body(buildCreateRequestConIva("ENTRATA", "55.36", "0.04"))
+            .when().post("/api/movimenti")
+            .then()
+                .statusCode(201)
+                .body("importoImponibile", equalTo(53.23f))
+                .body("importoIva", equalTo(2.13f));
+    }
+
+    @Test
+    @Order(132)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testScorporoIvaSommaRicostruisceIlLordo() {
+        for (String[] caso : new String[][] {
+                {"400.70", "0.10"}, {"55.36", "0.04"}, {"122.00", "0.22"}, {"33.33", "0.10"}}) {
+            io.restassured.path.json.JsonPath r = given()
+                .contentType(ContentType.JSON)
+                .body(buildCreateRequestConIva("ENTRATA", caso[0], caso[1]))
+                .when().post("/api/movimenti")
+                .then().statusCode(201).extract().jsonPath();
+
+            java.math.BigDecimal lordo = new java.math.BigDecimal(caso[0]);
+            java.math.BigDecimal imponibile = r.getObject("importoImponibile", java.math.BigDecimal.class);
+            java.math.BigDecimal iva = r.getObject("importoIva", java.math.BigDecimal.class);
+
+            Assertions.assertEquals(0, lordo.compareTo(imponibile.add(iva)),
+                    "imponibile + iva deve ricostruire il lordo per " + caso[0] + " @ " + caso[1]);
+
+            java.math.BigDecimal aliquotaImplicita = iva.divide(imponibile, 4, java.math.RoundingMode.HALF_UP);
+            Assertions.assertEquals(0, new java.math.BigDecimal(caso[1]).compareTo(
+                            aliquotaImplicita.setScale(2, java.math.RoundingMode.HALF_UP)),
+                    "iva/imponibile deve dare l'aliquota nominale, non l'aliquota gonfiata: "
+                            + caso[0] + " @ " + caso[1] + " -> " + aliquotaImplicita);
+        }
+    }
+
+    private String buildCreateRequestConIva(String tipo, String importo, String aliquota) {
+        return """
+                {"tipo":"%s","importo":%s,"aliquotaIva":%s,
+                 "dataMovimento":"2025-06-01","dataFinanziaria":"2025-06-01",
+                 "contoBancarioId":1,
+                 "metodoPagamentoId":%d,"businessUnitId":1,"contoCoge":%d,
+                 "descrizione":"Test scorporo IVA"}
+                """.formatted(tipo, importo, aliquota,
+                validMetodoPagamento, validContoCoge);
+    }
+
+    // ── data_competenza e PUT full-overwrite ──────────────────────────────────
+
+    /**
+     * Il PUT e' full-overwrite e dataCompetenza NON e' fra i campi protetti dal mapper:
+     * un client che la omette la azzera. mv_conto_economico_mensile filtra
+     * "data_competenza IS NOT NULL" (V3), quindi il movimento sparirebbe dal Conto
+     * Economico restando nei saldi e nella dashboard — senza alcun errore.
+     * @PrePersist copre solo la CREAZIONE, non l'update.
+     */
+    @Test
+    @Order(133)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void testUpdateSenzaDataCompetenzaNonSpariceDalContoEconomico() {
+        String id = given()
+            .contentType(ContentType.JSON)
+            .body(buildCreateRequest("ENTRATA", "100.00", "Competenza da preservare", null))
+            .when().post("/api/movimenti")
+            .then().statusCode(201).extract().path("id");
+
+        given()
+            .contentType(ContentType.JSON)
+            .body("""
+                    {"tipo":"ENTRATA","importo":100.00,"dataMovimento":"2025-06-01",
+                     "dataFinanziaria":"2025-06-01",
+                     "contoBancarioId":1,"metodoPagamentoId":%d,
+                     "businessUnitId":1,"contoCoge":%d,
+                     "descrizione":"Aggiornata senza dataCompetenza"}
+                    """.formatted(validMetodoPagamento, validContoCoge))
+            .when().put("/api/movimenti/" + id)
+            .then().statusCode(200);
+
+        Number visibiliNelPl = (Number) em.createNativeQuery(
+                        "SELECT count(*) FROM movimenti WHERE id = CAST(:id AS uuid) "
+                                + "AND stato <> 'ANNULLATO' AND data_competenza IS NOT NULL")
+                .setParameter("id", id)
+                .getSingleResult();
+
+        Assertions.assertEquals(1, visibiliNelPl.intValue(),
+                "dopo un PUT che omette dataCompetenza il movimento deve restare "
+                        + "visibile in mv_conto_economico_mensile (data_competenza NOT NULL)");
+    }
 }

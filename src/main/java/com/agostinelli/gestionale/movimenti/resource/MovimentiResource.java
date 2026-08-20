@@ -153,6 +153,21 @@ public class MovimentiResource {
         return service.assegnaContoBancario(id, req.contoBancarioId());
     }
 
+    /**
+     * Divide un movimento cumulativo (RiBa/effetti) in N quote — spec riba-split-importo.
+     * ADMIN-only: sposta euro veri fra conti CoGe e business unit.
+     */
+    @POST
+    @Path("/{id}/dividi")
+    @RolesAllowed("ADMIN")
+    public java.util.List<MovimentoDTO> dividi(
+            @PathParam("id") UUID id,
+            @Valid DividiMovimentoRequest req,
+            @Context SecurityContext ctx) {
+        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
+        return service.dividiMovimento(id, req, userId);
+    }
+
     @DELETE
     @Path("/{id}")
     @RolesAllowed("ADMIN")

@@ -49,6 +49,7 @@ public class PianoContiCogeRepository implements PanacheRepositoryBase<PianoCont
         String codice = req.codice().trim();
         validaTipo(req.tipo());
         validaParent(req.parentId(), null);
+        validaCoerenzaCodice(codice, req.parentId());
         if (esisteCodice(codice, null)) {
             throw new ApiException(Response.Status.CONFLICT, "CODICE_DUPLICATO",
                     "Esiste già un conto con codice " + codice);
@@ -82,6 +83,7 @@ public class PianoContiCogeRepository implements PanacheRepositoryBase<PianoCont
         String nuovoCodice = req.codice().trim();
         validaTipo(req.tipo());
         validaParent(req.parentId(), id);
+        validaCoerenzaCodice(nuovoCodice, req.parentId());
         if (esisteCodice(nuovoCodice, id)) {
             throw new ApiException(Response.Status.CONFLICT, "CODICE_DUPLICATO",
                     "Esiste già un altro conto con codice " + nuovoCodice);
@@ -190,6 +192,29 @@ public class PianoContiCogeRepository implements PanacheRepositoryBase<PianoCont
                 Object pid = res.isEmpty() ? null : res.get(0);
                 cur = pid == null ? null : ((Number) pid).intValue();
             }
+        }
+    }
+
+    /**
+     * Coerenza gerarchia ↔ codice: il padre di {@code 40.15.002} deve essere {@code 40.15}.
+     * Senza questa guardia un conto imputabile diventa padre di un altro e sparisce in silenzio da
+     * TUTTI i picker (il picker offre solo le foglie) — è il difetto trovato in produzione il
+     * 19/08/2026 su «Commissioni Alveare», appesa 40.15.002 al posto di 40.15.
+     * ponytail: non si valida il caso parentId == null (conto radice), anche con codice puntato:
+     * oggi 0 righe così e la decisione su quei conti è dell'utente (spec coge-01, R7).
+     */
+    private void validaCoerenzaCodice(String codice, Integer parentId) {
+        if (parentId == null) return;
+        int taglio = codice.lastIndexOf('.');
+        String atteso = taglio < 0 ? "" : codice.substring(0, taglio);
+        String codicePadre = (String) em.createNativeQuery(
+                "SELECT codice FROM piano_dei_conti_coge WHERE id = :id")
+                .setParameter("id", parentId).getSingleResult();
+        if (!codicePadre.equals(atteso)) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "PARENT_INCOERENTE",
+                    "Il padre di " + codice + " deve avere codice "
+                            + (atteso.isEmpty() ? "(nessuno: codice senza livelli)" : atteso)
+                            + ", non " + codicePadre);
         }
     }
 

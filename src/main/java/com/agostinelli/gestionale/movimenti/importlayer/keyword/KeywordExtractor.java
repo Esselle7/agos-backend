@@ -220,7 +220,12 @@ public final class KeywordExtractor {
         return nomi;
     }
 
-    private static boolean valida(FirmaCandidata f) {
+    /**
+     * §3A — una firma vale se ha ≥2 token <i>oppure</i> ≥1 token forte (IDENTITÀ/CODICE/DOMINIO).
+     * Pubblica perché la stessa regola va riapplicata <b>dopo</b> che l'operatore ha spento dei
+     * token nel wizard, non solo all'estrazione.
+     */
+    public static boolean valida(FirmaCandidata f) {
         int significativi = f.token().size();
         boolean forte = f.token().stream().anyMatch(t ->
                 t.tipo() == TipoToken.IDENTITA || t.tipo() == TipoToken.CODICE || t.tipo() == TipoToken.DOMINIO);

@@ -3,7 +3,12 @@ package com.agostinelli.gestionale.movimenti;
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.movimenti.dto.ClassificaTransitorioRequest;
 import com.agostinelli.gestionale.movimenti.dto.TransitorioDTO;
+import com.agostinelli.gestionale.movimenti.dto.ClassificaTransitorioRequest.FirmaSceltaDTO;
+import com.agostinelli.gestionale.movimenti.importlayer.DescNormalizer;
 import com.agostinelli.gestionale.movimenti.importlayer.ImportTriageService;
+import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordClassificazioneEngine;
+import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordExtractor;
+import com.agostinelli.gestionale.movimenti.importlayer.parser.Sorgente;
 import com.agostinelli.gestionale.movimenti.importlayer.MovimentoImportService;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.quarkus.test.junit.QuarkusTest;
@@ -39,6 +44,7 @@ class RicatalogazioneIntegrationTest {
     @Inject MovimentoImportService importService;
     @Inject ImportTriageService triage;
     @Inject EntityManager em;
+    @Inject KeywordClassificazioneEngine keywordEngine;
 
     @BeforeAll
     static void checkFixtures() {
@@ -297,6 +303,135 @@ class RicatalogazioneIntegrationTest {
         QuarkusTransaction.requiringNew().run(() -> triage.classificaTransitorio(riga.id(),
                 new ClassificaTransitorioRequest(cogeId("40.05.002"), (short) 5, null, false, null)));
         assertEquals(prima, contaFirme(), "da una causale senza intestatario non nasce nessuna firma");
+    }
+
+    // ── Keyword modificabili prima dell'apprendimento (SPEC omonima) ──────────────
+
+    /**
+     * R4 — quello che si vede è quello che si scrive. Accorciata la firma a una parola sola, a DB
+     * c'è ESATTAMENTE quella e NON c'è quella che l'estrattore avrebbe prodotto.
+     *
+     * <p>È l'invariante che rende la feature diversa da un placebo: senza questo, spegnere un chip
+     * cambierebbe solo il disegno a schermo e il sistema imparerebbe comunque la firma lunga.
+     */
+    @Test
+    void iTokenSpentiNonFinisconoNellaFirma() throws Exception {
+        importa();
+        TransitorioDTO riga = triage.listTransitori(null, 0, 2000).content().stream()
+                .filter(r -> r.firmeDaImparare().stream().anyMatch(f -> f.token().size() >= 2))
+                .findFirst().orElse(null);
+        Assumptions.assumeTrue(riga != null, "nessuna riga con una firma da >=2 token nelle fixture");
+
+        List<String> intera = riga.firmeDaImparare().stream()
+                .filter(f -> f.token().size() >= 2).findFirst().orElseThrow().token();
+        List<String> accorciata = List.of(intera.get(0));
+
+        QuarkusTransaction.requiringNew().run(() -> triage.classificaTransitorio(riga.id(),
+                new ClassificaTransitorioRequest(cogeId("40.05.002"), (short) 5, null, true,
+                        List.of(new FirmaSceltaDTO(accorciata)), null)));
+
+        assertEquals(1L, firmeConTokenEsatti(accorciata),
+                "la firma accorciata " + accorciata + " deve esistere a DB, esattamente una volta");
+        assertEquals(0L, firmeConTokenEsatti(intera),
+                "la firma intera " + intera + " è stata spenta dall'operatore: non deve nascere");
+    }
+
+    /**
+     * R5 — un token che non sta nella causale è 400, e NON lascia il movimento spostato.
+     *
+     * <p>Non è pedanteria: il match è in AND sul token-set della riga, quindi una firma con dentro
+     * una parola che lì non c'è non scatterebbe MAI — esisterebbe a DB senza fare niente, e
+     * nessuno se ne accorgerebbe.
+     */
+    @Test
+    void unTokenInventatoE400ENonSpostaIlMovimento() throws Exception {
+        importa();
+        TransitorioDTO riga = triage.listTransitori(null, 0, 2000).content().stream()
+                .filter(r -> !r.firmeDaImparare().isEmpty())
+                .findFirst().orElse(null);
+        Assumptions.assumeTrue(riga != null, "nessuna riga con firme da imparare nelle fixture");
+
+        Integer cogePrima = cogeDi(riga.id());
+        long firmePrima = contaFirme();
+        ApiException e = assertThrows(ApiException.class, () -> QuarkusTransaction.requiringNew().run(() ->
+                triage.classificaTransitorio(riga.id(), new ClassificaTransitorioRequest(
+                        cogeId("40.05.002"), (short) 5, null, true,
+                        List.of(new FirmaSceltaDTO(List.of("ZZQUESTAPAROLANONESISTE"))), null))));
+        assertEquals("TOKEN_NON_NELLA_CAUSALE", e.getCode());
+        assertEquals(cogePrima, cogeDi(riga.id()), "il 400 non deve lasciare il movimento spostato");
+        assertEquals(firmePrima, contaFirme(), "e nemmeno scrivere firme");
+    }
+
+    /**
+     * R6 — la regola di validità (§3A: ≥2 token oppure ≥1 forte) si riapplica DOPO la modifica,
+     * non solo all'estrazione. Una parola generica da sola non è una firma.
+     */
+    @Test
+    void unaFirmaRidottaAUnaParolaGenericaE400() throws Exception {
+        importa();
+        TransitorioDTO riga = null;
+        String generica = null;
+        for (TransitorioDTO r : triage.listTransitori(null, 0, 2000).content()) {
+            String tk = primoTokenNormale(r);
+            if (tk != null) { riga = r; generica = tk; break; }
+        }
+        Assumptions.assumeTrue(riga != null, "nessuna riga con un token NORMALE nelle fixture");
+
+        final UUID id = riga.id();
+        final String tk = generica;
+        ApiException e = assertThrows(ApiException.class, () -> QuarkusTransaction.requiringNew().run(() ->
+                triage.classificaTransitorio(id, new ClassificaTransitorioRequest(
+                        cogeId("40.05.002"), (short) 5, null, true,
+                        List.of(new FirmaSceltaDTO(List.of(tk))), null))));
+        assertEquals("FIRMA_NON_VALIDA", e.getCode());
+    }
+
+    /** Tutti i chip spenti: la riga si cataloga lo stesso e non nasce nessuna firma. */
+    @Test
+    void conTutteLeFirmeSpenteNonNasceNienteMaLaRigaSiCataloga() throws Exception {
+        importa();
+        TransitorioDTO riga = triage.listTransitori(null, 0, 2000).content().stream()
+                .filter(r -> !r.firmeDaImparare().isEmpty())
+                .findFirst().orElse(null);
+        Assumptions.assumeTrue(riga != null, "nessuna riga con firme da imparare nelle fixture");
+
+        long prima = contaFirme();
+        // `apprendiKeyword=true` ma lista vuota: la lista vince (I1), altrimenti due sorgenti per
+        // la stessa domanda potrebbero dire cose diverse.
+        QuarkusTransaction.requiringNew().run(() -> triage.classificaTransitorio(riga.id(),
+                new ClassificaTransitorioRequest(cogeId("40.05.002"), (short) 5, null, true,
+                        List.of(), null)));
+        assertEquals(prima, contaFirme(), "l'operatore ha spento tutto: non deve nascere nessuna firma");
+        assertEquals(cogeId("40.05.002"), cogeDi(riga.id()), "ma la riga si cataloga lo stesso");
+    }
+
+    /** Il token duplicato nella lista non rompe niente: la signature è su un insieme ordinato. */
+    @Test
+    void unTokenRipetutoNonRompeLApprendimento() throws Exception {
+        importa();
+        TransitorioDTO riga = triage.listTransitori(null, 0, 2000).content().stream()
+                .filter(r -> !r.firmeDaImparare().isEmpty())
+                .findFirst().orElse(null);
+        Assumptions.assumeTrue(riga != null, "nessuna riga con firme da imparare nelle fixture");
+        List<String> t = riga.firmeDaImparare().get(0).token();
+
+        QuarkusTransaction.requiringNew().run(() -> triage.classificaTransitorio(riga.id(),
+                new ClassificaTransitorioRequest(cogeId("40.05.002"), (short) 5, null, true,
+                        List.of(new FirmaSceltaDTO(List.of(t.get(0), t.get(0)))), null)));
+        assertEquals(1L, firmeConTokenEsatti(List.of(t.get(0))));
+    }
+
+    /** Il primo token NORMALE (parola generica, non un nome) della causale di questa riga. */
+    private String primoTokenNormale(TransitorioDTO r) {
+        String sorgente = r.contoBancarioId() == null ? Sorgente.CA
+                : (r.contoBancarioId() == 1 ? Sorgente.BPM
+                : (r.contoBancarioId() == 2 ? Sorgente.CA : Sorgente.BILLY));
+        return KeywordExtractor.classifica(r.descrizione(),
+                        DescNormalizer.extract(r.descrizione(), sorgente),
+                        keywordEngine.stopwords(), keywordEngine.domainTokens()).stream()
+                .filter(t -> t.tipo() == KeywordExtractor.TipoToken.NORMALE)
+                .map(KeywordExtractor.TokenTipizzato::token)
+                .findFirst().orElse(null);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────────

@@ -4,12 +4,12 @@ import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.movimenti.importlayer.model.RawMovimento;
 import com.agostinelli.gestionale.movimenti.importlayer.model.RawRow;
 import com.agostinelli.gestionale.movimenti.importlayer.parser.Sorgente;
+import com.agostinelli.gestionale.movimenti.importlayer.parser.Valori;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.core.Response;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -24,7 +24,6 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class MovimentoNormalizerImpl implements MovimentoNormalizer {
 
-    private static final DateTimeFormatter IT_DATE = DateTimeFormatter.ofPattern("dd/MM/yyyy");
     private static final Pattern STRIPE_DATE = Pattern.compile("PO(\\d{4})(\\d{2})(\\d{2})", Pattern.CASE_INSENSITIVE);
 
     // Data reale dell'incasso POS, riportata nella descrizione banca come "... DEL gg/mm/aa[aa]".
@@ -120,7 +119,9 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
         BigDecimal importo = abs(segnato);
         String tipo = (segnato != null && segnato.signum() < 0) ? "USCITA" : "ENTRATA";
         String descrizione = clean(c.get("DESCRIZIONE"));
-        String causale = trimToEmpty(c.get("CAUSALE")).toUpperCase();
+        // Causale canonica a 3 cifre: un foglio di calcolo mangia lo zero iniziale ("092" → "92")
+        // e senza il padding metodoBpm non riconosce più l'incasso POS (R3/R4 della SPEC).
+        String causale = Valori.causaleBanca(trimToEmpty(c.get("CAUSALE"))).toUpperCase();
 
         String metodo = metodoBpm(causale);
 
@@ -274,8 +275,12 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
         if (s.isEmpty() || s.equalsIgnoreCase("#N/A") || s.equalsIgnoreCase("NA")) return null;
         s = s.replace(".", "").replace(",", ".");
         try {
-            return new BigDecimal(s);
-        } catch (NumberFormatException e) {
+            // Scala fissa a 2: un importo bancario ha sempre i centesimi. Excel scrive "400,7"
+            // dove il CSV ha "400,70" e la scala finisce dentro riferimento_esterno (rifBanca usa
+            // toPlainString): senza normalizzarla la stessa riga produce due chiavi di dedup
+            // diverse e il dedup del prossimo import non la riconosce più.
+            return new BigDecimal(s).setScale(2, java.math.RoundingMode.HALF_UP);
+        } catch (NumberFormatException | ArithmeticException e) {
             return null;
         }
     }
@@ -299,13 +304,14 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
         }
     }
 
+    /**
+     * Data banca → {@link LocalDate}, delegata a {@link Valori#parseAnyDate}: i formati li
+     * conosce un posto solo. Prima qui c'era un {@code LocalDate.parse(s, "dd/MM/yyyy")} locale
+     * e le code (che ri-normalizzano il grezzo a ogni lettura, senza ripassare dai parser)
+     * restavano cieche a un anno a 2 cifre — 62 righe BPM di luglio 2026 ferme senza data.
+     */
     private LocalDate parseItDate(String s) {
-        if (s == null || s.isBlank()) return null;
-        try {
-            return LocalDate.parse(s.trim(), IT_DATE);
-        } catch (Exception e) {
-            return null;
-        }
+        return Valori.parseAnyDate(s);
     }
 
     private LocalDate extractStripeDate(String descrizione) {

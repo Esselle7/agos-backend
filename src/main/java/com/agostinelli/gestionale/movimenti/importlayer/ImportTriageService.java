@@ -141,14 +141,15 @@ public class ImportTriageService {
                 "  (SELECT COUNT(*) FROM movimenti m JOIN piano_dei_conti_coge p ON p.id = m.conto_coge_id " +
                 "    WHERE p.codice IN ('" + COGE_RICAVI_DACLASS + "','" + COGE_COSTI_DACLASS + "') " +
                 "      AND m.stato <> 'ANNULLATO'), " +
+                "  (SELECT COUNT(*) FROM import_ambiguita WHERE stato = 'DA_CLASSIFICARE'), " +
                 "  (SELECT COUNT(*) FROM ricorrenti_da_riconciliare WHERE stato = 'DA_RICONCILIARE'), " +
                 "  (SELECT COUNT(*) FROM eventi_da_riconciliare WHERE stato = 'DA_RICONCILIARE'), " +
                 "  (SELECT COUNT(*) FROM matching_differiti WHERE stato = 'DA_RICONCILIARE'), " +
                 "  (SELECT COUNT(*) FROM import_scartati WHERE stato = 'DA_VEDERE'), " +
                 "  (SELECT id FROM import_log ORDER BY data_import DESC LIMIT 1)")
                 .getSingleResult();
-        return new ImportBadgeDTO(num(r[0]), num(r[1]), num(r[2]), num(r[3]), num(r[4]),
-                r[5] == null ? null : toUuid(r[5]));
+        return new ImportBadgeDTO(num(r[0]), num(r[1]), num(r[2]), num(r[3]), num(r[4]), num(r[5]),
+                r[6] == null ? null : toUuid(r[6]));
     }
 
     // I suggerimenti basati sulla rubrica controparti (IBAN/fuzzy) sono rimossi con la dismissione
@@ -917,7 +918,8 @@ public class ImportTriageService {
     public void risolviEvento(UUID eventoParkId, RisolviEventoRequest req, UUID userId) {
         List<Object[]> found = em.createNativeQuery(
                 "SELECT import_log_id, fonte, data_movimento, importo, tipo, conto_bancario_id, " +
-                "descrizione_norm, stato, controparte_nome, data_evento_estratta, tipo_evento_presunto " +
+                "descrizione_norm, stato, controparte_nome, data_evento_estratta, tipo_evento_presunto, " +
+                "CAST(raw_data AS text) " +
                 "FROM eventi_da_riconciliare WHERE id = :id")
                 .setParameter("id", eventoParkId).getResultList();
         if (found.isEmpty()) {
@@ -1040,7 +1042,7 @@ public class ImportTriageService {
         }
 
         BigDecimal importo    = (BigDecimal) e[3];
-        LocalDate dataMov     = ((java.sql.Date) e[2]).toLocalDate();
+        LocalDate dataMov     = dataMovimentoOThrow(e[2], (String) e[11]);
         Short conto           = ((Number) e[5]).shortValue();
         String controparte    = (String) e[8];
         LocalDate dataEvento  = e[9] == null ? null : ((java.sql.Date) e[9]).toLocalDate();
@@ -1120,7 +1122,7 @@ public class ImportTriageService {
         String where = "FROM ricorrenti_da_riconciliare WHERE (CAST(:stato AS VARCHAR) IS NULL OR stato = :stato)";
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT id, fonte, data_movimento, importo, tipo, conto_bancario_id, descrizione_norm, " +
-                "tipo_presunto, recurring_plan_id, stato " + where +
+                "tipo_presunto, recurring_plan_id, stato, raw_data " + where +
                 " ORDER BY data_movimento, id LIMIT :size OFFSET :offset")
                 .setParameter("stato", stato).setParameter("size", size).setParameter("offset", (long) page * size)
                 .getResultList();
@@ -1140,7 +1142,11 @@ public class ImportTriageService {
             Object[] r = rows.get(i);
             String codiceSugg = codiciSugg.get(i);
             Integer idSugg = codiceSugg == null ? null : idByCodice.get(codiceSugg);
-            LocalDate dataMov = r[2] == null ? null : ((java.sql.Date) r[2]).toLocalDate();
+            // La data si ri-deriva dal grezzo quando la colonna è NULL, ESATTAMENTE come fanno
+            // COLLEGA e CONFERMA (dataMovimentoOThrow): altrimenti la lista dice «senza data» su
+            // una riga che il server sa datare, e il matcher — che senza data non può misurare lo
+            // scarto dalla scadenza — non propone mai nessuna rata.
+            LocalDate dataMov = dataMovimentoODerivata(r[2], (String) r[10]);
             Short conto = r[5] == null ? null : ((Number) r[5]).shortValue();
             RataMatcher.Esito esito = "USCITA".equals((String) r[4])
                     ? RataMatcher.valuta(conto, (BigDecimal) r[3], dataMov, (String) r[6], piani)
@@ -1180,7 +1186,8 @@ public class ImportTriageService {
     @Transactional
     public void risolviRicorrente(UUID id, RisolviRicorrenteRequest req, UUID userId) {
         List<Object[]> found = em.createNativeQuery(
-                "SELECT stato, import_log_id, data_movimento, importo, tipo, conto_bancario_id, descrizione_norm " +
+                "SELECT stato, import_log_id, data_movimento, importo, tipo, conto_bancario_id, descrizione_norm, " +
+                "CAST(raw_data AS text) " +
                 "FROM ricorrenti_da_riconciliare WHERE id = :id").setParameter("id", id).getResultList();
         if (found.isEmpty()) throw new ApiException(Response.Status.NOT_FOUND, "RICORRENTE_NON_TROVATA", "Ricorrente " + id);
         Object[] r = found.get(0);
@@ -1227,7 +1234,7 @@ public class ImportTriageService {
             throw new ApiException(Response.Status.BAD_REQUEST, "COLLEGA_SOLO_USCITE",
                     "Un'entrata (erogazione) non è una rata: usa CONFERMA");
         }
-        LocalDate dataAddebito = r[2] == null ? null : ((java.sql.Date) r[2]).toLocalDate();
+        LocalDate dataAddebito = dataMovimentoOThrow(r[2], (String) r[7]);
 
         // L'importo reale si legge QUI dalla riga parcheggiata, non dal client: è il dato certo
         // dell'estratto conto e sovrascrive la stima del piano (SPEC ricorrenti-importo-reale-da-import).
@@ -1251,7 +1258,7 @@ public class ImportTriageService {
     /** Crea il movimento contabile da una riga ricorrente confermata e la marca CONFERMATA. */
     private void confermaRicorrente(UUID id, Object[] r, RisolviRicorrenteRequest req, UUID userId) {
         UUID importLogId = toUuid(r[1]);
-        LocalDate data = r[2] == null ? null : ((java.sql.Date) r[2]).toLocalDate();
+        LocalDate data = dataMovimentoOThrow(r[2], (String) r[7]);
         BigDecimal importo = (BigDecimal) r[3];
         String tipo = (String) r[4];
         Short conto = r[5] == null ? null : ((Number) r[5]).shortValue();
@@ -1261,11 +1268,6 @@ public class ImportTriageService {
             throw new ApiException(Response.Status.BAD_REQUEST, "IMPORTO_NON_VALIDO",
                     "L'importo della ricorrente deve essere maggiore di zero");
         }
-        if (data == null) {
-            throw new ApiException(Response.Status.BAD_REQUEST, "DATA_MANCANTE",
-                    "La riga ricorrente non ha una data movimento da usare per il movimento");
-        }
-
         Integer cogeId;
         String metodoCodice;
         if ("ENTRATA".equals(tipo)) {
@@ -1463,6 +1465,31 @@ public class ImportTriageService {
             throw new ApiException(Response.Status.CONFLICT, "SCARTATO_GIA_RISOLTO",
                     "Questa riga è già stata decisa");
         }
+    }
+
+    /**
+     * Data del movimento di una riga parcheggiata: prima la colonna, poi — se è NULL — il grezzo,
+     * ri-normalizzato come già fanno le code ambiguità/scartati (I3: si ri-deriva, non si inventa).
+     *
+     * <p>Perché esiste: fino al 20/08/2026 qui c'era un {@code ((java.sql.Date) e[2]).toLocalDate()}
+     * senza guardia e una riga senza data faceva 500 (NPE) invece di dire cosa mancava — 2 incassi
+     * evento e 1 rata mutuo di luglio 2026, tutte con la data buona dentro il {@code raw_data}.
+     * Se nemmeno il grezzo la produce, 400 parlante: mai il 500.
+     */
+    /** Come {@link #dataMovimentoOThrow} ma per la sola lettura: null invece dell'eccezione. */
+    private LocalDate dataMovimentoODerivata(Object colonna, String rawJson) {
+        if (colonna != null) return ((java.sql.Date) colonna).toLocalDate();
+        var n = rawJson == null ? null : rinormalizza(rawJson, 0);
+        return n == null ? null : n.dataMovimento();
+    }
+
+    private LocalDate dataMovimentoOThrow(Object colonna, String rawJson) {
+        if (colonna != null) return ((java.sql.Date) colonna).toLocalDate();
+        var n = rawJson == null ? null : rinormalizza(rawJson, 0);
+        if (n != null && n.dataMovimento() != null) return n.dataMovimento();
+        throw new ApiException(Response.Status.BAD_REQUEST, "DATA_MOVIMENTO_MANCANTE",
+                "Questa riga non ha una data né in tabella né nel grezzo dell'estratto conto: "
+                + "va inserita a mano dalla pagina Movimenti.");
     }
 
     /**

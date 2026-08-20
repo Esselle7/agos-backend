@@ -191,6 +191,71 @@ public class MovimentiService {
         mvRefresh.requestRefreshAfterCommit();
     }
 
+    // ── CESTINA (purga fisica di un movimento ANNULLATO) ──────────────────────
+    // Spec: docs/specs/movimento-cestina-fisica.md
+
+    /**
+     * Toglie DAVVERO la riga da {@code movimenti}. Irreversibile in tabella, ma non nella storia:
+     * il trigger {@code trg_audit_movimenti} scrive l'intera riga in {@code audit_log.dati_precedenti}.
+     *
+     * <p><b>Perché serve l'annullamento prima (I1):</b> {@code mv_saldi_conti} somma solo i
+     * movimenti con {@code stato <> 'ANNULLATO'}. Su una riga già annullata la cancellazione fisica
+     * vale zero euro su ogni saldo — il denaro si è mosso quando è stata annullata. Il due-passi non
+     * è burocrazia: è ciò che rende l'operazione priva di effetti contabili.
+     *
+     * <p><b>Perché la guardia sui riferimenti (I2):</b> {@code movimenti} è partizionata e <b>non ha
+     * FK in ingresso</b> (verificato: 0 righe in {@code pg_constraint}), quindi il database non
+     * protegge niente. Dieci colonne di nove tabelle puntano ai movimenti per id: se una di loro
+     * punta a questa riga, cancellarla lascerebbe un orfano silenzioso — una rata PAID senza la sua
+     * scrittura, una riga d'import che dice «già a libro» indicando il vuoto.
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @Transactional
+    public void cestinaMovimento(UUID id) {
+        Movimento m = repo.findById(id);
+        if (m == null) {
+            throw new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND", "Movimento non trovato");
+        }
+        if (!"ANNULLATO".equals(m.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "MOVIMENTO_NON_ANNULLATO",
+                    "La cestina è consentita solo su un movimento ANNULLATO (stato attuale: "
+                    + m.stato + "): annullalo prima, così il saldo si muove una volta sola.");
+        }
+        List<String> refs = riferimentiA(m);
+        if (!refs.isEmpty()) {
+            throw new ApiException(Response.Status.CONFLICT, "MOVIMENTO_REFERENZIATO",
+                    "Questo movimento è ancora collegato a: " + String.join(", ", refs)
+                    + ". Sciogli il collegamento prima di cestinarlo.");
+        }
+        repo.delete(m);
+        mvRefresh.requestRefreshAfterCommit();
+    }
+
+    /** Chi punta a questo movimento, detto in italiano. Vuoto = si può cestinare. */
+    @SuppressWarnings("unchecked")
+    private List<String> riferimentiA(Movimento m) {
+        List<String> refs = new ArrayList<>();
+        // Questi due li porta il movimento stesso: nessuna query serve.
+        if (m.eventoId != null)  refs.add("un evento");
+        if (m.cespiteId != null) refs.add("un cespite");
+        // Le altre nove colonne stanno su altre tabelle e nessuna FK le difende: una query sola.
+        refs.addAll(em.createNativeQuery(
+                "SELECT 'una rata di un piano ricorrente' WHERE EXISTS (SELECT 1 FROM recurring_expense_installment WHERE movimento_id = :id OR movimento_interessi_id = :id)" +
+                " UNION ALL SELECT 'la penale di un piano ricorrente' WHERE EXISTS (SELECT 1 FROM recurring_expense_plan WHERE movimento_penale_id = :id)" +
+                " UNION ALL SELECT 'un costo diretto di evento'       WHERE EXISTS (SELECT 1 FROM evento_costi_diretti WHERE movimento_id = :id)" +
+                " UNION ALL SELECT 'un pagamento di evento'           WHERE EXISTS (SELECT 1 FROM evento_partecipanti WHERE movimento_id = :id)" +
+                " UNION ALL SELECT 'una riga della coda ricorrenti'   WHERE EXISTS (SELECT 1 FROM ricorrenti_da_riconciliare WHERE movimento_id = :id)" +
+                " UNION ALL SELECT 'una riga ambigua dell''import'    WHERE EXISTS (SELECT 1 FROM import_ambiguita WHERE movimento_id = :id)" +
+                " UNION ALL SELECT 'una riga scartata dell''import'   WHERE EXISTS (SELECT 1 FROM import_scartati WHERE movimento_id = :id)" +
+                " UNION ALL SELECT 'un matching differito'            WHERE EXISTS (SELECT 1 FROM matching_differiti WHERE movimento_id = :id)" +
+                " UNION ALL SELECT 'un conflitto di keyword'          WHERE EXISTS (SELECT 1 FROM keyword_conflitto WHERE movimento_id = :id)" +
+                " UNION ALL SELECT 'una firma di keyword appresa'     WHERE EXISTS (SELECT 1 FROM keyword_firma WHERE movimento_origine_id = :id)")
+                .setParameter("id", m.id).getResultList());
+        return refs;
+    }
+
 
     // ── DIVISIONE DI UN MOVIMENTO CUMULATIVO ──────────────────────────────────
     // Spec: docs/specs/debug-con-cliente/riba-split-importo.md

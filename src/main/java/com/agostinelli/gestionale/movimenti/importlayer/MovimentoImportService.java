@@ -59,6 +59,7 @@ public class MovimentoImportService {
     @Inject ObjectMapper objectMapper;
     @Inject com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService keywordLearning;
     @Inject MatchingDifferitiService matchingDifferitiService;
+    @Inject ContatoreImportService contatore;
     @Inject ImportAuditLog audit;   // AUDIT-TEMP: traccia decisionale su file, vedi ImportAuditLog
 
     /**
@@ -429,6 +430,223 @@ public class MovimentoImportService {
                 "ambiguitaEliminate", ambiguita,
                 "ricorrentiEliminate", ricorrenti,
                 "matchingDifferitiEliminati", matchingDifferiti);
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // ponytail: TEMPORANEO — SPEC docs/specs/bpm-luglio-2026-recupero.md R8/R14.
+    // Serve a smaltire UN arretrato: le righe BPM di luglio 2026 rimaste in coda perché
+    // l'estratto conto era passato da un foglio di calcolo (date senza secolo → nessuna data
+    // → nessun movimento). Il motore di mapping gira solo dentro importCongiunto: le righe
+    // già in coda non le rilegge nessuno, quindi serve un innesco esplicito.
+    // Il ramo di smistamento qui sotto RIPETE quello di importCongiunto: è una copia voluta,
+    // per non rifattorizzare il percorso-soldi al servizio di codice che ha una data di morte.
+    // DA RIMUOVERE (con l'endpoint e il bottone) quando l'arretrato è smaltito.
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /** Una riga ancora aperta in coda, con il grezzo da cui si ri-deriva tutto (I3). */
+    private record Aperta(String tabella, UUID id, int riga, String rawJson) {}
+
+    /**
+     * Ri-processa le righe ancora APERTE di un import: ri-normalizza il grezzo e lo rimanda nel
+     * motore di mapping, così ogni riga finisce dove sarebbe finita il primo giorno.
+     *
+     * <p>Solo le righe della sorgente BPM: il difetto è del file BPM e il Crédit Agricole di
+     * questo import è corretto così com'è (invariante I4 della SPEC — CA non si tocca).
+     *
+     * <p>Idempotente: ogni riga si chiude con un claim atomico (WHERE stato = …) e il dedup sul
+     * riferimento esterno impedisce il doppione anche se l'azione viene rilanciata.
+     *
+     * @param dryRun true = calcola e riporta il destino di ogni riga senza scrivere nulla.
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @CacheInvalidateAll(cacheName = "import-kpi")
+    @Transactional
+    public Map<String, Object> riprocessaCoda(UUID importLogId, UUID userId, boolean dryRun) {
+        long esiste = ((Number) em.createNativeQuery(
+                "SELECT count(*) FROM import_log WHERE id = :id")
+                .setParameter("id", importLogId).getSingleResult()).longValue();
+        if (esiste == 0) {
+            throw new ApiException(Response.Status.NOT_FOUND, "IMPORT_NON_TROVATO",
+                    "Import log non trovato: " + importLogId);
+        }
+
+        List<Aperta> aperte = new ArrayList<>();
+        aperte.addAll(aperteDi("import_ambiguita", "DA_CLASSIFICARE", importLogId));
+        aperte.addAll(aperteDi("import_scartati", "DA_VEDERE", importLogId));
+
+        // ── ri-normalizzazione: il grezzo torna a parlare ──
+        Map<Integer, Aperta> perRiga = new java.util.LinkedHashMap<>();
+        List<RawMovimento> righeBpm = new ArrayList<>();
+        List<String> illeggibili = new ArrayList<>();
+        int chiave = 0;
+        for (Aperta ap : aperte) {
+            RawMovimento n = contatore.rinormalizza(ap.rawJson(), ++chiave);
+            if (n == null || n.dataMovimento() == null || n.importo() == null) {
+                // Edge case della SPEC: resta dov'è, con un motivo. Non sparisce.
+                illeggibili.add(ap.tabella() + " " + ap.id());
+                continue;
+            }
+            perRiga.put(chiave, ap);
+            righeBpm.add(n);
+        }
+
+        // ── stesso dataset dell'import, senza Billy: le righe POS restano orfane e si
+        //    contabilizzano come ricavo POS sul transitorio («da catalogare»), non si perdono. ──
+        DatasetRiconciliato ds = riconciliazione.riconcilia(List.of(), righeBpm, List.of());
+
+        Map<String, Integer> esiti = new java.util.LinkedHashMap<>();
+        List<String> dettaglio = new ArrayList<>();
+        Set<String> rifEsistenti = new java.util.HashSet<>(repo.findRifimentiEsterniByFonte("IMPORT_BANCA"));
+        rifEsistenti.addAll(repo.findRifimentiEsterniByFonte("IMPORT_BILLY"));
+        int movimentiCreati = 0;
+
+        for (RawMovimentoArricchito a : ds.daMappare()) {
+            RawMovimento n = a.banca();
+            RawRow raw = n.rawOriginale();
+            Aperta ap = perRiga.get(raw.riga());
+            if (ap == null) continue; // difensivo: ogni riga qui viene dalle code
+            MappingResult mapped = mappingEngine.map(a);
+            String esito;
+            UUID movimentoId = null;
+
+            if (mapped.outcome() == MappingResult.MappingOutcome.SKIP_RICORRENTE) {
+                esito = "RICORRENTE_PARCHEGGIATA";
+                if (!dryRun) { chiudiAperta(ap, null, esito, userId); salvaRicorrenteParcheggiata(importLogId, raw, n, n.fonte()); }
+            } else if (mapped.outcome() == MappingResult.MappingOutcome.PARK_EVENTO) {
+                esito = "EVENTO_PARCHEGGIATO";
+                if (!dryRun) {
+                    chiudiAperta(ap, null, esito, userId);
+                    if (!salvaEventoParcheggiato(importLogId, raw, n, mapped.park(), n.fonte())) {
+                        salvaScartato(importLogId, raw, n, "DUPLICATA", n.fonte(), "DUPLICATA");
+                    }
+                }
+            } else if (mapped.outcome().isSkip()) {
+                esito = "RESTA_FUORI_" + mapped.outcome();
+                // Era già uno scarto con lo stesso motivo → non si tocca nulla (idempotenza).
+                if (!dryRun && !"import_scartati".equals(ap.tabella())) {
+                    chiudiAperta(ap, null, esito, userId);
+                    salvaScartato(importLogId, raw, n, mapped.motivoAmbiguita(), n.fonte());
+                }
+            } else if (mapped.outcome() == MappingResult.MappingOutcome.AMBIGUOUS
+                    || mapped.outcome() == MappingResult.MappingOutcome.ERROR) {
+                esito = "AMBIGUA_" + mapped.motivoAmbiguita();
+                // Resta in coda ambiguità: cambia solo il motivo, che ora è quello vero.
+                if (!dryRun && "import_ambiguita".equals(ap.tabella())) {
+                    em.createNativeQuery("UPDATE import_ambiguita SET motivo = :m WHERE id = :id AND stato = 'DA_CLASSIFICARE'")
+                            .setParameter("m", mapped.motivoAmbiguita() == null ? "COGE_NON_DETERMINABILE" : mapped.motivoAmbiguita())
+                            .setParameter("id", ap.id()).executeUpdate();
+                } else if (!dryRun) {
+                    chiudiAperta(ap, null, esito, userId);
+                    salvaAmbiguita(importLogId, raw, n, mapped.motivoAmbiguita(), n.fonte());
+                }
+            } else {
+                MovimentoCreateRequest req = mapped.request();
+                String rif = req.riferimentoEsterno();
+                if (rif != null && !rif.isBlank() && rifEsistenti.contains(rif)) {
+                    esito = "DUPLICATA";
+                    if (!dryRun) { chiudiAperta(ap, null, esito, userId); salvaScartato(importLogId, raw, n, "DUPLICATA", n.fonte(), "DUPLICATA"); }
+                } else {
+                    esito = "A_LIBRO";
+                    if (!dryRun) {
+                        chiudiAperta(ap, null, esito, userId);   // claim PRIMA di creare il movimento
+                        movimentoId = movimentiService.createMovimentoImport(req, userId, importLogId).id();
+                        collegaMovimento(ap, movimentoId);
+                        if (rif != null && !rif.isBlank()) rifEsistenti.add(rif);
+                        movimentiCreati++;
+                    }
+                }
+            }
+            esiti.merge(esito, 1, Integer::sum);
+            dettaglio.add(raw.riga() + " · " + n.dataMovimento() + " · " + n.tipo() + " "
+                    + n.importo() + " · " + esito + (movimentoId == null ? "" : " → " + movimentoId));
+        }
+
+        // ── R14 — quadratura POS: le colonne BPM smettono di essere 0,00. La quota CA
+        //    (già assegnata dall'import vero) NON si tocca: I4. ──
+        int quadraturaAggiornata = 0;
+        if (!dryRun && ds.quadratura().sigmaBpm().signum() != 0) {
+            quadraturaAggiornata = em.createNativeQuery(
+                    "UPDATE quadratura_periodo SET sigma_bpm = :s, assegnato_bpm = :a, " +
+                    "pos_banca_totale = pos_banca_totale + :s, pos_banca_core = pos_banca_core + :s, " +
+                    "billy_contabilizzato = billy_contabilizzato + :a " +
+                    "WHERE import_log_id = :id AND sigma_bpm = 0")
+                    .setParameter("s", ds.quadratura().sigmaBpm())
+                    .setParameter("a", ds.quadratura().assegnatoBpm())
+                    .setParameter("id", importLogId).executeUpdate();
+        }
+
+        if (!dryRun && movimentiCreati > 0) mvRefresh.requestRefreshAfterCommit();
+        log.infof("Ri-processo coda import %s (dryRun=%s): %d righe aperte, %d rileggibili, "
+                        + "%d movimenti creati, esiti=%s, illeggibili=%s",
+                importLogId, dryRun, aperte.size(), righeBpm.size(), movimentiCreati, esiti, illeggibili);
+
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("importLogId", importLogId.toString());
+        out.put("dryRun", dryRun);
+        out.put("righeAperte", aperte.size());
+        out.put("righeRileggibili", righeBpm.size());
+        out.put("righeIlleggibili", illeggibili);
+        out.put("movimentiCreati", movimentiCreati);
+        out.put("esiti", esiti);
+        out.put("quadraturaPosAggiornata", quadraturaAggiornata);
+        out.put("sigmaBpm", ds.quadratura().sigmaBpm());
+        out.put("dettaglio", dettaglio);
+        return out;
+    }
+
+    /** Le righe di UNA coda ancora aperte per questo import, sorgente BPM soltanto (I4). */
+    @SuppressWarnings("unchecked")
+    private List<Aperta> aperteDi(String tabella, String statoAperto, UUID importLogId) {
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT id, riga_numero, CAST(raw_data AS text) FROM " + tabella +
+                " WHERE import_log_id = :id AND stato = :stato AND raw_data->>'_SORGENTE' = 'BPM' " +
+                " ORDER BY riga_numero")
+                .setParameter("id", importLogId).setParameter("stato", statoAperto).getResultList();
+        List<Aperta> out = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            UUID id = r[0] instanceof UUID u ? u : UUID.fromString(r[0].toString());
+            out.add(new Aperta(tabella, id, ((Number) r[1]).intValue(), (String) r[2]));
+        }
+        return out;
+    }
+
+    /**
+     * Chiude la riga d'origine con un claim ATOMICO: se qualcuno l'ha già lavorata nel frattempo
+     * la UPDATE vede 0 righe e si alza un 409 — mai due destini per la stessa riga bancaria (I1).
+     */
+    private void chiudiAperta(Aperta ap, UUID movimentoId, String esito, UUID userId) {
+        String sql = "import_ambiguita".equals(ap.tabella())
+                ? "UPDATE import_ambiguita SET stato = 'RIPROCESSATA', movimento_id = :mov, " +
+                  "classificato_da = :uid, classificato_at = now(), note_operatore = :nota " +
+                  "WHERE id = :id AND stato = 'DA_CLASSIFICARE'"
+                : "UPDATE import_scartati SET stato = 'RIPROCESSATA', movimento_id = :mov, " +
+                  "risolto_by = :uid, risolto_at = now(), note = :nota " +
+                  "WHERE id = :id AND stato = 'DA_VEDERE'";
+        int claimed = em.createNativeQuery(sql)
+                .setParameter("mov", movimentoId).setParameter("uid", userId)
+                .setParameter("nota", "ri-processata dopo il fix della data a 2 cifre → " + esito)
+                .setParameter("id", ap.id()).executeUpdate();
+        if (claimed == 0) {
+            throw new ApiException(Response.Status.CONFLICT, "RIGA_GIA_LAVORATA",
+                    "La riga " + ap.id() + " è stata lavorata da qualcun altro: rilancia il ri-processo");
+        }
+        // Stesso contatore che aggiorna la classificazione manuale: senza, lo Storico import
+        // continuerebbe a mostrare «49 pend.» (e il bottone di rilettura) su una coda ormai vuota.
+        if ("import_ambiguita".equals(ap.tabella())) {
+            em.createNativeQuery("UPDATE import_log SET righe_ambigue_classificate = " +
+                    "COALESCE(righe_ambigue_classificate, 0) + 1 WHERE id = " +
+                    "(SELECT import_log_id FROM import_ambiguita WHERE id = :id)")
+                    .setParameter("id", ap.id()).executeUpdate();
+        }
+    }
+
+    /** Scrive il movimento nato dalla riga sulla riga stessa (traccia, I5). */
+    private void collegaMovimento(Aperta ap, UUID movimentoId) {
+        em.createNativeQuery("UPDATE " + ap.tabella() + " SET movimento_id = :mov WHERE id = :id")
+                .setParameter("mov", movimentoId).setParameter("id", ap.id()).executeUpdate();
     }
 
     private long contaPerImport(String tabella, UUID importLogId) {

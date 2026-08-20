@@ -26,6 +26,13 @@ import java.util.UUID;
  */
 public record ImportBadgeDTO(
         long catalogare,
+        /**
+         * Righe che l'import non è riuscito a interpretare ({@code import_ambiguita}
+         * DA_CLASSIFICARE). Fino al 20/08/2026 questo numero non esisteva in nessun badge: 49
+         * righe BPM e 12.495,01 € sono rimasti fermi un giorno in una coda che il flusso guidato
+         * non apriva. Un contatore che non c'è non è uno zero, è un buio.
+         */
+        long daRileggere,
         long ricorrenti,
         long eventi,
         long matchingDifferiti,

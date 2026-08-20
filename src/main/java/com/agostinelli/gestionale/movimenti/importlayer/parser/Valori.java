@@ -20,9 +20,11 @@ public final class Valori {
     private static final DateTimeFormatter ISO = DateTimeFormatter.ISO_LOCAL_DATE;
     private static final DateTimeFormatter IT_SLASH = DateTimeFormatter.ofPattern("dd/MM/yyyy");
 
-    // dd-MM-yyyy o dd/MM/yyyy, con eventuale orario in coda (es. "10-06-2026 22:59:48")
+    // dd-MM-yyyy o dd/MM/yyyy, con eventuale orario in coda (es. "10-06-2026 22:59:48").
+    // L'anno è accettato anche a 2 cifre: un estratto conto ri-salvato da un foglio di calcolo
+    // perde il secolo ("27/07/2026" → "27/07/26") e con la vecchia regex la data diventava null.
     private static final Pattern IT_DATE =
-            Pattern.compile("^(\\d{1,2})[-/](\\d{1,2})[-/](\\d{4})(?:[ T]\\d{1,2}:\\d{2}(?::\\d{2})?)?$");
+            Pattern.compile("^(\\d{1,2})[-/](\\d{1,2})[-/](\\d{2}|\\d{4})(?:[ T]\\d{1,2}:\\d{2}(?::\\d{2})?)?$");
     private static final Pattern ISO_DATE =
             Pattern.compile("^(\\d{4})-(\\d{1,2})-(\\d{1,2})(?:[ T].*)?$");
     private static final Pattern HAS_TIME =
@@ -49,19 +51,32 @@ public final class Valori {
         return raw != null && HAS_TIME.matcher(raw).find();
     }
 
-    static LocalDate parseAnyDate(String raw) {
+    /** Data in qualunque formato riconosciuto → {@link LocalDate}; null se non parsabile. */
+    public static LocalDate parseAnyDate(String raw) {
         if (raw == null) return null;
         String s = raw.trim();
         if (s.isEmpty()) return null;
         Matcher mi = IT_DATE.matcher(s);
         if (mi.matches()) {
-            return safeDate(Integer.parseInt(mi.group(3)), Integer.parseInt(mi.group(2)), Integer.parseInt(mi.group(1)));
+            return safeDate(anno(mi.group(3)), Integer.parseInt(mi.group(2)), Integer.parseInt(mi.group(1)));
         }
         Matcher mo = ISO_DATE.matcher(s);
         if (mo.matches()) {
             return safeDate(Integer.parseInt(mo.group(1)), Integer.parseInt(mo.group(2)), Integer.parseInt(mo.group(3)));
         }
         return null;
+    }
+
+    /**
+     * Finestra del secolo per l'anno a 2 cifre: {@code yy → 2000 + yy} (99 → 2099, non 1999).
+     * Scelta esplicita e non "furba": questi file sono estratti conto, non archivi storici —
+     * un movimento bancario del 1999 non entra da qui, uno del 2099 nemmeno, ma se un giorno
+     * entrasse la regola resta leggibile. Stessa finestra già usata da {@code extractPosDate}
+     * sul "DEL gg/mm/aa" delle descrizioni POS.
+     */
+    private static int anno(String raw) {
+        int y = Integer.parseInt(raw);
+        return raw.length() == 2 ? 2000 + y : y;
     }
 
     private static LocalDate safeDate(int y, int m, int d) {
@@ -85,6 +100,27 @@ public final class Valori {
         if (s.isEmpty()) return null;
         if (s.indexOf(',') < 0) return s;            // già canonica (Excel) o intero
         return s.replace(".", "").replace(",", ".");  // italiana → canonica
+    }
+
+    // ── CAUSALI ────────────────────────────────────────────────────────────────
+
+    /**
+     * Codice causale banca → forma canonica a 3 cifre ("92" → "092"). Un foglio di calcolo
+     * legge la colonna come numero e mangia lo zero iniziale: senza questo, {@code metodoBpm}
+     * non riconosce più l'incasso POS (090/092) e la riga esce dalla riconciliazione POS.
+     *
+     * <p>Solo le causali <b>interamente numeriche</b> più corte di 3 caratteri vengono paddate:
+     * le alfanumeriche ("78A", "ZI0", "50C") e le causali testuali del Crédit Agricole
+     * ("GIROCONTO/BONIFICO") restano intatte.
+     */
+    public static String causaleBanca(String raw) {
+        if (raw == null) return null;
+        String s = raw.trim();
+        if (s.isEmpty() || s.length() >= 3) return s;
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isDigit(s.charAt(i))) return s;
+        }
+        return "0".repeat(3 - s.length()) + s;
     }
 
     /**

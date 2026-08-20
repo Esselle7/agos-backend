@@ -107,6 +107,20 @@ class RisolviRicorrenteIntegrationTest {
         assertEquals("DA_RICONCILIARE", statoEMovimento(ric)[0], "resta non risolta");
     }
 
+    // ── (d0) LISTA: la data si ri-deriva dal grezzo quando la colonna è NULL ──
+    // Regressione reale: la riga BPM `a547f454-…` (rata mutuo 2.501,17) ha data_movimento NULL in
+    // tabella e «31/07/26» nel grezzo. COLLEGA/CONFERMA la ri-derivano già; la LISTA no, quindi la
+    // UI la mostrava «senza data» e il matcher — che senza data non misura lo scarto dalla
+    // scadenza — non poteva proporre nessuna rata.
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void lista_riDerivaLaDataDalGrezzo() {
+        UUID ric = seedRicorrenteSenzaData(DESCR_PREFIX + "_MUTUO SENZA DATA");
+        given().when().get("/api/movimenti/import/ricorrenti?stato=DA_RICONCILIARE&size=2000")
+            .then().statusCode(200)
+            .body("content.find { it.id == '" + ric + "' }.dataMovimento", equalTo("2026-07-31"));
+    }
+
     // ── (d2) azione inesistente → 400 ──
     @Test
     @TestSecurity(user = USER, roles = {"ADMIN"})
@@ -539,6 +553,24 @@ class RisolviRicorrenteIntegrationTest {
     BigDecimal importoMovimento(UUID movId) {
         return (BigDecimal) em.createNativeQuery("SELECT importo_lordo FROM movimenti WHERE id = :id")
                 .setParameter("id", movId).getSingleResult();
+    }
+
+    /** Riga come quella vera del mutuo BPM: colonna data NULL, data a 2 cifre solo nel grezzo. */
+    @Transactional
+    UUID seedRicorrenteSenzaData(String descr) {
+        ensureImportLog();
+        UUID id = UUID.randomUUID();
+        em.createNativeQuery(
+                "INSERT INTO ricorrenti_da_riconciliare (id, import_log_id, fonte, data_movimento, importo, tipo, " +
+                "conto_bancario_id, descrizione_norm, tipo_presunto, stato, raw_data) " +
+                "VALUES (:id, :log, 'IMPORT_BANCA', NULL, 2501.17, 'USCITA', 1, :descr, 'MUTUO', " +
+                "'DA_RICONCILIARE', CAST(:raw AS jsonb))")
+                .setParameter("id", id).setParameter("log", IMPORT_LOG).setParameter("descr", descr)
+                .setParameter("raw", "{\"_SORGENTE\":\"BPM\",\"DIVISA\":\"EUR\",\"CAUSALE\":\"150\","
+                        + "\"IMPORTO\":\"-2501,17\",\"DATA_VALUTA\":\"31/07/26\","
+                        + "\"DATA_CONTABILE\":\"31/07/26\",\"DESCRIZIONE\":\"" + descr + "\"}")
+                .executeUpdate();
+        return id;
     }
 
     @Transactional

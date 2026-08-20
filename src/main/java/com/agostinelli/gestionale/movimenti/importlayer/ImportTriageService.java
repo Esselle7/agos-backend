@@ -21,6 +21,7 @@ import com.agostinelli.gestionale.movimenti.dto.TransitorioDTO;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordClassificazioneEngine;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordExtractor;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordLearningService;
+import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordExtractor.FirmaCandidata;
 import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
 import com.agostinelli.gestionale.movimenti.importlayer.model.Proposta;
 import com.agostinelli.gestionale.movimenti.importlayer.parser.Sorgente;
@@ -441,6 +442,14 @@ public class ImportTriageService {
         CogeRiservatoEventi.vieta((String) target.get(0));
         CogeTransitorio.vieta((String) target.get(0));
 
+        // Le firme approvate a mano nel wizard si validano QUI, prima di qualunque scrittura:
+        // movimento e keyword condividono la transazione, e un 400 su un token inventato non deve
+        // lasciare dietro di sé né il movimento spostato né un voto sulla firma (I5).
+        EntitaEstratte ent = req.firme() != null || req.apprendiKeyword()
+                ? estraiEntita(m.descrizione, m.contoBancarioId) : null;
+        List<FirmaCandidata> firmeScelte = req.firme() == null ? null
+                : keywordLearning.firmeScelte(m.descrizione, ent, req.firme());
+
         // R17 — il voto sulla firma, PRIMA di riscrivere la nota (che è dove vive la proposta).
         votaFirma(m, (String) target.get(0));
 
@@ -452,10 +461,13 @@ public class ImportTriageService {
         m.note = aggiungiNota(Proposta.rimuovi(m.note), req.nota());
         em.merge(m);
 
-        if (req.apprendiKeyword()) {
-            EntitaEstratte ent = estraiEntita(m.descrizione, m.contoBancarioId);
+        // I1 — una sola fonte per «imparo o no»: se il wizard ha mandato le firme che l'operatore ha
+        // visto, valgono quelle (vuote comprese: ha spento tutto). Solo in loro assenza si guarda il
+        // flag storico, che dice appena «sì/no» e lascia scegliere i token al server.
+        boolean impara = firmeScelte != null ? !firmeScelte.isEmpty() : req.apprendiKeyword();
+        if (impara) {
             keywordLearning.apprendi(m.descrizione, ent, m.tipo, req.businessUnitId(), req.cogeId(),
-                    req.fornitoreId(), movimentoId, null);
+                    req.fornitoreId(), movimentoId, null, firmeScelte);
         }
 
         mvRefresh.requestRefreshAfterCommit();

@@ -233,7 +233,22 @@ class LookupEndpointsIntegrationTest {
             .then()
                 .statusCode(200)
                 .contentType(ContentType.JSON)
-                .body("$", hasSize(12));
+                // 12 metodi storici + RIBA (V36, spec debug-con-cliente/metodo-pagamento-riba).
+                .body("$", hasSize(13));
+    }
+
+    @Test
+    @Order(30)
+    @TestSecurity(user = "test-admin", roles = {"ADMIN"})
+    void testMetodiPagamentoContieneRiba() {
+        // Il normalizer nomina il metodo per STRINGA ("RIBA"): se la migration scrivesse un codice
+        // diverso, l'import fallirebbe sulla FK e nessun compilatore se ne accorgerebbe.
+        given()
+            .when().get("/api/metodi-pagamento")
+            .then()
+                .statusCode(200)
+                .body("codice", hasItem("RIBA"))
+                .body("find { it.codice == 'RIBA' }.descrizione", equalTo("Ri.Ba. — ricevuta bancaria (effetti)"));
     }
 
     @Test
@@ -322,7 +337,7 @@ class LookupEndpointsIntegrationTest {
             .when().get("/api/metodi-pagamento")
             .then()
                 .statusCode(200)
-                .body("$", hasSize(12));
+                .body("$", hasSize(13));   // 12 storici + RIBA (V36)
     }
 
     @Test

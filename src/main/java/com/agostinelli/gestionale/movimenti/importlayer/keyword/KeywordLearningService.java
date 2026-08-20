@@ -2,6 +2,7 @@ package com.agostinelli.gestionale.movimenti.importlayer.keyword;
 
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.movimenti.dto.ApprendimentoKeywordEsito;
+import com.agostinelli.gestionale.movimenti.dto.ClassificaTransitorioRequest.FirmaSceltaDTO;
 import com.agostinelli.gestionale.movimenti.dto.KeywordAnteprimaDTO;
 import com.agostinelli.gestionale.movimenti.dto.KeywordConflittoDTO;
 import com.agostinelli.gestionale.movimenti.dto.KeywordFirmaDTO;
@@ -9,6 +10,8 @@ import com.agostinelli.gestionale.movimenti.dto.RisolviConflittoKeywordRequest;
 import com.agostinelli.gestionale.movimenti.importlayer.CogeRiservatoEventi;
 import com.agostinelli.gestionale.movimenti.importlayer.DescNormalizer;
 import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordExtractor.FirmaCandidata;
+import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordExtractor.TipoToken;
+import com.agostinelli.gestionale.movimenti.importlayer.keyword.KeywordExtractor.TokenTipizzato;
 import com.agostinelli.gestionale.movimenti.importlayer.model.EntitaEstratte;
 import com.agostinelli.gestionale.movimenti.importlayer.parser.Sorgente;
 import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
@@ -22,8 +25,10 @@ import jakarta.ws.rs.core.Response;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -46,6 +51,8 @@ public class KeywordLearningService {
     /** Codici COGE transitori "Da catalogare" (ricavi/costi): l'auto-catalogazione tocca SOLO questi. */
     private static final String COGE_RICAVI_DACLASS = "39.99.999";
     private static final String COGE_COSTI_DACLASS = "49.99.999";
+    /** {@code keyword_token.token varchar(60)}: il limite di colonna è un limite di dominio (V7). */
+    private static final int MAX_LEN_TOKEN = 60;
 
 
     // ── APPRENDIMENTO (hook del triage) ─────────────────────────────────────────────────
@@ -55,14 +62,29 @@ public class KeywordLearningService {
      * controparte ricorre su qualsiasi banca); scope per {@code tipoMovimento}. COGE per codice.
      * Ritorna l'esito (firme create/aggiornate + conflitti aperti). Chiama {@code engine.refresh()}.
      */
-    @Transactional
     public ApprendimentoKeywordEsito apprendi(String descrizione, EntitaEstratte entita,
                                               String tipoMovimento, Short bu, Integer cogeId,
                                               UUID fornitoreId, UUID movimentoId, UUID userId) {
+        return apprendi(descrizione, entita, tipoMovimento, bu, cogeId, fornitoreId, movimentoId,
+                userId, null);
+    }
+
+    /**
+     * Come sopra, ma con le firme decise dall'operatore nel wizard ({@code firmeScelte != null}):
+     * si scrivono <b>esattamente quelle</b> invece di ri-estrarle. Tutto ciò che sta a valle —
+     * signature, dedup, conflitti, provenienza — è lo stesso identico percorso (I3): accorciare
+     * una firma può farla collidere con una già esistente, e quel ramo esiste già.
+     */
+    @Transactional
+    public ApprendimentoKeywordEsito apprendi(String descrizione, EntitaEstratte entita,
+                                              String tipoMovimento, Short bu, Integer cogeId,
+                                              UUID fornitoreId, UUID movimentoId, UUID userId,
+                                              List<FirmaCandidata> firmeScelte) {
         String coge = cogeCodice(cogeId);
         CogeRiservatoEventi.vieta(coge);
-        List<FirmaCandidata> firme = KeywordExtractor.estraiFirme(
-                descrizione, entita, engine.stopwords(), engine.domainTokens());
+        List<FirmaCandidata> firme = firmeScelte != null ? firmeScelte
+                : KeywordExtractor.estraiFirme(
+                        descrizione, entita, engine.stopwords(), engine.domainTokens());
 
         int create = 0, aggiornate = 0;
         List<UUID> conflitti = new ArrayList<>();
@@ -100,6 +122,56 @@ public class KeywordLearningService {
 
         engine.refresh();
         return new ApprendimentoKeywordEsito(create, aggiornate, conflitti);
+    }
+
+    /**
+     * Trust boundary delle firme scelte a mano: converte i token accesi nel wizard in
+     * {@link FirmaCandidata} <b>validandoli contro la causale</b>, e fallisce con un 400 parlante
+     * invece di scrivere qualcosa che non scatterà mai.
+     *
+     * <p>Perché il server non si fida della UI (che oggi sa solo spegnere chip): il match è in AND
+     * sul token-set della riga, quindi un token che non appartiene alla causale rende la firma
+     * inerte — e l'operatore non avrebbe alcun segnale del fallimento, la firma esisterebbe a DB
+     * senza scattare mai. La natura resta {@code IDENTITA} com'è per tutte le firme apprese: da qui
+     * si può solo togliere, mai aggiungere, quindi i token sono un sottoinsieme di quelli estratti.
+     *
+     * <p>Una firma con <b>zero</b> token non è un errore: vuol dire «questa non la imparo» e si
+     * salta, altrimenti spegnere tutti i chip di una firma sola bloccherebbe la catalogazione.
+     */
+    public List<FirmaCandidata> firmeScelte(String descrizione, EntitaEstratte entita,
+                                            List<FirmaSceltaDTO> scelte) {
+        Map<String, TipoToken> tavolozza = new HashMap<>();
+        for (TokenTipizzato t : KeywordExtractor.classifica(
+                descrizione, entita, engine.stopwords(), engine.domainTokens())) {
+            tavolozza.putIfAbsent(t.token(), t.tipo());
+        }
+
+        List<FirmaCandidata> out = new ArrayList<>();
+        for (FirmaSceltaDTO s : scelte) {
+            if (s == null || s.token() == null || s.token().isEmpty()) continue;
+            Set<TokenTipizzato> token = new LinkedHashSet<>();
+            for (String grezzo : s.token()) {
+                String tk = grezzo == null ? "" : grezzo.trim().toUpperCase();
+                if (tk.length() > MAX_LEN_TOKEN) {
+                    throw new ApiException(Response.Status.BAD_REQUEST, "TOKEN_TROPPO_LUNGO",
+                            "La parola «" + tk + "» supera i " + MAX_LEN_TOKEN + " caratteri");
+                }
+                TipoToken tipo = tavolozza.get(tk);
+                if (tipo == null) {
+                    throw new ApiException(Response.Status.BAD_REQUEST, "TOKEN_NON_NELLA_CAUSALE",
+                            "«" + tk + "» non è una parola di questa causale: una firma con dentro "
+                                    + "una parola che non c'è non scatterebbe mai su questa riga");
+                }
+                token.add(new TokenTipizzato(tk, tipo));
+            }
+            FirmaCandidata fc = new FirmaCandidata(token, KeywordExtractor.Natura.IDENTITA);
+            if (!KeywordExtractor.valida(fc)) {
+                throw new ApiException(Response.Status.BAD_REQUEST, "FIRMA_NON_VALIDA",
+                        "Questa firma non basta a riconoscere nulla: " + String.join(" + ", fc.valori()));
+            }
+            out.add(fc);
+        }
+        return out;
     }
 
     /**

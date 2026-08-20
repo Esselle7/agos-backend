@@ -185,7 +185,7 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
             case "118" -> "CARTA_DEBITO";           // pagamento con carta di debito aziendale
             case "50C", "110", "150", "174"         // addebiti SEPA: SDD B2B, utenze CBILL, rata mutuo, premi assicurativi
                     -> "RID_SDDMANDAT";
-            case "310", "314" -> "RID_SDDMANDAT";   // effetti ritirati / RIBA (addebito a scadenza)
+            case "310", "314" -> "RIBA";            // effetti ritirati / RiBa (addebito a scadenza): non è un SDD
             case "662", "660", "16H", "16I", "16G", "16X", "16Z", "18D", "195", "669"
                     -> "ADDEBITO_CONTO";            // commissioni, spese, competenze, interessi, bollo c/c, canone carta
             case "198" -> "F24";                    // tributi (I24 Agenzia Entrate)
@@ -256,8 +256,10 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
             case "INCASSO TRAMITE POS" -> "POS_CA_NEXI";
             case "PAGAMENTO TRAMITE POS" -> "CARTA_DEBITO"; // USCITA con la carta aziendale (gemella della causale BPM 118)
             case "GIROCONTO/BONIFICO", "DISPOSIZIONE DI PAGAMENTO" -> "BONIFICO";
-            case "ACCREDITI RIBA/EFFETTI" -> "BONIFICO";    // accredito effetti/RiBa (gemella della causale BPM 310/314)
-            case "COMMISSIONI/SPESE", "PAGAMENTO UTENZE", "EFFETTI RITIRATI/RICHIAMATI" -> "RID_SDDMANDAT";
+            // Effetti/RiBa nei due sensi: il segno del movimento distingue attiva e passiva,
+            // il metodo no (gemelle delle causali BPM 310/314).
+            case "ACCREDITI RIBA/EFFETTI", "EFFETTI RITIRATI/RICHIAMATI" -> "RIBA";
+            case "COMMISSIONI/SPESE", "PAGAMENTO UTENZE" -> "RID_SDDMANDAT";
             case "IMPOSTE E TASSE" -> "F24"; // tributi addebitati dal conto
             default -> null; // CAUSALE_NON_MAPPATA
         };

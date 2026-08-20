@@ -1,6 +1,7 @@
 package com.agostinelli.gestionale.eventi.resource;
 
 import com.agostinelli.gestionale.eventi.dto.*;
+import com.agostinelli.gestionale.eventi.repository.EventiRepository;
 import com.agostinelli.gestionale.eventi.service.EventiService;
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.shared.dto.PagedResponse;
@@ -44,12 +45,26 @@ public class EventiResource {
             @QueryParam("from")   LocalDate from,
             @QueryParam("to")     LocalDate to,
             @QueryParam("search") String search,
+            @QueryParam("vista")  String vista,
             @QueryParam("page")   @DefaultValue("0")  int page,
             @QueryParam("size")   @DefaultValue("20") int size,
             @Context SecurityContext ctx) {
 
         int safeSize = clampSize(size);
-        return service.findWithFilters(stato, buId, from, to, search, page, safeSize, isAdmin(ctx));
+        return service.findWithFilters(stato, buId, from, to, search, validaVista(vista), page, safeSize, isAdmin(ctx));
+    }
+
+    /**
+     * Vista ammessa o niente: un valore scritto male non deve cadere in silenzio sul default
+     * «tutti gli eventi», che è proprio la lista che le due schede vogliono partizionare.
+     */
+    private static String validaVista(String vista) {
+        if (vista == null || vista.isBlank()) return null;
+        if (EventiRepository.VISTA_LISTA.equals(vista) || EventiRepository.VISTA_STORICO.equals(vista)) {
+            return vista;
+        }
+        throw new ApiException(Response.Status.BAD_REQUEST, "VISTA_NON_VALIDA",
+                "vista ammette solo " + EventiRepository.VISTA_LISTA + " o " + EventiRepository.VISTA_STORICO);
     }
 
     @GET

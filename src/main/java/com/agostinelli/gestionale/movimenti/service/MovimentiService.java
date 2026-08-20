@@ -3,6 +3,8 @@ package com.agostinelli.gestionale.movimenti.service;
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
 import com.agostinelli.gestionale.movimenti.domain.Movimento;
 import com.agostinelli.gestionale.movimenti.dto.*;
+import com.agostinelli.gestionale.movimenti.importlayer.CogeRiservatoEventi;
+import com.agostinelli.gestionale.movimenti.importlayer.CogeTransitorio;
 import com.agostinelli.gestionale.movimenti.mapper.MovimentoMapper;
 import com.agostinelli.gestionale.movimenti.repository.MovimentiRepository;
 import com.agostinelli.gestionale.reporting.scheduler.MvRefreshService;
@@ -13,6 +15,8 @@ import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validator;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
 import jakarta.ws.rs.core.Response;
 
 import java.math.BigDecimal;
@@ -27,6 +31,7 @@ public class MovimentiService {
     @Inject MovimentoMapper mapper;
     @Inject Validator validator;
     @Inject MvRefreshService mvRefresh;
+    @Inject EntityManager em;
 
     /**
      * Crea un movimento con validazione cross-field e calcolo dei campi derivati.
@@ -184,6 +189,129 @@ public class MovimentiService {
         Movimento m = findActiveOrThrow(id);
         m.stato = "ANNULLATO";
         mvRefresh.requestRefreshAfterCommit();
+    }
+
+
+    // ── DIVISIONE DI UN MOVIMENTO CUMULATIVO ──────────────────────────────────
+    // Spec: docs/specs/debug-con-cliente/riba-split-importo.md
+
+    /**
+     * Divide un movimento (tipicamente una RiBa/effetti cumulativa) in N quote con conto CoGe e
+     * Business Unit propri. Il padre passa ad ANNULLATO, i figli nascono con le sue stesse
+     * coordinate finanziarie.
+     *
+     * <p><b>Il denaro non si crea e non si distrugge (I1):</b> la somma delle quote deve fare
+     * l'importo del padre al centesimo, e la verifica sta QUI — non solo nell'interfaccia — perché
+     * è l'unico punto da cui si scrive. Niente arrotondamenti d'ufficio sull'ultima quota: uno
+     * scarto si mostra, non si aggiusta.
+     *
+     * <p><b>Il saldo non si muove (I2):</b> nessun figlio cambia conto, data o segno rispetto al
+     * padre. In particolare {@code dataFinanziaria} si propaga identica (I4): è il campo su cui
+     * {@code mv_saldi_conti} decide se il movimento sta dentro o fuori dal saldo iniziale
+     * (filtro strict {@code >}), e un figlio senza quella data ricadrebbe su {@code dataMovimento}.
+     *
+     * <p><b>Una riga bancaria resta importata una volta sola (I3):</b> il
+     * {@code riferimentoEsterno} resta sul padre annullato e i figli nascono senza. Due ragioni:
+     * {@code idx_movimenti_dedup_import} è UNIQUE su (fonte, riferimento_esterno, data_movimento)
+     * e N figli lo violerebbero; e la dedup del prossimo import legge i riferimenti senza filtrare
+     * lo stato, quindi il padre annullato continua a fare da scudo al ri-import.
+     */
+    @CacheInvalidateAll(cacheName = "dashboard-kpi")
+    @CacheInvalidateAll(cacheName = "dashboard-andamento")
+    @CacheInvalidateAll(cacheName = "dashboard-bufatturato")
+    @Transactional
+    public List<MovimentoDTO> dividiMovimento(UUID id, DividiMovimentoRequest req, UUID userId) {
+        // Lock pessimistico: due divisioni in parallelo si mettono in fila, la seconda trova il
+        // padre già ANNULLATO e si ferma (R6). Con un UPDATE condizionato il controllo sarebbe
+        // altrettanto atomico, ma lascerebbe in sessione un'entità con lo stato vecchio.
+        Movimento padre = repo.findByIdOptional(id, LockModeType.PESSIMISTIC_WRITE)
+                .orElseThrow(() -> new ApiException(Response.Status.NOT_FOUND, "NOT_FOUND",
+                        "Movimento non trovato: " + id));
+
+        if ("ANNULLATO".equals(padre.stato)) {
+            throw new ApiException(Response.Status.CONFLICT, "MOVIMENTO_GIA_DIVISO",
+                    "Il movimento è annullato: se è già stato diviso, i figli sono a libro. "
+                    + "Dividerlo di nuovo creerebbe il doppio delle righe.");
+        }
+        if (padre.eventoId != null) {
+            throw new ApiException(Response.Status.CONFLICT, "SPLIT_SU_EVENTO_NON_SUPPORTATO",
+                    "Questo movimento è collegato a un evento: i totali dell'evento sono "
+                    + "denormalizzati e dividerlo qui li falserebbe. Scollegalo prima, o dividi "
+                    + "un movimento non legato a eventi.");
+        }
+
+        // R3 — quadratura al centesimo. Prima di scrivere qualunque cosa (I5).
+        BigDecimal somma = req.quote().stream()
+                .map(DividiMovimentoRequest.Quota::importo)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        if (somma.compareTo(padre.importo) != 0) {
+            BigDecimal scarto = somma.subtract(padre.importo);
+            throw new ApiException(Response.Status.BAD_REQUEST, "SPLIT_NON_QUADRA",
+                    "Le quote sommano EUR " + somma + " contro EUR " + padre.importo
+                    + " del movimento: scarto di EUR " + scarto.abs()
+                    + (scarto.signum() > 0 ? " in più." : " in meno.")
+                    + " La divisione non può creare né perdere denaro.");
+        }
+
+        // Ogni quota deve avere una destinazione vera: le stesse guardie della catalogazione.
+        for (DividiMovimentoRequest.Quota q : req.quote()) {
+            String codice = cogeCodiceOrThrow(q.contoCogeId());
+            CogeTransitorio.vieta(codice);      // dividere per lasciare i pezzi «da classificare» non è dividere
+            CogeRiservatoEventi.vieta(codice);  // un ricavo-evento senza evento non compare in nessun bilancio
+        }
+
+        List<Movimento> figli = new ArrayList<>();
+        for (int i = 0; i < req.quote().size(); i++) {
+            DividiMovimentoRequest.Quota q = req.quote().get(i);
+            Movimento f = new Movimento();
+            // Coordinate finanziarie: identiche al padre, o il saldo si muove.
+            f.tipo                = padre.tipo;
+            f.dataMovimento       = padre.dataMovimento;
+            f.dataCompetenza      = padre.dataCompetenza;
+            f.dataFinanziaria     = padre.dataFinanziaria;
+            f.dataLiquidita       = padre.dataLiquidita;
+            f.contoBancarioId     = padre.contoBancarioId;
+            f.metodoPagamentoId   = padre.metodoPagamentoId;
+            f.fonte               = padre.fonte;
+            f.fonteImportazioneId = padre.fonteImportazioneId;
+            f.stato               = padre.stato;
+            f.controparte         = padre.controparte;
+            // Per quota: il perché della divisione.
+            f.importo             = q.importo();
+            f.importoCommissione  = BigDecimal.ZERO;
+            f.contoCoge           = q.contoCogeId();
+            f.businessUnitId      = q.businessUnitId();
+            f.fornitoreId         = q.fornitoreId();
+            f.descrizione         = q.descrizione() != null && !q.descrizione().isBlank()
+                    ? q.descrizione()
+                    : padre.descrizione + " — quota " + (i + 1) + "/" + req.quote().size();
+            f.riferimentoEsterno  = null;   // I3: il riferimento resta sul padre
+            f.note                = "Quota " + (i + 1) + "/" + req.quote().size()
+                                    + " della divisione del movimento " + padre.id;
+            f.createdBy           = userId;
+            repo.persist(f);
+            figli.add(f);
+        }
+        em.flush();   // servono gli id dei figli per la traccia sul padre (R7)
+
+        padre.stato = "ANNULLATO";
+        padre.note = (padre.note == null || padre.note.isBlank() ? "" : padre.note + " | ")
+                + "Diviso in " + figli.size() + " quote: "
+                + figli.stream().map(f -> f.id.toString()).collect(java.util.stream.Collectors.joining(", "));
+
+        mvRefresh.requestRefreshAfterCommit();
+        return figli.stream().map(mapper::toDTO).toList();
+    }
+
+    /** Codice del conto CoGe, o 400 se l'id non esiste: le guardie ragionano sul codice, non sull'id. */
+    private String cogeCodiceOrThrow(Integer cogeId) {
+        List<?> r = em.createNativeQuery("SELECT codice FROM piano_dei_conti_coge WHERE id = :id")
+                .setParameter("id", cogeId).getResultList();
+        if (r.isEmpty()) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "COGE_NON_TROVATO",
+                    "Conto CoGe inesistente: " + cogeId);
+        }
+        return (String) r.get(0);
     }
 
     public MovimentoDTO findById(UUID id) {

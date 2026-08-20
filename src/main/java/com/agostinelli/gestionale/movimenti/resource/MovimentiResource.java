@@ -222,24 +222,6 @@ public class MovimentiResource {
         return importService.importCongiunto(billy, bpm, ca, fnBilly, fnBpm, fnCa, userId);
     }
 
-    /**
-     * ponytail: TEMPORANEO — SPEC docs/specs/bpm-luglio-2026-recupero.md R8.
-     * Ri-manda nel motore di mapping le righe ancora aperte in coda per questo import (sorgente
-     * BPM), così quelle ferme per un difetto di lettura ora risolto finiscono dove sarebbero
-     * finite il primo giorno. {@code ?dryRun=true} riporta il destino di ogni riga senza scrivere.
-     * DA RIMUOVERE con il bottone dello Storico import quando l'arretrato è smaltito.
-     */
-    @POST
-    @Path("/import/{importLogId}/riprocessa-coda")
-    @RolesAllowed("ADMIN")
-    public java.util.Map<String, Object> riprocessaCoda(
-            @PathParam("importLogId") UUID importLogId,
-            @QueryParam("dryRun") @DefaultValue("false") boolean dryRun,
-            @Context SecurityContext ctx) {
-        UUID userId = UUID.fromString(ctx.getUserPrincipal().getName());
-        return importService.riprocessaCoda(importLogId, userId, dryRun);
-    }
-
     @DELETE
     @Path("/import/{importLogId}/rollback")
     @RolesAllowed("ADMIN")

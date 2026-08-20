@@ -65,7 +65,7 @@ public class EventiService {
      * un server UTC respinga eventi "domani Italia" creati dopo mezzanotte
      * UTC ma prima di mezzanotte locale.
      */
-    private static final ZoneId ITALY = ZoneId.of("Europe/Rome");
+    private static final ZoneId ITALY = EventiRepository.FUSO;   // un solo fuso per il modulo
 
     @Inject EventiRepository repo;
     @Inject EventoPartecipantiRepository partecipantiRepo;
@@ -128,14 +128,20 @@ public class EventiService {
         return buildEventoDTO(findOrThrow(id), isAdmin);
     }
 
+    /**
+     * @param vista {@code LISTA} (eventi da lavorare, prima i più vicini), {@code STORICO}
+     *              (solo i saldati, dal più recente) oppure {@code null} = tutti, come da sempre.
+     *              Il default resta «tutti» perché altre maschere (filtri movimenti, wizard)
+     *              chiedono l'elenco intero: restringerlo qui le romperebbe in silenzio.
+     */
     public PagedResponse<EventoDTO> findWithFilters(
             String stato, Short buId, LocalDate from, LocalDate to,
-            String search, int page, int size, boolean isAdmin) {
+            String search, String vista, int page, int size, boolean isAdmin) {
 
-        List<Evento> eventi = repo.findWithFilters(stato, buId, from, to, search, page, size);
+        List<Evento> eventi = repo.findWithFilters(stato, buId, from, to, search, vista, page, size);
         Prefetch pre = prefetch(eventi);
         List<EventoDTO> content = eventi.stream().map(e -> buildEventoDTO(e, isAdmin, pre)).toList();
-        long total = repo.countWithFilters(stato, buId, from, to, search);
+        long total = repo.countWithFilters(stato, buId, from, to, search, vista);
         return PagedResponse.of(content, page, size, total);
     }
 

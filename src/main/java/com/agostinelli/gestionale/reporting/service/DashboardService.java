@@ -395,17 +395,28 @@ public class DashboardService {
     //      la quota capitale di un mutuo comparirebbe qui come costo e non nel P&L;
     //   2. data_competenza, non data_movimento: è la data che governa il P&L;
     //   3. imponibile quando c'è: il P&L legge COALESCE(importo_imponibile, importo_lordo).
+    //   4. (V39) storno di ricavo: una USCITA su conto RICAVO riduce i ricavi, come nella MV.
+    //      Senza questa riga il pannello e il Conto Economico divergono di ogni riga del genere
+    //      (misurato in prod: 500,00 € «carne» sul conto 30.03.001, competenza 31/08/2026).
     // COUNT(*) resta su TUTTI i movimenti del periodo: è "quanti movimenti", non una grandezza
     // economica.
+    //
+    // ponytail: NON replico il ramo V31 (ENTRATA negativa su COSTO): a DB gli importi sono
+    // sempre positivi e quel caso ha 0 occorrenze su tutte le righe reali. Si aggiunge qui, con
+    // la stessa forma, il giorno in cui una nota di credito fornitore arriva davvero.
     private Object[] queryKpiDirect(LocalDate from, LocalDate to) {
         return (Object[]) em.createNativeQuery(
                 "SELECT " +
                 "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' AND pc.tipo='RICAVO' " +
-                "              THEN COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0), " +
+                "              THEN COALESCE(m.importo_imponibile, m.importo_lordo) " +
+                "              WHEN m.tipo='USCITA' AND pc.tipo='RICAVO' " +
+                "              THEN -COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0), " +
                 "COALESCE(SUM(CASE WHEN m.tipo='USCITA' AND pc.tipo='COSTO' AND NOT COALESCE(pc.is_capex,false) " +
                 "              THEN COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0), " +
                 "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' AND pc.tipo='RICAVO' " +
                 "              THEN COALESCE(m.importo_imponibile, m.importo_lordo) " +
+                "              WHEN m.tipo='USCITA' AND pc.tipo='RICAVO' " +
+                "              THEN -COALESCE(m.importo_imponibile, m.importo_lordo) " +
                 "              WHEN m.tipo='USCITA' AND pc.tipo='COSTO' AND NOT COALESCE(pc.is_capex,false) " +
                 "              THEN -COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0), " +
                 "COUNT(*) " +

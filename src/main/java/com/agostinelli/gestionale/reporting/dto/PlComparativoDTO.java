@@ -8,7 +8,8 @@ public record PlComparativoDTO(
         LocalDate from,
         LocalDate to,
         List<PlBuDTO> businessUnits,
-        ConsolidatoDTO totaleConsolidato
+        ConsolidatoDTO totaleConsolidato,
+        PlDTO.QualitaDTO qualita
 ) {
     public record PlBuDTO(
             BuRefDTO bu,

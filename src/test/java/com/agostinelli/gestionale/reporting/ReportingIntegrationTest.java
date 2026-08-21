@@ -981,6 +981,48 @@ class ReportingIntegrationTest {
                 "Uscite dashboard e Costi del Conto Economico misurano la stessa cosa");
     }
 
+    /**
+     * V39 — storno di ricavo (USCITA su conto RICAVO): il Conto Economico lo sottrae dai ricavi,
+     * e la sezione "Performance Economica" deve fare lo stesso. Prima dell'allineamento di
+     * queryKpiDirect la dashboard ignorava la riga e restava piu' alta del P&amp;L esattamente
+     * dell'importo stornato (misurato in prod: 500,00 EUR «carne» sul conto 30.03.001).
+     */
+    @Test
+    @Order(72)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void kpiEconomici_stornoRicavo_restaAllineatoAlContoEconomico() throws Exception {
+        java.time.LocalDate oggi = java.time.LocalDate.now();
+        java.time.LocalDate primo = oggi.withDayOfMonth(1);
+        java.time.LocalDate ultimo = primo.plusMonths(1).minusDays(1);
+        String kpi = "/api/dashboard/kpi?from=%s&to=%s&period=CUSTOM".formatted(primo, ultimo);
+
+        double entratePre = kpiNum(kpi, "periodo.totalEntrate");
+
+        int cogeRicavo = ((Number) em.createNativeQuery(
+                "SELECT id FROM piano_dei_conti_coge WHERE codice = '30.01.001'")
+                .getSingleResult()).intValue();
+        int metodo = ((Number) em.createNativeQuery(
+                "SELECT id FROM metodi_pagamento WHERE codice = 'BONIFICO'")
+                .getSingleResult()).intValue();
+
+        creaMovimento("ENTRATA", "1000.00", 1, cogeRicavo, metodo, oggi.toString(), "ZZ ricavo base");
+        creaMovimento("USCITA",   "400.00", 1, cogeRicavo, metodo, oggi.toString(), "ZZ storno ricavo (USCITA su conto RICAVO)");
+
+        tx.begin();
+        em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_conto_economico_mensile").executeUpdate();
+        tx.commit();
+
+        double ricaviPl = ((Number) em.createNativeQuery(
+                "SELECT COALESCE(SUM(ricavi),0) FROM mv_conto_economico_mensile WHERE anno = :a AND mese = :m")
+                .setParameter("a", primo.getYear()).setParameter("m", primo.getMonthValue())
+                .getSingleResult()).doubleValue();
+
+        assertEquals(entratePre + 600.00, kpiNum(kpi, "periodo.totalEntrate"), 0.011,
+                "V39: lo storno deve ridurre le Entrate della dashboard (1000 - 400), non essere ignorato");
+        assertEquals(ricaviPl, kpiNum(kpi, "periodo.totalEntrate"), 0.011,
+                "V39: dashboard e Conto Economico restano la stessa grandezza anche con uno storno di ricavo");
+    }
+
     private double kpiNum(String url, String path) {
         return ((Number) given().when().get(url).then().statusCode(200).extract().path(path)).doubleValue();
     }

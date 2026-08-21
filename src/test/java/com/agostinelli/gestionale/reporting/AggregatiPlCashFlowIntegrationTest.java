@@ -721,6 +721,244 @@ class AggregatiPlCashFlowIntegrationTest {
                 "M8: lo storno NON deve trasformarsi in un costo operativo (V31 vale solo per pc.tipo='COSTO')");
     }
 
+    /**
+     * M10 (V37) — ENTRATA su conto CAPEX: rimborso/disinvestimento. Prima di V37 la MV del
+     * cash flow non aveva alcun secchio per questo caso (entrate_operative esclude
+     * {@code is_capex}), quindi la riga spariva dal cash flow: il totale entrate
+     * dell'endpoint non la contava. Ora sta in entrate_investimento ed è nel totale.
+     *
+     * <p>Caso reale che l'ha reso urgente: rimborso 490,00 € «fatture riparazione muro»
+     * del 15/07/2026 sul conto 91, che V38 marca capex.
+     */
+    @Test @Order(63)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void m10_entrata_su_conto_capex_finisce_in_entrateInvestimento_e_nel_totale() throws Exception {
+        short buId = 1;
+        int anno = 2097, mese = 1;   // anno non usato da altri test: totali dell'endpoint esatti
+
+        insertMovimento(
+                "ENTRATA", new BigDecimal("490.00"),
+                LocalDate.of(anno, mese, 15),
+                LocalDate.of(anno, mese, 15),
+                LocalDate.of(anno, mese, 15),
+                (short) 1, metodoContanti, cogeCapex, buId,
+                "REGISTRATO", "M10 rimborso su conto CAPEX");
+
+        refreshMvs();
+
+        assertEquals(490.00, sumCfEntrateInvestimento(anno, mese, (short) 1), 0.01,
+                "V37: l'ENTRATA su conto capex deve confluire in entrate_investimento");
+        assertEquals(0.0, sumCfEntrateOperative(anno, mese, (short) 1), 0.01,
+                "V37: NON è un'entrata operativa (entrate_operative esclude is_capex)");
+        assertEquals(0.0, sumCfEntrateFinanziarie(anno, mese, (short) 1), 0.01,
+                "V37: NON è un'entrata finanziaria (il conto è COSTO capex, non PASSIVITA)");
+
+        // L'endpoint deve vedere i 490: è il punto in cui la riga spariva.
+        float entrate = given()
+                .queryParam("from", anno + "-01-01")
+                .queryParam("to",   anno + "-01-31")
+                .queryParam("granularity", "MONTH")
+                .when().get("/api/reporting/cashflow/storico")
+                .then().statusCode(200)
+                .extract().jsonPath().getFloat("[0].entrate");
+        assertEquals(490.00, entrate, 0.01,
+                "V37: senza entrate_investimento nella somma, l'endpoint esporrebbe 0,00");
+    }
+
+    /**
+     * M11 (V39) — USCITA su conto RICAVO: storno di ricavo. Prima di V39 la MV del P&amp;L
+     * aveva solo il ramo ENTRATA su RICAVO: una USCITA su un conto ricavo non era né costo
+     * né meno-ricavo e spariva dagli aggregati (in prod: 500,00 € «carne» sul conto
+     * 30.03.001, competenza 31/08/2026, riga nata dopo l'analisi del 19/08).
+     *
+     * <p>Simmetrico a {@code m9} (V31, storno costo): riduce i ricavi e l'EBITDA, e NON
+     * diventa un costo operativo.
+     */
+    @Test @Order(64)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void m11_uscita_su_conto_ricavo_storna_il_ricavo() throws Exception {
+        short buId = 1;
+        int anno = 2097, mese = 2;
+
+        insertMovimento(
+                "ENTRATA", new BigDecimal("1000.00"),
+                LocalDate.of(anno, mese, 5),
+                LocalDate.of(anno, mese, 5),
+                LocalDate.of(anno, mese, 5),
+                (short) 1, metodoContanti, cogeRicavoRist, buId,
+                "REGISTRATO", "M11 ricavo originario");
+
+        // Storno: USCITA sullo stesso conto RICAVO (restituzione al cliente)
+        insertMovimento(
+                "USCITA", new BigDecimal("500.00"),
+                LocalDate.of(anno, mese, 20),
+                LocalDate.of(anno, mese, 20),
+                LocalDate.of(anno, mese, 20),
+                (short) 1, metodoContanti, cogeRicavoRist, buId,
+                "REGISTRATO", "M11 storno ricavo (USCITA su conto RICAVO)");
+
+        refreshMvs();
+
+        assertEquals(500.00, sumPnlRicavi(anno, mese, buId), 0.01,
+                "V39: l'USCITA su conto RICAVO riduce i ricavi (1000 − 500); prima spariva");
+        assertEquals(0.0, sumPnlCostiOperativi(anno, mese, buId), 0.01,
+                "V39: lo storno di ricavo NON diventa un costo operativo");
+        assertEquals(500.00, sumPnlEbitdaProxy(anno, mese, buId), 0.01,
+                "V39: l'EBITDA scende dello stesso importo stornato");
+    }
+
+    /**
+     * M12 (V39) — ENTRATA su conto CAPEX: rimborso/disinvestimento. Prima di V39 la riga non
+     * cadeva in nessuna colonna del P&amp;L (in prod: 490,00 € sul conto 91 del 15/07/2026,
+     * con l'endpoint che esponeva 5.135,35 contro i 5.625,35 a DB).
+     *
+     * <p>Ora riduce investimenti_capex e — come ogni movimento capex — resta fuori dall'EBITDA.
+     */
+    @Test @Order(65)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void m12_entrata_su_conto_capex_riduce_investimento_e_non_tocca_ebitda() throws Exception {
+        short buId = 1;
+        int anno = 2097, mese = 3;
+
+        insertMovimento(
+                "USCITA", new BigDecimal("2000.00"),
+                LocalDate.of(anno, mese, 5),
+                LocalDate.of(anno, mese, 5),
+                LocalDate.of(anno, mese, 5),
+                (short) 1, metodoContanti, cogeCapex, buId,
+                "REGISTRATO", "M12 investimento");
+
+        insertMovimento(
+                "ENTRATA", new BigDecimal("490.00"),
+                LocalDate.of(anno, mese, 15),
+                LocalDate.of(anno, mese, 15),
+                LocalDate.of(anno, mese, 15),
+                (short) 1, metodoContanti, cogeCapex, buId,
+                "REGISTRATO", "M12 rimborso sull'investimento");
+
+        refreshMvs();
+
+        assertEquals(1510.00, sumPnlInvestimentiCapex(anno, mese, buId), 0.01,
+                "V39: il rimborso nettizza l'investimento (2000 − 490); prima i 490 sparivano");
+        assertEquals(0.0, sumPnlRicavi(anno, mese, buId), 0.01,
+                "V39: il rimborso su capex NON è un ricavo");
+        assertEquals(0.0, sumPnlEbitdaProxy(anno, mese, buId), 0.01,
+                "V39: il capex, in entrata come in uscita, resta fuori dall'EBITDA");
+    }
+
+    /**
+     * F7a — Fase 7: la rata dichiara lo split nella descrizione bancaria, quindi gli interessi
+     * arrivano a conto economico anche se la riga sta tutta su un conto PASSIVITA.
+     * Descrizione reale (rata Asconfidi CA del 06/07/2026, 1.765,32 €):
+     * {@code ... Q.CAP. E 1.594,91 Q.INT. E 168,41 SPESE E 2,00}.
+     *
+     * <p>Nessuna riga viene toccata: l'EBITDA non cambia, cambia solo la riga sotto l'EBIT.
+     */
+    @Test @Order(66)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void f7a_interessi_dichiarati_nella_descrizione_arrivano_a_oneriFinanziari() throws Exception {
+        short buId = 1;
+        int anno = 2097, mese = 4;
+
+        insertMovimento(
+                "USCITA", new BigDecimal("1765.32"),
+                LocalDate.of(anno, mese, 6),
+                LocalDate.of(anno, mese, 6),
+                LocalDate.of(anno, mese, 6),
+                (short) 1, metodoContanti, cogePassivitaMutuo, buId,
+                "REGISTRATO",
+                "SDD A : CONFIDI RATA N. 003 SCAD. 05.04.2097 Q.CAP. E 1.594,91 Q.INT. E 168,41 SPESE E 2,00 ADDEBITO");
+
+        refreshMvs();
+
+        var pl = given()
+                .queryParam("from", "%d-%02d-01".formatted(anno, mese))
+                .queryParam("to",   "%d-%02d-30".formatted(anno, mese))
+                .when().get("/api/reporting/pl")
+                .then().statusCode(200).extract().jsonPath();
+
+        assertEquals(170.41, pl.getFloat("oneriFinanziari"), 0.01,
+                "Fase 7: Q.INT. 168,41 + SPESE 2,00 = 170,41 devono comparire negli oneri finanziari");
+        assertEquals(0.0, pl.getFloat("costi.totale"), 0.01,
+                "Fase 7: la rata resta PASSIVITA — non diventa un costo operativo");
+        assertEquals(0.0, pl.getFloat("ebitda"), 0.01,
+                "Fase 7: gli interessi stanno SOTTO l'EBITDA, non lo toccano");
+        assertEquals(-170.41, pl.getFloat("utileNetto"), 0.01,
+                "Fase 7: l'utile netto scende esattamente della quota interessi");
+    }
+
+    /** F7b — una rata che NON dichiara lo split non produce nessuna quota: non si inventa nulla. */
+    @Test @Order(67)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void f7b_rata_senza_split_nella_descrizione_non_genera_interessi() throws Exception {
+        short buId = 1;
+        int anno = 2097, mese = 5;
+
+        insertMovimento(
+                "USCITA", new BigDecimal("2501.17"),
+                LocalDate.of(anno, mese, 10),
+                LocalDate.of(anno, mese, 10),
+                LocalDate.of(anno, mese, 10),
+                (short) 1, metodoContanti, cogePassivitaMutuo, buId,
+                "REGISTRATO", "ADDEBITO RATA MUTUO BPM - NESSUNO SPLIT DICHIARATO");
+
+        refreshMvs();
+
+        assertEquals(0.0, given()
+                .queryParam("from", "%d-%02d-01".formatted(anno, mese))
+                .queryParam("to",   "%d-%02d-31".formatted(anno, mese))
+                .when().get("/api/reporting/pl")
+                .then().statusCode(200).extract().jsonPath().getFloat("oneriFinanziari"), 0.01,
+                "Fase 7: senza Q.INT. nella descrizione non si stima nessun interesse");
+    }
+
+    /**
+     * F6 — Fase 6: il P&amp;L dichiara quanto di sé non è ancora certo. Non cambia nessun totale:
+     * mette accanto al numero l'etichetta di attendibilità (conti transitori, crediti evento,
+     * perimetro ante go-live).
+     */
+    @Test @Order(68)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void f6_qualita_misura_i_transitori_e_il_perimetro() throws Exception {
+        short buId = 1;
+        int anno = 2097, mese = 6;
+
+        Integer cogeRicaviDaClassificare = lookupCoge("39.99.999");
+        insertMovimento(
+                "ENTRATA", new BigDecimal("1000.00"),
+                LocalDate.of(anno, mese, 3), LocalDate.of(anno, mese, 3), LocalDate.of(anno, mese, 3),
+                (short) 1, metodoContanti, cogeRicavoRist, buId, "REGISTRATO", "F6 ricavo certo");
+        insertMovimento(
+                "ENTRATA", new BigDecimal("250.00"),
+                LocalDate.of(anno, mese, 4), LocalDate.of(anno, mese, 4), LocalDate.of(anno, mese, 4),
+                (short) 1, metodoContanti, cogeRicaviDaClassificare, buId, "REGISTRATO", "F6 ricavo da classificare");
+
+        refreshMvs();
+
+        var pl = given()
+                .queryParam("from", "%d-%02d-01".formatted(anno, mese))
+                .queryParam("to",   "%d-%02d-30".formatted(anno, mese))
+                .when().get("/api/reporting/pl")
+                .then().statusCode(200).extract().jsonPath();
+
+        assertEquals(1250.00, pl.getFloat("ricavi.totale"), 0.01,
+                "Fase 6 è additiva: il totale ricavi NON cambia");
+        assertEquals(250.00, pl.getFloat("qualita.nonClassificatoRicavi"), 0.01,
+                "Fase 6: i 250 sul conto transitorio sono dichiarati come non classificati");
+        assertEquals(20.00, pl.getFloat("qualita.nonClassificatoRicaviPct"), 0.01,
+                "Fase 6: 250 su 1250 = 20% dei ricavi ancora da attribuire");
+        assertEquals(false, pl.getBoolean("qualita.perimetroIncompleto"),
+                "Fase 6: un periodo dopo il go-live ha perimetro completo");
+
+        // Una finestra che parte prima del go-live (01/07/2026) è dichiarata incompleta.
+        assertEquals(true, given()
+                .queryParam("from", "2026-06-01")
+                .queryParam("to",   "2026-07-31")
+                .when().get("/api/reporting/pl")
+                .then().statusCode(200).extract().jsonPath().getBoolean("qualita.perimetroIncompleto"),
+                "Fase 6: chiedendo mesi ante go-live il P&L deve dirlo, non fingere che sia confrontabile");
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // HELPERS — inserimento e query MV
     // ════════════════════════════════════════════════════════════════════════
@@ -851,6 +1089,9 @@ class AggregatiPlCashFlowIntegrationTest {
     }
     private double sumCfEntrateFinanziarie(int anno, int mese, short conto) {
         return sumCfColumn("entrate_finanziarie", anno, mese, conto);
+    }
+    private double sumCfEntrateInvestimento(int anno, int mese, short conto) {
+        return sumCfColumn("entrate_investimento", anno, mese, conto);
     }
     private double sumCfFlussoOperativoNetto(int anno, int mese, short conto) {
         return sumCfColumn("flusso_operativo_netto", anno, mese, conto);

@@ -50,7 +50,7 @@ public class ReportingService {
         @SuppressWarnings("unchecked")
         List<Object[]> rows = query.getResultList();
 
-        return buildPlDto(buId, from, to, rows);
+        return buildPlDto(buId, from, to, rows, sommaOneri(oneriDaDescrizione(from, to), buId));
     }
 
     // Versione senza filtro buId usata dal job e da /pl/tutte-bu
@@ -90,6 +90,9 @@ public class ReportingService {
         BigDecimal totImposte         = BigDecimal.ZERO;
 
         BigDecimal ammortamenti = computeAmmortamenti(from, to);
+        // Fase 7: gli interessi dichiarati nella descrizione della rata, per BU — così la somma
+        // delle BU resta uguale al consolidato e questa pagina non diverge da /pl.
+        Map<Short, BigDecimal> oneriDescrPerBu = oneriDaDescrizione(from, to);
 
         // Prima passata per calcolare totale ebitda (necessario per pro-rata D&A per BU)
         BigDecimal sumEbitda = BigDecimal.ZERO;
@@ -103,7 +106,7 @@ public class ReportingService {
             // Solo costi operativi: il capex (r[4]) è investimento, non costo economico
             BigDecimal cos          = toBD(r[3]);
             BigDecimal ebitdaBu     = toBD(r[5]);
-            BigDecimal oneriBu      = toBD(r[6]);
+            BigDecimal oneriBu      = toBD(r[6]).add(oneriDescrPerBu.getOrDefault(buId, BigDecimal.ZERO));
             BigDecimal imposteBu    = toBD(r[7]);
 
             // Distribuisce D&A proporzionalmente all'EBITDA della BU; se sumEbitda ≤ 0 ripartisce in quote uguali
@@ -139,7 +142,8 @@ public class ReportingService {
                         totRicavi, totCosti, totEbitda,
                         ammortamenti, totEbit,
                         totOneriFinanziari, totImposte,
-                        totUtileNetto, totMargPct));
+                        totUtileNetto, totMargPct),
+                computeQualita(null, from, to, totRicavi, totCosti));
     }
 
     // ── GET /api/reporting/cashflow/storico ───────────────────────────────────
@@ -239,9 +243,143 @@ public class ReportingService {
         return risultato;
     }
 
+    // ── Fase 7: interessi passivi dichiarati nella descrizione bancaria ───────
+
+    /** {@code Q.INT. E 168,41} — importo italiano con separatore migliaia opzionale. */
+    private static final java.util.regex.Pattern P_QINT =
+            java.util.regex.Pattern.compile("Q\\.INT\\.\\s*E\\s*([0-9.]+,[0-9]{2})");
+    private static final java.util.regex.Pattern P_SPESE =
+            java.util.regex.Pattern.compile("SPESE\\s*E\\s*([0-9.]+,[0-9]{2})");
+
+    /**
+     * Estrae la quota interessi (+ spese) dalle rate che la dichiarano nella propria descrizione,
+     * per business unit. Esempio reale, rata Asconfidi CA del 06/07/2026:
+     * <pre>RATA N. 003 SCAD. 05.07.2026 Q.CAP. E 1.594,91 Q.INT. E 168,41 SPESE E 2,00</pre>
+     * La riga vale 1.765,32 su un conto PASSIVITA: capitale e interessi stanno insieme e gli
+     * interessi non arrivano mai a conto economico. Qui si leggono dal dato, non si stimano:
+     * <b>se la descrizione non li dichiara, non si inventa nulla</b>.
+     *
+     * <p>Niente doppio conteggio: i conti gia' ONERE_FINANZIARIO sono esclusi, e una rata
+     * collegata a un piano FINANZIAMENTO non passa mai di qui (la riga banca resta parcheggiata
+     * in {@code ricorrenti_da_riconciliare} e il piano genera due movimenti separati, con
+     * descrizione «… (int.)» che non contiene {@code Q.INT.}).
+     *
+     * <p>Guardia percorso-soldi: la quota estratta non puo' superare l'importo della riga.
+     */
+    private Map<Short, BigDecimal> oneriDaDescrizione(LocalDate from, LocalDate to) {
+        @SuppressWarnings("unchecked")
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT m.business_unit_id, m.descrizione, m.importo_lordo " +
+                "FROM movimenti m JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
+                "WHERE m.stato <> 'ANNULLATO' AND pc.tipo <> 'ONERE_FINANZIARIO' " +
+                "AND m.data_competenza BETWEEN :from AND :to " +
+                "AND m.descrizione LIKE '%Q.INT.%'")
+                .setParameter("from", from)
+                .setParameter("to", to)
+                .getResultList();
+
+        Map<Short, BigDecimal> perBu = new HashMap<>();
+        for (Object[] r : rows) {
+            String descrizione = (String) r[1];
+            var mInt = P_QINT.matcher(descrizione);
+            if (!mInt.find()) continue;
+
+            BigDecimal quota = importoItaliano(mInt.group(1));
+            var mSpese = P_SPESE.matcher(descrizione);
+            if (mSpese.find()) quota = quota.add(importoItaliano(mSpese.group(1)));
+
+            if (quota.compareTo(toBD(r[2])) > 0) continue;   // dato incoerente: si lascia stare
+            perBu.merge(toShort(r[0]), quota, BigDecimal::add);
+        }
+        return perBu;
+    }
+
+    private static BigDecimal importoItaliano(String s) {
+        return new BigDecimal(s.replace(".", "").replace(',', '.'));
+    }
+
+    private BigDecimal sommaOneri(Map<Short, BigDecimal> perBu, Short buId) {
+        return buId != null
+                ? perBu.getOrDefault(buId, BigDecimal.ZERO)
+                : perBu.values().stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    // ── Fase 6: attendibilita' del numero (additiva, non cambia nessun totale) ─
+
+    /** Il gestionale riparte da qui: prima non ci sono i costi, quindi il P&amp;L non e' confrontabile. */
+    private static final LocalDate GO_LIVE = LocalDate.of(2026, 7, 1);
+
+    /**
+     * Conti transitori: quelli su cui una riga viene parcheggiata quando l'attribuzione non e'
+     * certa. Non li tocco (decisione D: li cataloga il cliente), li MISURO — cosi' si vede quanto
+     * del numero esposto e' ancora da attribuire.
+     */
+    private static final String TRANSITORI =
+            "(pc.codice LIKE '%99.999' OR pc.descrizione ILIKE '%da classificare%' " +
+            " OR pc.descrizione ILIKE '%temporane%' OR pc.descrizione ILIKE '%transitori%')";
+
+    private PlDTO.QualitaDTO computeQualita(Short buId, LocalDate from, LocalDate to,
+                                            BigDecimal totRicavi, BigDecimal totCosti) {
+        String buFilter = buId != null ? " AND m.business_unit_id = :buId" : "";
+
+        var qTrans = em.createNativeQuery(
+                "SELECT " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' AND pc.tipo='RICAVO' " +
+                "         THEN COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='USCITA' AND pc.tipo='COSTO' AND NOT pc.is_capex " +
+                "         THEN COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0) " +
+                "FROM movimenti m JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
+                "WHERE m.stato <> 'ANNULLATO' AND m.data_competenza BETWEEN :from AND :to " +
+                "AND " + TRANSITORI + buFilter)
+                .setParameter("from", from).setParameter("to", to);
+        if (buId != null) qTrans.setParameter("buId", buId);
+        Object[] trans = (Object[]) qTrans.getSingleResult();
+
+        // Crediti evento: ricavo maturato e non ancora incassato (data_finanziaria NULL).
+        // Oggi vale 0 e lo dice: si popola quando parte la Fase 4.
+        var qCrediti = em.createNativeQuery(
+                "SELECT COALESCE(SUM(m.importo_lordo),0) FROM movimenti m " +
+                "WHERE m.stato <> 'ANNULLATO' AND m.tipo = 'ENTRATA' AND m.evento_id IS NOT NULL " +
+                "AND m.data_finanziaria IS NULL AND m.data_competenza BETWEEN :from AND :to" +
+                (buId != null ? " AND m.business_unit_id = :buId" : ""))
+                .setParameter("from", from).setParameter("to", to);
+        if (buId != null) qCrediti.setParameter("buId", buId);
+        BigDecimal crediti = toBD(qCrediti.getSingleResult());
+
+        boolean perimetroIncompleto = from.isBefore(GO_LIVE);
+        String nota = null;
+        if (perimetroIncompleto) {
+            var qAnte = em.createNativeQuery(
+                    "SELECT COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' AND pc.tipo='RICAVO' " +
+                    "       THEN COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0) " +
+                    "FROM movimenti m JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
+                    "WHERE m.stato <> 'ANNULLATO' AND m.data_competenza BETWEEN :from AND :ante" +
+                    (buId != null ? " AND m.business_unit_id = :buId" : ""))
+                    .setParameter("from", from).setParameter("ante", GO_LIVE.minusDays(1));
+            if (buId != null) qAnte.setParameter("buId", buId);
+            BigDecimal ricaviAnte = toBD(qAnte.getSingleResult());
+            nota = "Il periodo include mesi anteriori al " + GO_LIVE
+                    + ": " + ricaviAnte.setScale(2, RoundingMode.HALF_UP)
+                    + " € di ricavi ante go-live senza i costi corrispondenti.";
+        }
+
+        return new PlDTO.QualitaDTO(
+                toBD(trans[0]), pct(toBD(trans[0]), totRicavi),
+                toBD(trans[1]), pct(toBD(trans[1]), totCosti),
+                crediti, perimetroIncompleto, nota);
+    }
+
+    private static BigDecimal pct(BigDecimal parte, BigDecimal totale) {
+        return totale.compareTo(BigDecimal.ZERO) > 0
+                ? parte.divide(totale, 4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
+                        .setScale(2, RoundingMode.HALF_UP)
+                : BigDecimal.ZERO;
+    }
+
     // ── helpers privati ───────────────────────────────────────────────────────
 
-    private PlDTO buildPlDto(Short buId, LocalDate from, LocalDate to, List<Object[]> rows) {
+    private PlDTO buildPlDto(Short buId, LocalDate from, LocalDate to, List<Object[]> rows,
+                             BigDecimal oneriDaDescrizione) {
         List<VoceDTO> vociRicavi  = new ArrayList<>();
         List<VoceDTO> vociCosti   = new ArrayList<>();
         BigDecimal totRicavi          = BigDecimal.ZERO;
@@ -282,6 +420,11 @@ public class ReportingService {
             }
         }
 
+        // Fase 7: gli interessi che la banca dichiara nella descrizione della rata non hanno
+        // un conto ONERE_FINANZIARIO a DB (la rata e' classificata PASSIVITA per intero), quindi
+        // la MV non li vede. Qui si sommano a ciò che la MV ha già: nessuna riga viene toccata.
+        totOneriFinanziari = totOneriFinanziari.add(oneriDaDescrizione);
+
         BigDecimal ammortamenti = computeAmmortamenti(from, to);
         BigDecimal ebit         = totEbitda.subtract(ammortamenti);
         BigDecimal ebt          = ebit.subtract(totOneriFinanziari);
@@ -300,7 +443,8 @@ public class ReportingService {
                 new PlDTO.CostiDTO(totCosti, totCapex, vociCosti),
                 totEbitda, ammortamenti, ebit,
                 totOneriFinanziari, ebt, totImposte, utileNetto,
-                marginePct
+                marginePct,
+                computeQualita(buId, from, to, totRicavi, totCosti)
         );
     }
 
@@ -352,7 +496,9 @@ public class ReportingService {
         @SuppressWarnings("unchecked")
         List<Object[]> rows = em.createNativeQuery(
                 "SELECT anno, mese, " +
-                "COALESCE(SUM(entrate_operative + entrate_finanziarie),0), " +
+                // entrate_investimento (V37): un'ENTRATA su conto capex (rimborso/disinvestimento)
+                // prima non stava in nessuna colonna e spariva dal totale entrate.
+                "COALESCE(SUM(entrate_operative + entrate_investimento + entrate_finanziarie),0), " +
                 "COALESCE(SUM(uscite_operative + uscite_investimento + uscite_finanziarie),0) " +
                 "FROM mv_cash_flow_statement " +
                 "WHERE (anno * 100 + mese) >= :fromYM AND (anno * 100 + mese) <= :toYM " +

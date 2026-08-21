@@ -47,6 +47,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -58,6 +59,17 @@ public class EventiService {
     /** Foglie di ricavo della BU "Cerimonie ed Eventi" (piano dei conti, mastro 30.02). */
     private static final String COGE_CAPARRE_EVENTI = "30.02.001";
     private static final String COGE_SALDI_EVENTI   = "30.02.002";
+
+    /**
+     * Fase 4 — SPEC {@code docs/specs/competenza-ricavo-evento.md}.
+     * Marcatore della riga di ricavo maturato e non ancora incassato. NON è un pagamento:
+     * non ha banca né data finanziaria, quindi il conto economico la vede e la vista
+     * finanziaria no. I filtri esistenti su CAPARRA/ACCONTO/SALDO non la intercettano.
+     */
+    static final String TIPO_COMPETENZA = "COMPETENZA";
+
+    /** Data di apertura del gestionale: prima non esiste un conto economico (reset go-live). */
+    private static final LocalDate GO_LIVE = LocalDate.of(2026, 7, 1);
 
     /**
      * Timezone di riferimento per le validazioni di date che derivano da
@@ -1136,6 +1148,10 @@ public class EventiService {
                 .setParameter("eid", e.id)
                 .getSingleResult();
         e.importoTotalePreviventivato = tot;
+
+        // Fase 4 / R7: il preventivo è uno dei due termini del credito. Se cambia qui, la riga
+        // di competenza si riallinea subito, non alla prossima mutazione.
+        allineaRigaDiCompetenza(e);
     }
 
     private BigDecimal calcolaTotaleConsuntivato(UUID eventoId) {
@@ -1197,8 +1213,8 @@ public class EventiService {
     private void ricalcolaIncassi(Evento evento) {
         Object[] r = (Object[]) em.createQuery(
                 "SELECT " +
-                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo ELSE 0 END), 0), " +
-                "COALESCE(SUM(CASE WHEN m.tipoEventoMovimento='CAPARRA' AND m.tipo='ENTRATA' THEN m.importo ELSE 0 END), 0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' AND m.dataFinanziaria IS NOT NULL THEN m.importo ELSE 0 END), 0), " +
+                "COALESCE(SUM(CASE WHEN m.tipoEventoMovimento='CAPARRA' AND m.tipo='ENTRATA' AND m.dataFinanziaria IS NOT NULL THEN m.importo ELSE 0 END), 0), " +
                 "COALESCE(SUM(CASE WHEN m.tipo='USCITA' THEN m.importo ELSE 0 END), 0) " +
                 "FROM Movimento m WHERE m.eventoId = :eid AND m.stato != 'ANNULLATO'")
                 .setParameter("eid", evento.id)
@@ -1207,6 +1223,146 @@ public class EventiService {
         evento.importoIncassato       = (BigDecimal) r[0];
         evento.caparreIncassate       = (BigDecimal) r[1];
         evento.costiDirettiImputati   = (BigDecimal) r[2];
+
+        allineaRigaDiCompetenza(evento);
+    }
+
+    // ── FASE 4 — competenza del ricavo evento ─────────────────────────────────
+    // SPEC: docs/specs/competenza-ricavo-evento.md
+
+    /**
+     * Porta la riga di competenza dell'evento a {@code preventivato − incassato}, creandola,
+     * restringendola o annullandola. Idempotente: chiamarla due volte non cambia nulla.
+     *
+     * È agganciata a {@link #ricalcolaIncassi} e a {@link #ricalcolaPreventivato}, cioè ai due
+     * punti che muovono i termini della sottrazione: così l'invariante I1 della SPEC
+     * («il ricavo di un evento nel perimetro è il preventivato, sempre») resta vero per
+     * costruzione, senza che ogni chiamante debba ricordarsene.
+     *
+     * DECISIONE B del piano: l'incasso NON crea un secondo ricavo, restringe questo. Il ricavo
+     * totale dell'evento non si muove quando arrivano i soldi — si sposta soltanto dalla colonna
+     * "credito" alla colonna "incassato".
+     *
+     * ⚠️ INVARIANTE I2, la riga che romperebbe la vista finanziaria: banca, metodo di pagamento e
+     * data finanziaria restano NULL. {@code mv_saldi_conti} non filtra su {@code data_finanziaria},
+     * usa {@code COALESCE(data_finanziaria, data_movimento)}: con un conto bancario valorizzato il
+     * saldo si gonfierebbe dell'intero credito (15.566 € sul solo luglio, misurati il 21/08/2026).
+     */
+    private void allineaRigaDiCompetenza(Evento e) {
+        Optional<Movimento> esistente = movimentiRepo
+                .find("eventoId = ?1 AND tipoEventoMovimento = ?2 AND stato <> 'ANNULLATO'",
+                      e.id, TIPO_COMPETENZA)
+                .firstResultOptional();
+
+        // La data evento è la partition key della riga: se cambia, la riga si rifà da capo
+        // invece di migrare fra partizioni.
+        if (esistente.isPresent() && !esistente.get().dataMovimento.equals(e.dataEvento)) {
+            esistente.get().stato = "ANNULLATO";
+            esistente = Optional.empty();
+        }
+
+        BigDecimal residuo = residuoDaMaturare(e);
+
+        if (residuo.compareTo(SOGLIA_SALDO) < 0) {
+            esistente.ifPresent(m -> m.stato = "ANNULLATO");
+            return;
+        }
+
+        Movimento m = esistente.orElseGet(() -> creaRigaDiCompetenza(e));
+        m.importo = residuo;
+    }
+
+    /**
+     * Quanto ricavo dell'evento è maturato ma non ancora incassato. Zero fuori dal perimetro
+     * deciso il 21/08/2026 (SPEC §Perimetro): il ricavo nasce alla data dell'evento (D1), quindi
+     * un evento futuro non ha ancora maturato nulla, e prima del go-live non esiste un conto
+     * economico da alimentare — i 58 eventi SALDATO ante go-live hanno l'incassato storico senza
+     * i movimenti che lo giustificano, e generare loro un credito significherebbe inventare
+     * 101.823 € di ricavo.
+     */
+    private BigDecimal residuoDaMaturare(Evento e) {
+        if (e.dataEvento == null || e.importoTotalePreviventivato == null) return BigDecimal.ZERO;
+        if ("ANNULLATO".equals(e.stato))                                   return BigDecimal.ZERO;
+        if (e.dataEvento.isBefore(GO_LIVE))                                return BigDecimal.ZERO;
+        if (e.dataEvento.isAfter(LocalDate.now(ITALY)))                    return BigDecimal.ZERO;
+
+        return e.importoTotalePreviventivato.subtract(incassatoDaiMovimenti(e));
+    }
+
+    /**
+     * L'incassato letto dai MOVIMENTI, non dalla colonna denormalizzata {@code importoIncassato}.
+     *
+     * Non è pignoleria: quella colonna va stale. Annullando un pagamento da
+     * {@code DELETE /api/movimenti/{id}} i totali dell'evento non vengono riallineati — è
+     * documentato in {@code Movimento.java} («il trigger è stato RIMOSSO in V20 … il ricalcolo
+     * scatta alla mutazione successiva di quell'evento passando da EventiService»).
+     *
+     * CONTROESEMPIO MISURATO il 21/08/2026 sulla copia di produzione: annullati due incassi da
+     * 400 e 600 sull'evento «Elena molteni», la colonna continuava a dire 3.550,00 mentre i
+     * movimenti dicevano 2.550,00 — e il credito da 1.000,00 non tornava, cioè il P&L
+     * sottostimava i ricavi di 1.000,00 €. Leggere la somma vera rende il riallineamento
+     * self-healing e toglie la dipendenza da una colonna che può essere vecchia.
+     */
+    private BigDecimal incassatoDaiMovimenti(Evento e) {
+        return (BigDecimal) em.createQuery(
+                "SELECT COALESCE(SUM(m.importo), 0) FROM Movimento m " +
+                "WHERE m.eventoId = :eid AND m.tipo = 'ENTRATA' AND m.stato <> 'ANNULLATO' " +
+                "AND m.dataFinanziaria IS NOT NULL")
+                .setParameter("eid", e.id)
+                .getSingleResult();
+    }
+
+    /** L'importo lo mette il chiamante: qui si costruisce solo la forma della riga (I2). */
+    private Movimento creaRigaDiCompetenza(Evento e) {
+        Movimento m = new Movimento();
+        m.tipo                = "ENTRATA";
+        m.importo             = BigDecimal.ZERO;
+        m.importoCommissione  = BigDecimal.ZERO;
+        m.dataMovimento       = e.dataEvento;
+        m.dataCompetenza      = e.dataEvento;   // il ricavo è dell'evento, non dell'incasso
+        m.dataFinanziaria     = null;           // I2 — non è denaro entrato
+        m.dataLiquidita       = e.dataEvento;   // scadenza attesa: obbligatoria sui DA_LIQUIDARE
+        m.contoBancarioId     = null;           // I2
+        m.metodoPagamentoId   = null;           // I2
+        m.stato               = "DA_LIQUIDARE";
+        m.eventoId            = e.id;
+        m.tipoEventoMovimento = TIPO_COMPETENZA;
+        m.businessUnitId      = e.businessUnitId != null ? e.businessUnitId : 2;
+        m.contoCoge           = lookupCogeRicavi("SALDO");   // 30.02.002 Saldi eventi
+        m.descrizione         = "[EVENTO] " + spogliaSegnaposto(e.nome) + " – da incassare";
+        m.fonte               = "MANUALE";
+        m.createdBy           = e.createdBy;
+        movimentiRepo.persist(m);
+        return m;
+    }
+
+    /**
+     * Riallinea le righe di competenza di tutti gli eventi del perimetro: backfill delle 15
+     * celebrate prima di oggi, e maturazione di quelle che diventano passate col trascorrere
+     * dei giorni. Idempotente — è pensata per essere rilanciata (endpoint ADMIN + scheduler
+     * giornaliero), non per girare una volta sola.
+     *
+     * @return numero di eventi toccati e totale del credito aperto che ne risulta
+     */
+    @Transactional
+    public Map<String, Object> allineaCompetenzaEventi() {
+        List<Evento> eventi = repo.list(
+                "dataEvento >= ?1 AND dataEvento <= ?2 AND stato <> 'ANNULLATO'",
+                GO_LIVE, LocalDate.now(ITALY));
+
+        for (Evento e : eventi) {
+            allineaRigaDiCompetenza(e);
+        }
+        em.flush();
+
+        BigDecimal credito = (BigDecimal) em.createQuery(
+                "SELECT COALESCE(SUM(m.importo), 0) FROM Movimento m " +
+                "WHERE m.tipoEventoMovimento = :t AND m.stato <> 'ANNULLATO'")
+                .setParameter("t", TIPO_COMPETENZA)
+                .getSingleResult();
+
+        mvRefresh.requestRefreshAfterCommit();
+        return Map.of("eventiEsaminati", eventi.size(), "creditoAperto", credito);
     }
 
     /**

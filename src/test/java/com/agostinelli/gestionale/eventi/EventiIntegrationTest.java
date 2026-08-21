@@ -956,12 +956,288 @@ class EventiIntegrationTest {
         String id = creaEventoConfermato("Evento Extra No PL", "500");
         dataEventoAIeri(id);
 
+        // Fase 4: `dataEventoAIeri` sposta la data con SQL diretto, quindi il service non ha
+        // ancora visto l'evento entrare nel perimetro e la sua riga di competenza non esiste.
+        // Nascerebbe alla prima mutazione — cioe' dentro la finestra di misura, confondendo la
+        // maturazione del ricavo (Fase 4) con il preteso ricavo da consuntivo (cio' che si misura
+        // qui). Un esperimento, una variabile: si riallinea PRIMA di leggere `prima`.
+        given().when().post("/api/eventi/allinea-competenza").then().statusCode(200);
+
         java.math.BigDecimal prima = ricaviAnno(2026);
         aggiungiVoce(id, "Extra A3 pl", "250.00", "0", "1");
         java.math.BigDecimal dopo = ricaviAnno(2026);
 
         assertEquals(0, prima.compareTo(dopo),
                 "una voce a consuntivo non genera ricavo: il P&L legge i movimenti");
+    }
+
+    // ── 10. FASE 4 — competenza del ricavo evento ─────────────────────────────
+    // SPEC: docs/specs/competenza-ricavo-evento.md
+    //
+    // CONTROPROVA ESEGUITA il 21/08/2026: togliendo le 3 chiamate a allineaRigaDiCompetenza da
+    // ricalcolaIncassi/ricalcolaPreventivato, 5 test di questo blocco vanno rossi (f4a, f4b, f4e,
+    // f4f, f4h). Gli altri 3 restano verdi per costruzione: f4c, f4d e f4g asseriscono che la riga
+    // NON c'e' o non gonfia l'incassato — sono la guardia sul verso opposto, non un doppione.
+
+    /**
+     * R1 — un evento celebrato dal go-live in poi porta UNA riga di competenza pari al residuo,
+     * e quella riga non tocca il denaro (I2: banca, metodo e data finanziaria NULL).
+     */
+    @Test
+    @Order(170)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void f4a_eventoCelebratoConResiduo_haUnaRigaDiCompetenzaSenzaBanca() {
+        String id = creaEventoConfermato("F4 Residuo", "2000");
+        dataEventoAIeri(id);
+        pagamento(id, "CAPARRA", "500.00");   // passa dal service: riallinea
+
+        Object[] r = rigaDiCompetenza(id);
+        assertNotNull(r, "l'evento celebrato con residuo deve avere la sua riga di competenza");
+        assertEquals(0, new java.math.BigDecimal("1500.00").compareTo((java.math.BigDecimal) r[0]),
+                "la riga vale preventivato - incassato");
+        assertNull(r[1], "I2: nessun conto bancario, altrimenti il saldo si gonfia");
+        assertNull(r[2], "I2: nessun metodo di pagamento");
+        assertNull(r[3], "I2: nessuna data finanziaria, non sono soldi entrati");
+        assertEquals("DA_LIQUIDARE", r[4]);
+        assertEquals(1, contaRigheDiCompetenza(id), "I3: una sola riga di competenza per evento");
+    }
+
+    /**
+     * R2 + I1 — l'incasso parziale RESTRINGE la riga di competenza (decisione B): il ricavo
+     * totale dell'evento non si muove di un centesimo, si sposta solo da credito a incassato.
+     */
+    @Test
+    @Order(171)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void f4b_incassoParziale_nonMuoveIlRicavoTotale() {
+        String id = creaEventoConfermato("F4 Invariante", "3000");
+        dataEventoAIeri(id);
+        pagamento(id, "CAPARRA", "1000.00");
+
+        java.math.BigDecimal dopoPrimo = ricavoTotaleEvento(id);
+        assertEquals(0, new java.math.BigDecimal("3000.00").compareTo(dopoPrimo),
+                "I1: il ricavo dell'evento e' il preventivato, gia' dopo il primo incasso");
+
+        pagamento(id, "ACCONTO", "800.00");
+        assertEquals(0, dopoPrimo.compareTo(ricavoTotaleEvento(id)),
+                "I1: un secondo incasso non aggiunge ricavo, sposta il credito");
+        assertEquals(0, new java.math.BigDecimal("1200.00").compareTo(importoDiCompetenza(id)),
+                "la riga di competenza si e' ristretta dell'importo incassato");
+        assertEquals(1, contaRigheDiCompetenza(id), "I3: sempre una sola riga");
+    }
+
+    /** R3 — all'incasso a saldo la riga di competenza sparisce e il ricavo resta il preventivato. */
+    @Test
+    @Order(172)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void f4c_incassoASaldo_chiudeLaRigaDiCompetenza() {
+        String id = creaEventoConfermato("F4 Saldo", "1000");
+        dataEventoAIeri(id);
+        pagamento(id, "CAPARRA", "400.00");
+        pagamento(id, "SALDO",   "600.00");
+
+        assertEquals(0, contaRigheDiCompetenza(id), "incassato tutto: nessun credito residuo");
+        assertEquals(0, new java.math.BigDecimal("1000.00").compareTo(ricavoTotaleEvento(id)),
+                "I1: il ricavo resta il preventivato anche a evento saldato");
+    }
+
+    /**
+     * R5 — la riga di competenza non e' un incasso: `importo_incassato` non la vede e l'evento
+     * NON si auto-salda. Senza il filtro su dataFinanziaria in ricalcolaIncassi, un evento con
+     * residuo diventerebbe SALDATO da solo e rifiuterebbe i pagamenti veri.
+     */
+    @Test
+    @Order(173)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void f4d_laRigaDiCompetenzaNonGonfiaLIncassato() {
+        String id = creaEventoConfermato("F4 Non Incassato", "2500");
+        dataEventoAIeri(id);
+        pagamento(id, "CAPARRA", "500.00");
+
+        given().when().get("/api/eventi/" + id)
+            .then().statusCode(200)
+            .body("importoIncassato", equalTo(500.0f))
+            .body("stato", equalTo("CONFERMATO"));
+    }
+
+    /** R6 — riallineare due volte non crea una seconda riga e non muove nessun totale. */
+    @Test
+    @Order(174)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void f4e_riallineamentoIdempotente() {
+        String id = creaEventoConfermato("F4 Idempotente", "1800");
+        dataEventoAIeri(id);
+        pagamento(id, "CAPARRA", "300.00");
+
+        java.math.BigDecimal prima = ricavoTotaleEvento(id);
+        given().when().post("/api/eventi/allinea-competenza").then().statusCode(200);
+        given().when().post("/api/eventi/allinea-competenza").then().statusCode(200);
+
+        assertEquals(1, contaRigheDiCompetenza(id), "I3: due riallineamenti, una sola riga");
+        assertEquals(0, prima.compareTo(ricavoTotaleEvento(id)), "nessun totale si e' mosso");
+    }
+
+    /** R8 — il rimborso fa RICRESCERE il credito: il ricavo dell'evento resta il preventivato. */
+    @Test
+    @Order(175)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void f4f_rimborsoFaRicrescereIlCredito() {
+        String id = creaEventoConfermato("F4 Rimborso", "1000");
+        dataEventoAIeri(id);
+        pagamento(id, "CAPARRA", "600.00");
+        assertEquals(0, new java.math.BigDecimal("400.00").compareTo(importoDiCompetenza(id)));
+
+        pagamento(id, "RIMBORSO", "200.00");
+        assertEquals(0, new java.math.BigDecimal("600.00").compareTo(importoDiCompetenza(id)),
+                "restituiti 200: il credito da incassare risale a 600");
+        assertEquals(0, new java.math.BigDecimal("1000.00").compareTo(ricavoTotaleEvento(id)),
+                "I1: il ricavo dell'evento resta il preventivato");
+    }
+
+    /**
+     * Perimetro (SPEC §Perimetro) — un evento FUTURO non ha ancora maturato nulla (D1: il ricavo
+     * nasce alla data evento) e un evento ANTE GO-LIVE sta fuori dal conto economico.
+     */
+    @Test
+    @Order(176)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void f4g_fuoriPerimetroNessunaRigaDiCompetenza() {
+        String futuro = creaEventoConfermato("F4 Futuro", "5000");   // dataEvento 2026-12-15
+        pagamento(futuro, "CAPARRA", "500.00");
+        assertEquals(0, contaRigheDiCompetenza(futuro),
+                "evento non ancora celebrato: nessun ricavo maturato");
+
+        String anteGoLive = creaEventoConfermato("F4 Ante Go-Live", "4000");
+        dataEventoA(anteGoLive, "2026-05-10");
+        given().when().post("/api/eventi/allinea-competenza").then().statusCode(200);
+        assertEquals(0, contaRigheDiCompetenza(anteGoLive),
+                "prima del go-live non esiste un conto economico da alimentare");
+    }
+
+    /**
+     * R4 — la vista finanziaria non si accorge di niente. E' l'invariante che protegge la parte
+     * dell'app che gia' quadra al centesimo con gli estratti conto.
+     */
+    @Test
+    @Order(177)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void f4h_saldiConti_invariatiDopoLeRigheDiCompetenza() {
+        String id = creaEventoConfermato("F4 Saldi", "7000");
+        dataEventoAIeri(id);
+        pagamento(id, "CAPARRA", "100.00");   // 6.900 di credito nascono qui
+
+        java.math.BigDecimal saldoPrima = saldoTotaleConti();
+        given().when().post("/api/eventi/allinea-competenza").then().statusCode(200);
+        assertTrue(importoDiCompetenza(id).compareTo(java.math.BigDecimal.ZERO) > 0,
+                "premessa del test: il credito esiste davvero");
+        assertEquals(0, saldoPrima.compareTo(saldoTotaleConti()),
+                "R4: mv_saldi_conti non deve muoversi di un centesimo");
+    }
+
+    /**
+     * REGRESSIONE — il credito si ricalcola dai MOVIMENTI, non dalla colonna denormalizzata.
+     *
+     * `DELETE /api/movimenti/{id}` annulla l'incasso ma NON riallinea `eventi.importo_incassato`
+     * (documentato in Movimento.java: il trigger e' stato rimosso in V20). Fidandosi di quella
+     * colonna, il riallineamento non farebbe ricomparire il credito e il P&L resterebbe
+     * sottostimato dell'importo annullato.
+     *
+     * CONTROESEMPIO MISURATO il 21/08/2026 sulla copia di produzione, evento «Elena molteni»:
+     * annullati 400 + 600, la colonna diceva ancora 3.550,00 contro i 2.550,00 dei movimenti, e
+     * i 1.000,00 di credito non tornavano.
+     * CONTROPROVA ESEGUITA: rimettendo `e.importoIncassato` al posto di `incassatoDaiMovimenti(e)`
+     * questo test va rosso.
+     */
+    @Test
+    @Order(178)
+    @TestSecurity(user = TEST_USER_UUID, roles = {"ADMIN"})
+    void f4i_incassoAnnullatoDaFuori_faTornareIlCredito() {
+        String id = creaEventoConfermato("F4 Annullo", "1200");
+        dataEventoAIeri(id);
+        pagamento(id, "CAPARRA", "500.00");
+        assertEquals(0, new java.math.BigDecimal("700.00").compareTo(importoDiCompetenza(id)));
+
+        String movId = (String) em.createNativeQuery(
+                "SELECT CAST(id AS text) FROM movimenti WHERE evento_id = CAST(:e AS uuid) " +
+                "AND tipo_evento_movimento = 'CAPARRA' AND stato <> 'ANNULLATO'")
+                .setParameter("e", id).getSingleResult();
+        given().when().delete("/api/movimenti/" + movId).then().statusCode(204);
+
+        given().when().post("/api/eventi/allinea-competenza").then().statusCode(200);
+        assertEquals(0, new java.math.BigDecimal("1200.00").compareTo(importoDiCompetenza(id)),
+                "annullato l'incasso, il credito deve tornare pieno: il P&L non perde ricavo");
+    }
+
+    /**
+     * Le fixture della Fase 4 incassano su un conto bancario vero (5.100 € in totale). Lasciate
+     * a libro finiscono in {@code mv_saldi_conti} e spostano l'oracolo SALDO CA di
+     * {@code TermometroLuglioIntegrationTest}, che gira sullo STESSO {@code agosdb_test} e somma
+     * TUTTI i movimenti del conto senza filtrare per {@code fonte_importazione_id}.
+     * Misurato il 21/08/2026: delta SALDO CA 1.787,05 → 6.887,05 con le fixture in piedi.
+     * Stesso problema e stessa cura del reset di TermometroLuglioIntegrationTest#after().
+     *
+     * No-op per tutti gli altri test della classe: tocca solo gli eventi «F4 …».
+     */
+    @AfterEach
+    void ripulisciFixtureFase4() {
+        QuarkusTransaction.requiringNew().run(() -> {
+            em.createNativeQuery("DELETE FROM movimenti WHERE evento_id IN "
+                    + "(SELECT id FROM eventi WHERE nome LIKE 'F4 %')").executeUpdate();
+            em.createNativeQuery("DELETE FROM eventi WHERE nome LIKE 'F4 %'").executeUpdate();
+        });
+    }
+
+    // ── helper Fase 4 ──────────────────────────────────────────────────────────
+
+    private void pagamento(String eventoId, String tipo, String importo) {
+        given().contentType(ContentType.JSON)
+                .body(buildPagamentoRequest(tipo, importo))
+                .when().post("/api/eventi/" + eventoId + "/pagamenti")
+                .then().statusCode(201);
+    }
+
+    /** [importo, contoBancarioId, metodoPagamentoId, dataFinanziaria, stato] oppure null. */
+    private Object[] rigaDiCompetenza(String eventoId) {
+        var righe = em.createNativeQuery(
+                "SELECT importo_lordo, conto_bancario_id, metodo_pagamento_id, data_finanziaria, stato " +
+                "FROM movimenti WHERE evento_id = CAST(:e AS uuid) " +
+                "AND tipo_evento_movimento = 'COMPETENZA' AND stato <> 'ANNULLATO'")
+                .setParameter("e", eventoId).getResultList();
+        return righe.isEmpty() ? null : (Object[]) righe.get(0);
+    }
+
+    private int contaRigheDiCompetenza(String eventoId) {
+        return ((Number) em.createNativeQuery(
+                "SELECT count(*) FROM movimenti WHERE evento_id = CAST(:e AS uuid) " +
+                "AND tipo_evento_movimento = 'COMPETENZA' AND stato <> 'ANNULLATO'")
+                .setParameter("e", eventoId).getSingleResult()).intValue();
+    }
+
+    private java.math.BigDecimal importoDiCompetenza(String eventoId) {
+        return (java.math.BigDecimal) em.createNativeQuery(
+                "SELECT COALESCE(SUM(importo_lordo),0) FROM movimenti WHERE evento_id = CAST(:e AS uuid) " +
+                "AND tipo_evento_movimento = 'COMPETENZA' AND stato <> 'ANNULLATO'")
+                .setParameter("e", eventoId).getSingleResult();
+    }
+
+    /** I1: somma dei movimenti di ricavo dell'evento — incassi + credito ancora aperto. */
+    private java.math.BigDecimal ricavoTotaleEvento(String eventoId) {
+        return (java.math.BigDecimal) em.createNativeQuery(
+                "SELECT COALESCE(SUM(importo_lordo),0) FROM movimenti WHERE evento_id = CAST(:e AS uuid) " +
+                "AND tipo = 'ENTRATA' AND stato <> 'ANNULLATO'")
+                .setParameter("e", eventoId).getSingleResult();
+    }
+
+    private java.math.BigDecimal saldoTotaleConti() {
+        em.createNativeQuery("SELECT fn_refresh_all_mv()").getSingleResult();
+        return (java.math.BigDecimal) em.createNativeQuery(
+                "SELECT COALESCE(SUM(saldo_calcolato),0) FROM mv_saldi_conti").getSingleResult();
+    }
+
+    private void dataEventoA(String eventoId, String data) {
+        QuarkusTransaction.requiringNew().run(() -> em.createNativeQuery(
+                "UPDATE eventi SET data_evento = CAST(:d AS date) WHERE id = CAST(:i AS uuid)")
+                .setParameter("d", data).setParameter("i", eventoId).executeUpdate());
     }
 
     // ── 9. Pagamenti – RIMBORSO ───────────────────────────────────────────────

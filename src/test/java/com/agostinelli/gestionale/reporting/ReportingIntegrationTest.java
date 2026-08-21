@@ -643,6 +643,58 @@ class ReportingIntegrationTest {
         }
     }
 
+    /**
+     * REGRESSIONE Fase 4, secondo caso — il ramo WEEK di /cashflow/storico aggrega per
+     * `data_movimento` e non filtrava la data finanziaria: le righe di ricavo maturato-non-incassato
+     * ci entravano come se fossero soldi arrivati in conto.
+     *
+     * MISURATO IN PRODUZIONE il 21/08/2026: stessa chiamata, stesso periodo, entrate di luglio
+     * 42.059,14 con granularity=MONTH e 48.005,14 con WEEK.
+     *
+     * ⚠️ Il test verifica SOLO che le righe senza data finanziaria restino fuori. La divergenza di
+     * fondo fra i due rami (MONTH per data_finanziaria, WEEK per data_movimento, 9.620,00 € di
+     * scarto strutturale su luglio) resta aperta ed è una decisione, non un refuso.
+     * CONTROPROVA ESEGUITA: togliendo il filtro questo test va rosso.
+     */
+    @Test
+    @Order(79)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void cashFlowWEEK_ignoraLeRigheSenzaDataFinanziaria() {
+        java.math.BigDecimal prima = entrateCashFlowWeek();
+
+        int cogeRicaviEventi = ((Number) em.createNativeQuery(
+                "SELECT id FROM piano_dei_conti_coge WHERE codice = '30.02.002'")
+                .getSingleResult()).intValue();
+
+        String movId = given().contentType(ContentType.JSON)
+                .body("""
+                      {"tipo":"ENTRATA","importo":1234.00,"dataMovimento":"2026-07-15",
+                       "dataCompetenza":"2026-07-15","dataLiquidita":"2026-07-15",
+                       "businessUnitId":2,"contoCoge":%d,
+                       "descrizione":"[TEST] credito senza banca, cash flow"}
+                      """.formatted(cogeRicaviEventi))
+                .when().post("/api/movimenti")
+                .then().statusCode(201).extract().path("id");
+        try {
+            assertEquals(0, prima.compareTo(entrateCashFlowWeek()),
+                    "il cash flow conta i soldi transitati, non i crediti aperti");
+        } finally {
+            given().when().delete("/api/movimenti/" + movId).then().statusCode(204);
+        }
+    }
+
+    /** Somma delle entrate di luglio 2026 secondo /cashflow/storico?granularity=WEEK. */
+    private java.math.BigDecimal entrateCashFlowWeek() {
+        java.util.List<java.util.Map<String, Object>> righe = given()
+                .queryParam("from", "2026-07-01").queryParam("to", "2026-07-31")
+                .queryParam("granularity", "WEEK")
+                .when().get("/api/reporting/cashflow/storico")
+                .then().statusCode(200).extract().jsonPath().getList("$");
+        java.math.BigDecimal tot = java.math.BigDecimal.ZERO;
+        for (var r : righe) tot = tot.add(new java.math.BigDecimal(r.get("entrate").toString()));
+        return tot;
+    }
+
     /** Somma delle entrate di luglio 2026 secondo /api/dashboard/fatturato-per-bu. */
     private java.math.BigDecimal entrateFatturatoBu() {
         java.util.List<java.util.Map<String, Object>> righe = given()

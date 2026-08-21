@@ -528,21 +528,32 @@ public class ReportingService {
     private List<CashFlowPeriodoDTO> getCashFlowSettimanale(LocalDate from, LocalDate to) {
         @SuppressWarnings("unchecked")
         List<Object[]> rows = em.createNativeQuery(
-                "SELECT DATE_TRUNC('week', data_movimento) AS settimana, " +
-                "COALESCE(SUM(CASE WHEN tipo='ENTRATA' THEN importo_lordo ELSE 0 END),0), " +
-                "COALESCE(SUM(CASE WHEN tipo='USCITA'  THEN importo_lordo ELSE 0 END),0) " +
-                "FROM movimenti " +
-                "WHERE stato != 'ANNULLATO' AND data_movimento BETWEEN :from AND :to " +
-                // Fase 4 — è un CASH flow: una riga senza data_finanziaria non è denaro
-                // transitato. Senza questo filtro le righe di ricavo maturato-non-incassato
-                // entravano fra le entrate: misurato in produzione il 21/08/2026, la stessa
-                // chiamata dava 42.059,14 con granularity=MONTH e 48.005,14 con WEEK.
-                // ⚠️ NON chiude la divergenza di fondo fra i due rami: MONTH aggrega per
-                // data_finanziaria (mv_cash_flow_statement), questo per data_movimento, e
-                // restano 9.620,00 € di scarto strutturale su luglio. È una decisione aperta,
-                // non un refuso: vedi docs/specs/misure/sessione-8-fasi-8-4-5-2026-08-21.md §6.
-                "AND data_finanziaria IS NOT NULL " +
-                "GROUP BY DATE_TRUNC('week', data_movimento) " +
+                "SELECT DATE_TRUNC('week', m.data_finanziaria) AS settimana, " +
+                "COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' THEN m.importo_lordo ELSE 0 END),0), " +
+                "COALESCE(SUM(CASE WHEN m.tipo='USCITA'  THEN m.importo_lordo ELSE 0 END),0) " +
+                // Stessa base di getCashFlowMensile: i due rami rispondevano alla stessa domanda
+                // con due basi diverse (MONTH da mv_cash_flow_statement per data_finanziaria,
+                // WEEK da movimenti per data_movimento) e su luglio 2026 davano 42.059,14 contro
+                // 32.439,14 — 9.620,00 € di scarto strutturale. Decisione dell'utente del
+                // 21/08/2026: un CASH flow si aggrega per data di liquidazione, WEEK si allinea.
+                //
+                // I due JOIN e il NOT ATTIVITA replicano i secchi della MV (V37), non sono
+                // decorazione: la MV somma entrate/uscite operative + investimento + finanziarie,
+                // e una riga ATTIVITA non-capex non cade in nessuno dei tre. Su luglio è un
+                // giroconto da 300,00 fra conto 2 e conto 1 (COGE 10.03.001, 06/07): senza questo
+                // predicato WEEK dava 42.359,14 / 49.336,83 contro i 42.059,14 / 49.036,83 di
+                // MONTH. Con, coincidono al centesimo su entrambi i lati (misurato su
+                // agosdb_postdeploy, copia della produzione del 21/08).
+                //
+                // data_finanziaria IS NOT NULL non serve più: lo implica il BETWEEN. È il filtro
+                // che teneva fuori le righe di competenza della Fase 4, e continua a valere.
+                "FROM movimenti m " +
+                "JOIN conti_bancari cb ON cb.id = m.conto_bancario_id " +
+                "JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
+                "WHERE m.stato != 'ANNULLATO' " +
+                "AND m.data_finanziaria BETWEEN :from AND :to " +
+                "AND NOT (pc.tipo = 'ATTIVITA' AND NOT pc.is_capex) " +
+                "GROUP BY DATE_TRUNC('week', m.data_finanziaria) " +
                 "ORDER BY settimana ASC")
                 .setParameter("from", from)
                 .setParameter("to", to)

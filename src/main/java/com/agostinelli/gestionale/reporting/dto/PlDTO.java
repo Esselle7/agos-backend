@@ -17,9 +17,25 @@ public record PlDTO(
         BigDecimal ebt,
         BigDecimal imposte,
         BigDecimal utileNetto,
-        BigDecimal marginePct
+        BigDecimal marginePct,
+        QualitaDTO qualita
 ) {
     public record RicaviDTO(BigDecimal totale, List<VoceDTO> perCategoria) {}
 
     public record CostiDTO(BigDecimal totale, BigDecimal capex, List<VoceDTO> perCategoria) {}
+
+    /**
+     * Attendibilita' del numero esposto: NON cambia il numero, gli mette accanto quanto di esso
+     * non e' ancora certo. Serve a non far leggere un conto economico come se fosse chiuso quando
+     * una parte e' ancora su conti transitori o fuori perimetro.
+     */
+    public record QualitaDTO(
+            BigDecimal nonClassificatoRicavi,
+            BigDecimal nonClassificatoRicaviPct,
+            BigDecimal nonClassificatoCosti,
+            BigDecimal nonClassificatoCostiPct,
+            BigDecimal creditiEventiAperti,
+            boolean perimetroIncompleto,
+            String perimetroNota
+    ) {}
 }

@@ -651,9 +651,10 @@ class ReportingIntegrationTest {
      * MISURATO IN PRODUZIONE il 21/08/2026: stessa chiamata, stesso periodo, entrate di luglio
      * 42.059,14 con granularity=MONTH e 48.005,14 con WEEK.
      *
-     * ⚠️ Il test verifica SOLO che le righe senza data finanziaria restino fuori. La divergenza di
-     * fondo fra i due rami (MONTH per data_finanziaria, WEEK per data_movimento, 9.620,00 € di
-     * scarto strutturale su luglio) resta aperta ed è una decisione, non un refuso.
+     * Il test verifica che le righe senza data finanziaria restino fuori. La divergenza di fondo
+     * fra i due rami — 9.620,00 € di scarto strutturale su luglio — è stata chiusa il 21/08/2026
+     * portando anche WEEK su `data_finanziaria`: la copre
+     * {@link #cashFlowWEEK_coincideConMONTH_sullaStessaFinestra()}.
      * CONTROPROVA ESEGUITA: togliendo il filtro questo test va rosso.
      */
     @Test
@@ -681,6 +682,100 @@ class ReportingIntegrationTest {
         } finally {
             given().when().delete("/api/movimenti/" + movId).then().statusCode(204);
         }
+    }
+
+    /**
+     * Stessa domanda, stessa finestra, stessa risposta: su un periodo di mesi interi la somma dei
+     * secchi WEEK deve coincidere con quella dei secchi MONTH, entrate e uscite.
+     *
+     * Prima del 21/08/2026 non coincidevano: MONTH aggrega {@code mv_cash_flow_statement} per
+     * {@code data_finanziaria}, WEEK aggregava {@code movimenti} per {@code data_movimento}. Due
+     * basi diverse per la stessa domanda, misurate su luglio 2026 in produzione: 42.059,14 contro
+     * 32.439,14, 9.620,00 € di scarto strutturale. Decisione dell'utente: WEEK si allinea a MONTH.
+     *
+     * Non basta cambiare colonna. La MV somma tre secchi (operativo + investimento + finanziario)
+     * e una riga {@code ATTIVITA} non-capex non cade in nessuno: su luglio è il giroconto da 300,00
+     * fra i due conti del 06/07 (COGE 10.03.001), che con la sola colonna cambiata teneva WEEK a
+     * 42.359,14 / 49.336,83. Per questo la query replica anche i JOIN e il predicato della MV.
+     *
+     * CONTROPROVA ESEGUITA: riportando {@code getCashFlowSettimanale} su {@code data_movimento}
+     * questo test va rosso.
+     */
+    @Test
+    @Order(80)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void cashFlowWEEK_coincideConMONTH_sullaStessaFinestra() {
+        var week  = cashFlowStorico("WEEK");
+        var month = cashFlowStorico("MONTH");
+
+        assertEquals(0, week[0].compareTo(month[0]),
+                "entrate di luglio: WEEK " + week[0] + " contro MONTH " + month[0]);
+        assertEquals(0, week[1].compareTo(month[1]),
+                "uscite di luglio: WEEK " + week[1] + " contro MONTH " + month[1]);
+    }
+
+    /**
+     * L'altra metà del fix del 21/08/2026: un giroconto non è un flusso di cassa, ed è la ragione
+     * per cui portare WEEK su {@code data_finanziaria} non basta a farlo coincidere con MONTH.
+     *
+     * {@code mv_cash_flow_statement} somma tre secchi (operativo, investimento, finanziario) e una
+     * riga {@code ATTIVITA} non-capex non cade in nessuno: sparisce, correttamente. La query WEEK
+     * replica quel predicato. Senza, su luglio 2026 in produzione il giroconto da 300,00 del 06/07
+     * (COGE 10.03.001) teneva WEEK a 42.359,14 / 49.336,83 contro i 42.059,14 / 49.036,83 di MONTH.
+     *
+     * Serve un test suo perché {@link #cashFlowWEEK_coincideConMONTH_sullaStessaFinestra()} non lo
+     * copre: nel DB di test non esiste una riga ATTIVITA non-capex a luglio, e togliendo il
+     * predicato quel test resta verde (CONTROPROVA ESEGUITA il 21/08). Qui la riga la creo io.
+     *
+     * CONTROPROVA ESEGUITA: togliendo il predicato dalla query questo test va rosso.
+     */
+    @Test
+    @Order(81)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void cashFlowWEEK_escludeIGiroconti_comeLaMV() {
+        var prima = cashFlowStorico("WEEK");
+
+        int cogeGiroconto = ((Number) em.createNativeQuery(
+                "SELECT id FROM piano_dei_conti_coge WHERE codice = '10.03.001'")
+                .getSingleResult()).intValue();
+        int metodo = ((Number) em.createNativeQuery(
+                "SELECT MIN(id) FROM metodi_pagamento").getSingleResult()).intValue();
+
+        String movId = given().contentType(ContentType.JSON)
+                .body("""
+                      {"tipo":"USCITA","importo":777.00,"dataMovimento":"2026-07-15",
+                       "dataCompetenza":"2026-07-15","dataFinanziaria":"2026-07-15",
+                       "dataLiquidita":"2026-07-15","contoBancarioId":1,"metodoPagamentoId":%d,
+                       "businessUnitId":2,"contoCoge":%d,
+                       "descrizione":"[TEST] giroconto, non e' un flusso di cassa"}
+                      """.formatted(metodo, cogeGiroconto))
+                .when().post("/api/movimenti")
+                .then().statusCode(201).extract().path("id");
+        try {
+            var dopo = cashFlowStorico("WEEK");
+            assertEquals(0, prima[1].compareTo(dopo[1]),
+                    "un giroconto non è un'uscita di cassa: uscite " + prima[1] + " → " + dopo[1]);
+            assertEquals(0, prima[0].compareTo(dopo[0]),
+                    "il giroconto non deve toccare nemmeno le entrate");
+        } finally {
+            given().when().delete("/api/movimenti/" + movId).then().statusCode(204);
+        }
+    }
+
+    /** Totali {entrate, uscite} di luglio 2026 da /cashflow/storico alla granularità data. */
+    private java.math.BigDecimal[] cashFlowStorico(String granularity) {
+        java.util.List<java.util.Map<String, Object>> righe = given()
+                .queryParam("from", "2026-07-01").queryParam("to", "2026-07-31")
+                .queryParam("granularity", granularity)
+                .when().get("/api/reporting/cashflow/storico")
+                .then().statusCode(200).extract().jsonPath().getList("$");
+        java.math.BigDecimal entrate = java.math.BigDecimal.ZERO;
+        java.math.BigDecimal uscite  = java.math.BigDecimal.ZERO;
+        for (var r : righe) {
+            entrate = entrate.add(new java.math.BigDecimal(r.get("entrate").toString()));
+            uscite  = uscite.add(new java.math.BigDecimal(r.get("uscite").toString()));
+        }
+        return new java.math.BigDecimal[] { entrate, uscite };
     }
 
     /** Somma delle entrate di luglio 2026 secondo /cashflow/storico?granularity=WEEK. */

@@ -1,5 +1,6 @@
 package com.agostinelli.gestionale.reporting;
 
+import io.restassured.http.ContentType;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.security.TestSecurity;
 import io.restassured.response.Response;
@@ -596,6 +597,63 @@ class ReportingIntegrationTest {
      * CONTROPROVA ESEGUITA: togliendo la chiamata a validateRangeMensile questo test fallisce
      * con "expected 400 but was 200".
      */
+    /**
+     * REGRESSIONE Fase 4 — i grafici «Andamento Mensile» e «Fatturato per BU» leggono la BANCA
+     * (data_movimento, importo lordo, nessun filtro su pc.tipo): una riga senza data_finanziaria
+     * non e' denaro transitato e non deve comparirci.
+     *
+     * MISURATO IN PRODUZIONE il 21/08/2026: appena nate le righe di ricavo maturato-non-incassato,
+     * le entrate di luglio del grafico passavano da 32.439,14 a 48.005,14 — 15.566,00 € di soldi
+     * mai arrivati in conto, mostrati come incassi.
+     *
+     * Non risolve il difetto di fondo (restano grafici di banca sotto un header economico, misura
+     * del 20/08 §8): impedisce che peggiori.
+     *
+     * ⚠️ Il movimento si crea e si annulla dalla REST API, NON con SQL diretto: l'endpoint e'
+     * `@CacheResult` e una scrittura fuori dal service non invalida la cache — la prima versione
+     * di questo test passava anche SENZA il fix, perche' rileggeva il valore in cache. Scoperto
+     * eseguendo la controprova.
+     * CONTROPROVA ESEGUITA: togliendo il filtro `data_finanziaria IS NOT NULL` dalle due query di
+     * DashboardService questo test va rosso (4.321,00 di differenza).
+     */
+    @Test
+    @Order(78)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void grafichiDiBanca_ignoranoLeRigheSenzaDataFinanziaria() {
+        java.math.BigDecimal prima = entrateFatturatoBu();
+
+        int cogeRicaviEventi = ((Number) em.createNativeQuery(
+                "SELECT id FROM piano_dei_conti_coge WHERE codice = '30.02.002'")
+                .getSingleResult()).intValue();
+
+        String movId = given().contentType(ContentType.JSON)
+                .body("""
+                      {"tipo":"ENTRATA","importo":4321.00,"dataMovimento":"2026-07-15",
+                       "dataCompetenza":"2026-07-15","dataLiquidita":"2026-07-15",
+                       "businessUnitId":2,"contoCoge":%d,
+                       "descrizione":"[TEST] credito senza banca"}
+                      """.formatted(cogeRicaviEventi))
+                .when().post("/api/movimenti")
+                .then().statusCode(201).extract().path("id");
+        try {
+            assertEquals(0, prima.compareTo(entrateFatturatoBu()),
+                    "una riga senza data_finanziaria non e' denaro entrato: il grafico di banca non deve vederla");
+        } finally {
+            given().when().delete("/api/movimenti/" + movId).then().statusCode(204);
+        }
+    }
+
+    /** Somma delle entrate di luglio 2026 secondo /api/dashboard/fatturato-per-bu. */
+    private java.math.BigDecimal entrateFatturatoBu() {
+        java.util.List<java.util.Map<String, Object>> righe = given()
+                .queryParam("from", "2026-07-01").queryParam("to", "2026-07-31")
+                .when().get("/api/dashboard/fatturato-per-bu")
+                .then().statusCode(200).extract().jsonPath().getList("$");
+        java.math.BigDecimal tot = java.math.BigDecimal.ZERO;
+        for (var r : righe) tot = tot.add(new java.math.BigDecimal(r.get("totEntrate").toString()));
+        return tot;
+    }
+
     @Test
     @Order(74)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})

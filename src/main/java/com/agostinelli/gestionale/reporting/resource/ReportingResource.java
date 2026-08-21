@@ -35,6 +35,9 @@ public class ReportingResource {
             @Context SecurityContext ctx) {
 
         validateRange(from, to);
+        // Prima del branch asincrono: un range non mensile deve tornare 400 subito, non un 202
+        // con dentro un job che fallisce (Fase 5, decisione C).
+        reportingService.validateRangeMensile(from, to);
 
         // Range > 12 mesi → pattern async
         if (ChronoUnit.MONTHS.between(from.withDayOfMonth(1), to.withDayOfMonth(1)) > 12) {

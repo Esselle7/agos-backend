@@ -103,7 +103,7 @@ public class PianoContiCogeRepository implements PanacheRepositoryBase<PianoCont
 
         // Il codice è una chiave referenziata PER STRINGA: propagala dove serve per non orfanizzare
         // le regole di catalogazione. (La allowlist forecasting in ForecastBaselineService è in codice
-        // Java: se rinomini un conto ricavo-cash 30.01.001/30.03.001/30.03.002 va aggiornata a mano.)
+        // Java: se rinomini un conto ricavo-cash 30.01.001/30.03.001/30.03.002/30.03.004 va aggiornata a mano.)
         if (!vecchioCodice.equals(nuovoCodice)) {
             for (String tabella : List.of("keyword_firma", "regole_classificazione")) {
                 em.createNativeQuery("UPDATE " + tabella + " SET coge_codice=:nuovo WHERE coge_codice=:vecchio")

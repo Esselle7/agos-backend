@@ -26,7 +26,8 @@ public final class BillyCategoria {
     // COGE per codice (allineati a MovimentoMappingEngineImpl / seed V4).
     private static final String COGE_AGRITURISMO = "30.01.001"; // ristorazione (Billy cassa)
     private static final String COGE_CARNE_10 = "30.03.001";    // vendita carni e salumi (IVA 10%)
-    private static final String COGE_ORTOFRUTTA_4 = "30.03.002"; // ortofrutta e trasformati (IVA 4%)
+    private static final String COGE_ORTOFRUTTA_4 = "30.03.002"; // vendita ortofrutta (IVA 4%)
+    private static final String COGE_TRASFORMATI_10 = "30.03.004"; // vendita prodotti trasformati (IVA 10%)
 
     private static final BigDecimal IVA_10 = new BigDecimal("0.10");
     private static final BigDecimal IVA_04 = new BigDecimal("0.04");
@@ -39,9 +40,10 @@ public final class BillyCategoria {
         if (positive(billy.billyAgriturismo())) return new Esito(COGE_AGRITURISMO, BU_RISTORAZIONE, IVA_10);
         if (positive(billy.billyCarne10())) return new Esito(COGE_CARNE_10, BU_SPACCIO, IVA_10);
         if (positive(billy.billyOrtofrutta4())) return new Esito(COGE_ORTOFRUTTA_4, BU_SPACCIO, IVA_04);
-        // "Prodotti trasformati" (CSV corrispettivi): accorpato a ortofrutta/trasformati 4%.
+        // "Prodotti trasformati" (CSV corrispettivi): conto proprio, 10% (V41). Billy misura
+        // 10,00% su 20 scontrini per 6.270,24 €; l'accorpamento a ortofrutta 4% era un difetto.
         if (positive(rawAmount(billy, "PRODOTTI_TRASFORMATI"))) {
-            return new Esito(COGE_ORTOFRUTTA_4, BU_SPACCIO, IVA_04);
+            return new Esito(COGE_TRASFORMATI_10, BU_SPACCIO, IVA_10);
         }
         // "Servizi" (CSV corrispettivi): ristorazione (PROMPT-RICONCILIAZIONE-PERIODO §4 Step 1).
         if (positive(rawAmount(billy, "SERVIZI"))) {

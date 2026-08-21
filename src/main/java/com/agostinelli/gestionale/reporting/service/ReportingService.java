@@ -31,6 +31,7 @@ public class ReportingService {
     @Transactional
     public PlDTO computePl(Short buId, LocalDate from, LocalDate to) {
         validateRange(from, to);
+        validateRangeMensile(from, to);
         int fromYM = from.getYear() * 100 + from.getMonthValue();
         int toYM   = to.getYear()   * 100 + to.getMonthValue();
 
@@ -66,6 +67,7 @@ public class ReportingService {
     @Transactional
     public PlComparativoDTO computePlComparativo(LocalDate from, LocalDate to) {
         validateRange(from, to);
+        validateRangeMensile(from, to);
         int fromYM = from.getYear() * 100 + from.getMonthValue();
         int toYM   = to.getYear()   * 100 + to.getMonthValue();
 
@@ -559,6 +561,32 @@ public class ReportingService {
         if (ChronoUnit.YEARS.between(from, to) >= 5) {
             throw new ApiException(Response.Status.BAD_REQUEST, "RANGE_TOO_LARGE",
                     "Range massimo consentito: 5 anni");
+        }
+    }
+
+    /**
+     * Fase 5 / decisione C (docs/specs/piano-conto-economico-italiano.md): il conto economico è
+     * MENSILE e lo dice.
+     *
+     * {@code mv_conto_economico_mensile} aggrega per {@code anno * 100 + mese}: la parte giorno del
+     * range non arriva alla query, quindi {@code from=2026-07-10&to=2026-07-20} restituiva tutto
+     * luglio — in silenzio. Misurato il 21/08/2026 sul dump di produzione: sulla finestra
+     * 01/07 → 20/08 il P&L rispondeva 19.691,75 e la dashboard (che filtra per giorno esatto)
+     * 20.191,75, cioè 500,00 € di scarto fra due schermate della stessa app.
+     *
+     * Scartata l'ipotesi giornaliera: sarebbe una query nuova sul percorso caldo, senza il
+     * beneficio della vista materializzata, per una precisione che un conto economico non usa.
+     *
+     * Vale SOLO per il P&L. Il cash flow ({@link #getCashFlowStorico}) continua a usare
+     * {@link #validateRange}: la sua granularità WEEK esiste apposta per i range parziali.
+     */
+    public void validateRangeMensile(LocalDate from, LocalDate to) {
+        if (from == null || to == null) return;
+        if (from.getDayOfMonth() != 1 || to.getDayOfMonth() != to.lengthOfMonth()) {
+            throw new ApiException(Response.Status.BAD_REQUEST, "RANGE_NON_MENSILE",
+                    "Il conto economico è mensile: il periodo deve coprire mesi interi. "
+                    + "Ricevuto " + from + " → " + to + ", atteso "
+                    + from.withDayOfMonth(1) + " → " + to.withDayOfMonth(to.lengthOfMonth()) + ".");
         }
     }
 

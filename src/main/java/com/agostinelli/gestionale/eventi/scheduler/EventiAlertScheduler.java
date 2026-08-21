@@ -27,6 +27,7 @@ public class EventiAlertScheduler {
     private static final Logger LOG = Logger.getLogger(EventiAlertScheduler.class);
 
     @Inject EventiRepository repo;
+    @Inject com.agostinelli.gestionale.eventi.service.EventiService eventiService;
 
     /**
      * Eseguito ogni giorno alle 08:00.
@@ -38,6 +39,19 @@ public class EventiAlertScheduler {
     void checkEventiAlert() {
         checkCaparreMancantiEntroDays(30);
         checkSaldatiConResiduoPositivo();
+        maturaRicaviDiCompetenza();
+    }
+
+    /**
+     * Fase 4 — SPEC docs/specs/competenza-ricavo-evento.md.
+     * Un evento celebrato ieri è entrato nel perimetro stanotte: il suo ricavo va riconosciuto
+     * alla data dell'evento (D1), con la parte non incassata a credito. Riusa la routine
+     * idempotente del service invece di un job dedicato (YAGNI).
+     */
+    private void maturaRicaviDiCompetenza() {
+        var esito = eventiService.allineaCompetenzaEventi();
+        LOG.infof("Competenza ricavo evento riallineata: %s eventi esaminati, credito aperto EUR %s",
+                esito.get("eventiEsaminati"), esito.get("creditoAperto"));
     }
 
     private void checkCaparreMancantiEntroDays(int giorni) {

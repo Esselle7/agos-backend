@@ -151,6 +151,20 @@ public class EventiResource {
 
     // ── PAGAMENTI ─────────────────────────────────────────────────────────────
 
+    /**
+     * Fase 4 — SPEC docs/specs/competenza-ricavo-evento.md.
+     * Riallinea le righe di ricavo maturato-non-incassato di tutti gli eventi del perimetro
+     * (celebrati dal 1/7/2026 a oggi). Idempotente: pensata per essere rilanciata, non per
+     * girare una volta sola. La chiama anche lo scheduler giornaliero.
+     */
+    @POST
+    @Path("/allinea-competenza")
+    @Consumes(MediaType.WILDCARD)   // non ha corpo: senza questo la classe pretende un JSON (415)
+    @RolesAllowed(ROLE_ADMIN)
+    public Map<String, Object> allineaCompetenza() {
+        return service.allineaCompetenzaEventi();
+    }
+
     @POST
     @Path("/{id}/pagamenti")
     @RolesAllowed(ROLE_ADMIN)

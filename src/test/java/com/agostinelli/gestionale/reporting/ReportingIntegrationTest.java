@@ -583,6 +583,73 @@ class ReportingIntegrationTest {
                 .body("code", equalTo("RANGE_TOO_LARGE"));
     }
 
+    /**
+     * Fase 5 / decisione C — il conto economico e' mensile e lo dice.
+     *
+     * Prima di questo controllo, {@code from=2026-07-10&to=2026-07-20} restituiva 200 con TUTTO
+     * luglio: {@code mv_conto_economico_mensile} aggrega per {@code anno*100+mese} e la parte
+     * giorno del range cadeva in silenzio. Misurato sul dump di produzione del 21/08/2026:
+     * sulla finestra 01/07 -> 20/08 il P&L rispondeva 19.691,75 contro i 20.191,75 della
+     * dashboard, che filtra per giorno esatto — 500,00 EUR di scarto fra due schermate della
+     * stessa app.
+     *
+     * CONTROPROVA ESEGUITA: togliendo la chiamata a validateRangeMensile questo test fallisce
+     * con "expected 400 but was 200".
+     */
+    @Test
+    @Order(74)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void plRangeParzialeDentroUnMese_400() {
+        given()
+            .queryParam("from", "2026-07-10")
+            .queryParam("to", "2026-07-20")
+            .when().get("/api/reporting/pl")
+            .then()
+                .statusCode(400)
+                .body("code", equalTo("RANGE_NON_MENSILE"));
+    }
+
+    @Test
+    @Order(75)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void plRangeCheFinisceAMetaMese_400() {
+        // Il caso vero dei preset MTD/QTD/YTD: "dal primo del mese a oggi".
+        given()
+            .queryParam("from", "2026-07-01")
+            .queryParam("to", "2026-08-20")
+            .when().get("/api/reporting/pl")
+            .then()
+                .statusCode(400)
+                .body("code", equalTo("RANGE_NON_MENSILE"));
+    }
+
+    @Test
+    @Order(76)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void plTutteBuRangeParziale_400() {
+        given()
+            .queryParam("from", "2026-07-10")
+            .queryParam("to", "2026-07-20")
+            .when().get("/api/reporting/pl/tutte-bu")
+            .then()
+                .statusCode(400)
+                .body("code", equalTo("RANGE_NON_MENSILE"));
+    }
+
+    @Test
+    @Order(77)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void plMeseInteroPassa_200() {
+        // Il mese intero resta l'unica forma accettata, e continua a rispondere 200.
+        given()
+            .queryParam("from", "2026-07-01")
+            .queryParam("to", "2026-07-31")
+            .when().get("/api/reporting/pl")
+            .then()
+                .statusCode(200)
+                .body("ricavi", notNullValue());
+    }
+
     @Test
     @Order(73)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})

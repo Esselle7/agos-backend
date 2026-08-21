@@ -397,9 +397,19 @@ class ImportEventiAttribuzioneIntegrationTest {
         return id;
     }
 
+    /**
+     * Conta gli INCASSI dell'evento — che e' cio' che questi test verificano ("un solo incasso",
+     * "due bonifici = due movimenti distinti").
+     *
+     * Esclude la riga di competenza della Fase 4 (`tipo_evento_movimento = 'COMPETENZA'`,
+     * SPEC docs/specs/competenza-ricavo-evento.md): non e' un incasso, e' il ricavo maturato e non
+     * ancora riscosso, e su un evento gia' celebrato ce n'e' sempre una finche' resta un residuo.
+     * L'oracolo non e' stato indebolito: e' stato riportato a cio' che diceva di misurare.
+     */
     private long contaMovimenti(UUID eventoId) {
         return ((Number) em.createNativeQuery(
-                "SELECT count(*) FROM movimenti WHERE evento_id = CAST(:e AS uuid) AND stato <> 'ANNULLATO'")
+                "SELECT count(*) FROM movimenti WHERE evento_id = CAST(:e AS uuid) " +
+                "AND stato <> 'ANNULLATO' AND COALESCE(tipo_evento_movimento,'') <> 'COMPETENZA'")
                 .setParameter("e", eventoId.toString()).getSingleResult()).longValue();
     }
 

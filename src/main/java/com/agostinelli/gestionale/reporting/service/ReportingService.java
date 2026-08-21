@@ -533,6 +533,15 @@ public class ReportingService {
                 "COALESCE(SUM(CASE WHEN tipo='USCITA'  THEN importo_lordo ELSE 0 END),0) " +
                 "FROM movimenti " +
                 "WHERE stato != 'ANNULLATO' AND data_movimento BETWEEN :from AND :to " +
+                // Fase 4 — è un CASH flow: una riga senza data_finanziaria non è denaro
+                // transitato. Senza questo filtro le righe di ricavo maturato-non-incassato
+                // entravano fra le entrate: misurato in produzione il 21/08/2026, la stessa
+                // chiamata dava 42.059,14 con granularity=MONTH e 48.005,14 con WEEK.
+                // ⚠️ NON chiude la divergenza di fondo fra i due rami: MONTH aggrega per
+                // data_finanziaria (mv_cash_flow_statement), questo per data_movimento, e
+                // restano 9.620,00 € di scarto strutturale su luglio. È una decisione aperta,
+                // non un refuso: vedi docs/specs/misure/sessione-8-fasi-8-4-5-2026-08-21.md §6.
+                "AND data_finanziaria IS NOT NULL " +
                 "GROUP BY DATE_TRUNC('week', data_movimento) " +
                 "ORDER BY settimana ASC")
                 .setParameter("from", from)

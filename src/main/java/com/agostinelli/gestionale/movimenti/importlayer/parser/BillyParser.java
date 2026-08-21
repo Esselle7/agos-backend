@@ -82,7 +82,7 @@ public class BillyParser implements MovimentoParser {
                 campi.put("ALTRO", Valori.toCanonicalNumber(t.valore(r, "Altro", "Altro No Agriturismo")));
                 campi.put("CARNE_10", Valori.toCanonicalNumber(t.valore(r, "Carne 10", "Carne")));
                 campi.put("ORTOFRUTTA_4", Valori.toCanonicalNumber(t.valore(r, "Ortofrutta 4", "Ortofrutta")));
-                // Categoria aggiuntiva del CSV corrispettivi (IVA 4%, accorpata a 30.03.002 in
+                // Categoria aggiuntiva del CSV corrispettivi (IVA 10%, conto 30.03.004 in
                 // riconciliazione): serve al resolver mono-categoria dell'import congiunto.
                 campi.put("PRODOTTI_TRASFORMATI", Valori.toCanonicalNumber(t.valore(r, "Prodotti trasformati", "Trasformati")));
                 // "Servizi" (CSV corrispettivi, IVA 10%, ristorazione): serve al resolver mono-categoria.

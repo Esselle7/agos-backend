@@ -24,7 +24,8 @@ import java.util.List;
 public class ForecastBaselineService {
 
     /** Conti ricavo cash ad alta frequenza (codici stabili nel piano dei conti, vedi seed V4). */
-    static final List<String> CONTI_RICAVO_CASH = List.of("30.01.001", "30.03.001", "30.03.002");
+    static final List<String> CONTI_RICAVO_CASH =
+            List.of("30.01.001", "30.03.001", "30.03.002", "30.03.004");
 
     @Inject
     EntityManager em;

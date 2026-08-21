@@ -130,6 +130,15 @@ public class DashboardService {
                 "FROM movimenti m " +
                 "LEFT JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
                 "WHERE m.stato != 'ANNULLATO' " +
+                // Fase 4 — questi due grafici leggono la BANCA (data_movimento, importo lordo,
+                // nessun filtro su pc.tipo): una riga senza data_finanziaria non e' denaro
+                // transitato e non ha diritto di comparirci. Senza questo filtro le righe di
+                // ricavo maturato-non-incassato entravano fra le "entrate": misurato in
+                // produzione il 21/08/2026, luglio passava da 32.439,14 a 48.005,14 con
+                // 15.566,00 di soldi mai arrivati in conto.
+                // NON risolve il difetto vero (sono grafici di banca sotto un header economico,
+                // vedi misura del 20/08 §8): impedisce solo che peggiori.
+                "AND m.data_finanziaria IS NOT NULL " +
                 "AND EXTRACT(YEAR FROM m.data_movimento) >= :startYear " +
                 "GROUP BY 1, 2 ORDER BY 1 ASC, 2 ASC")
                 .setParameter("startYear", startYear)
@@ -158,6 +167,15 @@ public class DashboardService {
                 "LEFT JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
                 "JOIN business_units bu ON bu.id = m.business_unit_id " +
                 "WHERE m.stato != 'ANNULLATO' " +
+                // Fase 4 — questi due grafici leggono la BANCA (data_movimento, importo lordo,
+                // nessun filtro su pc.tipo): una riga senza data_finanziaria non e' denaro
+                // transitato e non ha diritto di comparirci. Senza questo filtro le righe di
+                // ricavo maturato-non-incassato entravano fra le "entrate": misurato in
+                // produzione il 21/08/2026, luglio passava da 32.439,14 a 48.005,14 con
+                // 15.566,00 di soldi mai arrivati in conto.
+                // NON risolve il difetto vero (sono grafici di banca sotto un header economico,
+                // vedi misura del 20/08 §8): impedisce solo che peggiori.
+                "AND m.data_finanziaria IS NOT NULL " +
                 "AND m.data_movimento >= :from AND m.data_movimento <= :to " +
                 "GROUP BY m.business_unit_id, bu.nome")
                 .setParameter("from", from)

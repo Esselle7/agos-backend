@@ -97,11 +97,18 @@ class WizardRateIntegrationTest {
         importaCongiunto();
         List<RicorrenteParcheggiataDTO> coda = triageService.listRicorrenti("DA_RICONCILIARE", 0, 500).content();
 
-        assertEquals(11, coda.size(), "il corpus di sei mesi porta 11 voci in coda");
+        // 14 dal 24/08/2026, erano 11: le 3 in più sono le rate scritte «PAG.RATE SU FIN.TO»,
+        // che V45 ha aggiunto al pattern delle regole 1 e 2 (SKIP_RICORRENTE). Prima finivano a
+        // smistamento manuale perché la riga scrive FIN.TO mentre il pattern diceva FINANZIAMENTO:
+        // ora entrano in questa coda, che è il posto giusto per una rata senza piano collegato.
+        // Vedi docs/analisi/keyword-cleanup-esecuzione-2026-08-24.md.
+        assertEquals(14, coda.size(), "il corpus di sei mesi porta 14 voci in coda");
         BigDecimal totale = coda.stream().map(RicorrenteParcheggiataDTO::importo)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
-        assertEquals(0, new BigDecimal("51790.09").compareTo(totale),
-                "poche decisioni, molto denaro: 51.790,09 € (audit §7.3)");
+        // 56.744,20 = i 51.790,09 dell'audit §7.3 + le 3 rate FIN.TO che V45 fa entrare in coda
+        // (2.476,46 + 2.226,65 + 251,00 = 4.954,11).
+        assertEquals(0, new BigDecimal("56744.20").compareTo(totale),
+                "poche decisioni, molto denaro: 56.744,20 € (audit §7.3 + le 3 rate FIN.TO di V45)");
 
         for (RicorrenteParcheggiataDTO r : coda) {
             assertNull(r.propostaRataId(), "senza piani non si propone nulla: " + r.descrizione());

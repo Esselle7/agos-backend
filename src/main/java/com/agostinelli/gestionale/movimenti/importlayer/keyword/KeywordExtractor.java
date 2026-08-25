@@ -11,6 +11,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.regex.Pattern;
 
 /**
  * Estrattore di keyword dalla descrizione di un movimento (PROMPT-KEYWORD-LEARNING.md §4.2).
@@ -167,7 +168,8 @@ public final class KeywordExtractor {
     private static List<Lessema> lex(String descrizione, Set<String> stopwords) {
         List<Lessema> out = new ArrayList<>();
         if (descrizione == null || descrizione.isBlank()) return out;
-        String[] parole = descrizione.toUpperCase().replaceAll("[^A-Z0-9]", " ").trim().split("\\s+");
+        String testo = separaSigle(descrizione.toUpperCase());
+        String[] parole = testo.replaceAll("[^A-Z0-9]", " ").trim().split("\\s+");
         String prec = null;
         for (String w : parole) {
             if (w.isEmpty()) continue;
@@ -187,6 +189,39 @@ public final class KeywordExtractor {
 
     private static boolean isCodice(String w) {
         return w.length() >= LEN_CODICE && hasDigit(w);
+    }
+
+    /** {@code RIF.} incollato al cognome dall'estratto conto CA: {@code "BERNASCONIRIF. CRO:"}. */
+    private static final Pattern RIF_INCOLLATO = Pattern.compile("(?<=[A-Z])RIF\\.");
+    /** Sigla puntata: {@code F.O.C.}, {@code S.R.L.}, {@code S.N.C.} */
+    private static final Pattern SIGLA_PUNTATA = Pattern.compile("(?:[A-Z]\\.){2,}");
+
+    /**
+     * Ripara i due artefatti di parsing degli estratti conto, <b>prima</b> della tokenizzazione
+     * (audit 24/08/2026, §8.6 e §8.6-bis).
+     *
+     * <p><b>1) {@code RIF.} incollato al cognome</b> — l'estratto conto CA non mette lo spazio
+     * ({@code "CARLO BERNASCONIRIF. CRO:"}), e una firma appresa su {@code BERNASCONIRIF} non
+     * aggancerà mai una riga che scrive {@code BERNASCONI RIF.}.
+     *
+     * <p><b>2) sigla puntata → lettere con spazi ai lati</b> — il tokenizer spezza su ogni
+     * non-alfanumerico, quindi {@code F.O.C.} diventa F/O/C, tutti sotto {@value #LEN_MIN} e già
+     * buttati oggi: compattarli <b>aggiunge</b> un token senza toglierne nessuno. Gli spazi ai
+     * lati sono la parte che conta: senza, la sigla resta incollata alla parola vicina e produce
+     * {@code MANGINOSRL} / {@code SASRIF} / {@code SNCDI} invece di {@code MANGINO} / {@code FOC}.
+     *
+     * <p><b>Attenzione a un'asimmetria fra i due interventi.</b> Le sigle puntate solo AGGIUNGONO
+     * token (F/O/C erano già sotto {@value #LEN_MIN} e quindi buttati), e per quelle vale che un
+     * {@code Set} che cresce fa scattare più firme, mai meno. Il fix {@code RIF.} invece
+     * SOSTITUISCE: {@code BERNASCONIRIF} sparisce e compare {@code BERNASCONI}, quindi una firma
+     * appresa sul token rotto diventa CIECA. Misurato: applicato da solo perde 4 righe. Per questo
+     * va insieme alla correzione dei token a DB (V42) — se qualcuno lo porta in un altro ramo
+     * senza quella migration, quelle righe tornano a smistamento manuale.
+     * Le forme societarie compattate sono già stopword e vengono assorbite.
+     */
+    private static String separaSigle(String upper) {
+        String s = RIF_INCOLLATO.matcher(upper).replaceAll(" RIF.");
+        return SIGLA_PUNTATA.matcher(s).replaceAll(m -> " " + m.group().replace(".", "") + " ");
     }
 
     /**

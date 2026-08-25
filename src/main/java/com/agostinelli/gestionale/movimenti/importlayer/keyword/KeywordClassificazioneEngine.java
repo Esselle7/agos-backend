@@ -49,18 +49,33 @@ public class KeywordClassificazioneEngine {
         /**
          * R18 — una firma è CERTA quando ha accumulato abbastanza conferme e nessuna correzione.
          *
-         * <p><b>N non si sceglie adesso</b>: si fissa quando ci sono almeno 3 mesi di conferme, sul
-         * dato. Fino ad allora N = ∞ (nessuna promozione) e la classe CERTA resta l'elenco chiuso
-         * di R3. Il contatore però gira da subito: quando arriverà il momento di scegliere N ci
-         * sarà lo storico su cui sceglierlo, invece di dover aspettare altri 3 mesi.
+         * <p><b>N = 1, deciso dal titolare il 24/08/2026</b>: quello che ha già confermato una
+         * volta non glielo si richiede mai più. La conferma vale come prova perché arriva su una
+         * riga DIVERSA da quella che ha generato la firma — l'auto-conferma non esiste (la firma
+         * nasce dopo che la riga è stata catalogata, quindi quella riga non la vota).
+         *
+         * <p><b>Misurato per replay</b> sul dump di prod del 24/08 (unico import = luglio 2026,
+         * 154 righe banca), cambiando solo questa costante: N = ∞ dà 64/66/24, N = 1 dà
+         * <b>79/51/24</b> ⇒ <b>+15 righe</b> scritte da sole, 11.719,10 €. Confrontate col to-be
+         * (le scelte a mano del titolare in prod): <b>15 su 15 identiche, conto E ramo</b>.
+         * ⚠️ misura contaminata dall'ex-post: al momento dell'import tutte le firme avevano 0 voti,
+         * i contatori esistono grazie a decisioni prese DOPO — quelle stesse righe. È un limite
+         * superiore ottimistico, non una previsione su agosto (che non è ancora stato importato).
+         *
+         * <p>Ciò che rende sicuro N = 1 non è la soglia, è la <b>retrocessione</b>: al primo conto
+         * (o ramo) corretto dal titolare la firma perde la promozione per sempre. Quel meccanismo
+         * fino al 24/08/2026 NON funzionava su una firma promossa — vedi
+         * {@code ImportTriageService.votaFirma}, che usciva se la nota non portava il marcatore
+         * {@code PROPOSTA[…]}, e una riga scritta in automatico per definizione non ce l'ha.
+         * Abbassare N senza quel fix voleva dire «sbaglia una volta, sbaglia per sempre».
          */
         boolean promossa() {
             return usiCorretti == 0 && usiConfermati >= SOGLIA_PROMOZIONE;
         }
     }
 
-    /** N di R18. Integer.MAX_VALUE = ∞: nessuna firma si promuove finché il dato non dice quanto. */
-    static final int SOGLIA_PROMOZIONE = Integer.MAX_VALUE;
+    /** N di R18: una conferma basta. Il perché e la misura stanno sul javadoc di {@link Firma#promossa()}. */
+    static final int SOGLIA_PROMOZIONE = 1;
 
     /** Vista del target appreso per la riga (o conflitto da risolvere). */
     public record KeywordMatch(boolean conflitto, String cogeCodice, Short bu, UUID fornitoreId,

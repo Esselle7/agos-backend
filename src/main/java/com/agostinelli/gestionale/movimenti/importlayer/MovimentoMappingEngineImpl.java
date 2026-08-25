@@ -577,7 +577,14 @@ public class MovimentoMappingEngineImpl {
         String keyword;
         if (compact.contains("CAPARRA")) { tipo = "CAPARRA"; keyword = "CAPARRA"; }
         else if (compact.contains("ACCONTO")) { tipo = "ACCONTO"; keyword = "ACCONTO"; }
-        else if (compact.contains("AFFITTOSALA") || compact.contains("AFFITTO")) { tipo = "AFFITTO_SALA"; keyword = "AFFITTO"; }
+        // AFFITTO_SALA NON e' un tipo valido: lk_tipi_evento_mov elenca i MOMENTI di pagamento
+        // (acconto, caparra, competenza, penale, rimborso, saldo), mentre l'affitto sala e' un
+        // SERVIZIO. Aggiungerlo alla lookup la sporcherebbe per sempre. Il motore smette quindi
+        // di indovinare su questo ramo e lascia scegliere l'operatore — la keyword resta, perche'
+        // serve a spiegare PERCHE' la riga e' stata parcheggiata.
+        // Rischio nullo, verificato: la colonna e' nullable, non ha FK, e in produzione 3 righe
+        // su 28 sono gia' a NULL (il ramo else qui sotto le produce gia' oggi).
+        else if (compact.contains("AFFITTOSALA") || compact.contains("AFFITTO")) { tipo = null; keyword = "AFFITTO"; }
         else if (compact.contains("SALDO")) { tipo = "SALDO"; keyword = "SALDO"; }
         else { tipo = null; keyword = firstMatch(compact, keywordEngine.eventiForti()); }
         return new ParkEvento(tipo, keyword, extractEventoDate(spaced, dataMovimento));
@@ -806,7 +813,13 @@ public class MovimentoMappingEngineImpl {
             return cl.certa();   // R3: il metodo ADDEBITO_CONTO è il segnale, non un'ipotesi
         }
 
-        boolean sdd = causale.contains("SDD") || "PAGAMENTO UTENZE".equals(causale);
+        // "50C" e' il codice con cui Banco BPM identifica un addebito SDD: non contiene la
+        // stringa "SDD", quindi il ramo Nexi non scattava sulle righe BPM. Il raggio d'azione
+        // resta chiuso dalla guardia desc.contains("NEXI") alla riga sotto — misurato sul corpus:
+        // 28 righe hanno causale 50C, di cui 2 nominano NEXI; le altre 26 (12 Confidi, 6 TIM,
+        // 6 Enel) non la nominano e NON sono toccate.
+        boolean sdd = causale.contains("SDD") || "PAGAMENTO UTENZE".equals(causale)
+                   || "50C".equals(causale);
         if (desc.contains("NEXI") && (sdd || "COMMISSIONI/SPESE".equals(causale))) {
             cl.cogeId = coge(COGE_COMMISSIONI_POS);
             cl.bu = 5;

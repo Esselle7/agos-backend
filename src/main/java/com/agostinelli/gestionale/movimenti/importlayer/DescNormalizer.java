@@ -71,6 +71,17 @@ public final class DescNormalizer {
     // stabile per la rata ricorrente. Copre "MUTUO N.1273 5796807 RATA" e "PAG.RATE SU FIN.TO 1273/05...".
     private static final Pattern FINANZIAMENTO = Pattern.compile(
             "(?:MUTUO\\s+N\\.?|FIN\\.?TO)\\s*[:./]?\\s*(\\d[\\d/ ]*\\d)");
+    // Esercente di un pagamento carta Crédit Agricole: "... C/O <esercente> <località> [PV] ITA".
+    // Formato DISGIUNTO da quello BPM (che è "CARTA <num>-<esercente>" e non contiene mai "C/O":
+    // misurato sul corpus reale, 0 occorrenze sui due file BPM), quindi il ramo non può toccarli.
+    // Senza questo pattern la riga è inapprendibile: non ha ORD:, non ha FAVORE e non ha alcun
+    // CODICE da cui segmentoNomi() possa ripartire, quindi estraiFirme() non produce nulla.
+    private static final Pattern MERCHANT_CO_CA = Pattern.compile("\\bC/O\\s+(.+?)\\s*$");
+    // Taglio alla forma societaria, INCLUSA: dove c'è, il nome dell'esercente finisce lì.
+    private static final Pattern FORMA_SOC_TAGLIO = Pattern.compile(
+            "^(.*?\\b(?:S\\.?R\\.?L\\.?S?|S\\.?P\\.?A\\.?|S\\.?N\\.?C\\.?|S\\.?A\\.?S\\.?|SRL|SPA|SNC|SAS|COOP)\\.?)(?:\\s|$)");
+    // Sigla di provincia in coda ("… ALBAIRATE MI"), quando non c'è una forma societaria su cui tagliare.
+    private static final Pattern CODA_PROVINCIA = Pattern.compile("\\s+[A-Z]{2}\\s*$");
 
     /** Vista COMPACT: rimuove tutti gli spazi (ricongiunge le parole spezzate dal word-wrap). */
     public static String compact(String spaced) {
@@ -115,6 +126,7 @@ public final class DescNormalizer {
             ordinante = clean(firstGroup(ORD_CA, descSpaced));
             beneficiario = clean(firstGroup(BENEF_CA, descSpaced));
             if (beneficiario == null) beneficiario = clean(firstGroup(SDD_A_CA, descSpaced));
+            if (beneficiario == null) beneficiario = merchantCo(descSpaced);
             if (beneficiario == null) beneficiario = agenziaEntrate(descSpaced);
             if (beneficiario == null) beneficiario = finanziamento(descSpaced);
         } else if (Sorgente.BPM.equals(sorgente)) {
@@ -152,6 +164,25 @@ public final class DescNormalizer {
     /** Controparte deterministica dei pagamenti fiscali F24/I24. */
     private static String agenziaEntrate(String s) {
         return F24.matcher(s).find() ? "AGENZIA DELLE ENTRATE" : null;
+    }
+
+    /**
+     * Esercente di un pagamento carta Crédit Agricole ({@code "… C/O <esercente> <località> ITA"}).
+     *
+     * <p><b>Precisione misurata: 5 righe esatte su 10</b> (audit 24/08/2026 §8.5). Nel file grezzo
+     * il confine fra esercente e località non esiste — verificato con {@code cat -A}: spazi singoli,
+     * nessun padding di campo — quindi dove non c'è una forma societaria su cui tagliare restano
+     * dentro 1-3 token di località. L'errore è sempre <b>per eccesso</b>: non cataloga mai una
+     * controparte diversa, e il wizard lascia all'operatore spegnere i token prima di salvare la
+     * firma. Allargare l'euristica per "azzeccarle tutte" significherebbe indovinare.
+     */
+    private static String merchantCo(String descSpaced) {
+        String dopo = clean(firstGroup(MERCHANT_CO_CA, descSpaced));
+        if (dopo == null) return null;
+        String s = CODA_LOCALITA.matcher(dopo).replaceFirst("").trim();
+        Matcher forma = FORMA_SOC_TAGLIO.matcher(s);
+        if (forma.find()) return clean(forma.group(1));
+        return clean(CODA_PROVINCIA.matcher(s).replaceFirst(""));
     }
 
     // ── Chiave di raggruppamento del wizard «Che spesa è questa?» (audit §7.1) ────────────

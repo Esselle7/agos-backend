@@ -1184,6 +1184,57 @@ class SpeseRicorrentiIntegrationTest {
                 "quota_interessi rata 1 deve essere ≈ 100000*0.035/12 ≈ 291.67");
     }
 
+    /**
+     * L'ultima rata è un moncone: chiude il capitale residuo e gli interessi si CALCOLANO sul
+     * periodo, non si deducono per differenza dalla rata piena. Numeri veri del Leasing Merlo
+     * in produzione (debito 55.511,03 · 6,997% · TRIMESTRALE · 14 rate · rata 4.716,49): il ramo
+     * vecchio scriveva 3.349,41 di interessi su 23,91 maturati, cioè 3.325,50 di costo inventato.
+     */
+    @Test
+    @Order(101)
+    @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
+    void testFinanziamento_ultimaRata_interessiCalcolatiNonDedotti() {
+        Assumptions.assumeTrue(validContoCogeInteressi != null,
+                "Conto ONERE_FINANZIARIO non disponibile (V29 non applicata?)");
+
+        String body = """
+            {
+              "descrizione": "ZZ Leasing Merlo ultima rata",
+              "contoBancarioId": 1,
+              "contoCoge": %d,
+              "importoRata": 4716.49,
+              "variazionePct": 0,
+              "giornoDelMese": 15,
+              "frequenza": "TRIMESTRALE",
+              "numeroRate": 14,
+              "dataInizio": "2026-09-15",
+              "tipoPiano": "FINANZIAMENTO",
+              "importoDebitoIniziale": 55511.03,
+              "tassoInteresseAnnuo": 6.997,
+              "contoCogeInteressiId": %d
+            }
+            """.formatted(validContoCoge, validContoCogeInteressi);
+
+        io.restassured.path.json.JsonPath jp = given()
+            .contentType(ContentType.JSON).body(body)
+            .when().post(BASE + "/piani")
+            .then()
+                .statusCode(201)
+                .body("rate", hasSize(14))
+                .extract().jsonPath();
+
+        assertEquals(1367.08f, jp.getFloat("rate[13].quotaCapitale"),  0.005f, "capitale rata 14");
+        assertEquals(  23.91f, jp.getFloat("rate[13].quotaInteressi"), 0.005f, "interessi rata 14");
+        assertEquals(1390.99f, jp.getFloat("rate[13].importo"),        0.005f, "importo rata 14");
+
+        // Il debito residuo è la sola quota capitale, non il totale da sborsare (A1).
+        assertEquals(55511.03f, jp.getFloat("debitoResiduo"), 0.005f, "debitoResiduo = debito iniziale");
+        assertEquals(66030.86f - 3325.50f, jp.getFloat("totaleResiduo"), 0.01f,
+                "totaleResiduo = capitale + interessi reali");
+
+        given().when().delete(BASE + "/piani/" + jp.getString("id")).then().statusCode(anyOf(is(200), is(204)));
+    }
+
     @Test
     @Order(102)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})

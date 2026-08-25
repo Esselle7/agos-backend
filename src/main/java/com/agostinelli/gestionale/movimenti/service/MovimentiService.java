@@ -404,6 +404,13 @@ public class MovimentiService {
     @Transactional
     public MovimentoDTO assegnaContoBancario(UUID id, Short contoBancarioId) {
         Movimento m = findActiveOrThrow(id);
+        // ponytail: guardia money, non rimuovere. Invariante I2: una riga di competenza evento
+        // non è denaro entrato, e con un conto valorizzato entra in mv_saldi_conti via
+        // COALESCE(data_finanziaria, data_movimento).
+        if ("COMPETENZA".equals(m.tipoEventoMovimento)) {
+            throw new ApiException(Response.Status.CONFLICT, "COMPETENZA_SENZA_BANCA",
+                    "Una riga di competenza evento non è denaro entrato: non può avere un conto bancario.");
+        }
         m.contoBancarioId = contoBancarioId;
         mvRefresh.requestRefreshAfterCommit();
         return mapper.toDTO(m);

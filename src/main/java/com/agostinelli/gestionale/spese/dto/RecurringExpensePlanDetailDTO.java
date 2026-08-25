@@ -22,7 +22,10 @@ public record RecurringExpensePlanDetailDTO(
     String      note,
     String      riferimentoEstrattoConto,
     BigDecimal  totalePagato,
+    /** Quanto resta da SBORSARE: capitale + interessi delle rate PENDING. */
     BigDecimal  totaleResiduo,
+    /** Quanto si deve ancora alla banca: solo la quota capitale delle rate PENDING. */
+    BigDecimal  debitoResiduo,
     BigDecimal  totalePiano,
     BigDecimal  totaleInteressi,
     BigDecimal  totaleCapitale,

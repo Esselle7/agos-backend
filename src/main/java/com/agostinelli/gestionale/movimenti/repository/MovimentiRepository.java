@@ -186,9 +186,15 @@ public class MovimentiRepository implements PanacheRepositoryBase<Movimento, UUI
                 .firstResultOptional();
     }
 
-    /** Movimenti attivi non ancora attribuiti a un conto/cassa (conto_bancario_id IS NULL). */
+    /**
+     * Movimenti attivi non ancora attribuiti a un conto/cassa (conto_bancario_id IS NULL).
+     * Le righe COMPETENZA hanno il conto NULL per invariante I2 (non sono denaro entrato):
+     * proporle qui le faceva attribuire a mano, gonfiando i saldi di 4.020 € su CA (25/08/2026).
+     */
     public List<Movimento> findSenzaBanca() {
-        return list("contoBancarioId IS NULL AND stato != 'ANNULLATO' ORDER BY dataMovimento DESC");
+        return list("contoBancarioId IS NULL AND stato != 'ANNULLATO' " +
+                    "AND (tipoEventoMovimento IS NULL OR tipoEventoMovimento <> 'COMPETENZA') " +
+                    "ORDER BY dataMovimento DESC");
     }
 
     /** Partite di apertura: crediti/debiti pregressi (fonte APERTURA) ancora da liquidare. */

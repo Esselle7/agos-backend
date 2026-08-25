@@ -1269,7 +1269,9 @@ public class EventiService {
         }
 
         Movimento m = esistente.orElseGet(() -> creaRigaDiCompetenza(e));
-        m.importo = residuo;
+        m.importo         = residuo;
+        m.contoBancarioId = null;   // I2 riaffermata sulle righe già esistenti, non solo alla creazione
+        m.dataFinanziaria = null;   // I2
     }
 
     /**

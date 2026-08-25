@@ -612,14 +612,14 @@ public class RecurringExpenseService {
                 }
 
                 if (i == plan.numeroRate) {
+                    // L'ultima rata chiude il debito, quindi è un moncone: gli interessi si
+                    // calcolano sul capitale che matura nel periodo, come per tutte le altre.
+                    // Dedurli per differenza dalla rata piena (importo - capitale) li gonfiava
+                    // di tutto lo scarto fra rata contrattuale e PMT teorica: +3.325,50 € sul
+                    // Leasing Merlo, misurati il 25/08/2026. ponytail: guardia money.
                     capitale  = debitoResiduo;
-                    interessi = importo.subtract(capitale).max(BigDecimal.ZERO)
-                            .setScale(2, RoundingMode.HALF_UP);
-                    // L'ultima rata chiude il debito esattamente, quindi può differire
-                    // leggermente dalla PMT (accumulo di arrotondamenti su 60 rate è
-                    // tipicamente qualche €). Aggiorniamo importo per mantenere
-                    // l'invariante rata.importo = quotaCapitale + quotaInteressi.
-                    importo = capitale.add(interessi);
+                    interessi = debitoResiduo.multiply(tassoPeriodo).setScale(2, RoundingMode.HALF_UP);
+                    importo   = capitale.add(interessi);
                 }
                 debitoResiduo = debitoResiduo.subtract(capitale);
 
@@ -797,6 +797,11 @@ public class RecurringExpenseService {
                 .map(r -> r.importo).reduce(BigDecimal.ZERO, BigDecimal::add);
         BigDecimal residuo = rate.stream().filter(r -> "PENDING".equals(r.stato))
                 .map(r -> r.importo).reduce(BigDecimal.ZERO, BigDecimal::add);
+        // Il debito verso la banca è la sola quota capitale: `residuo` include gli interessi
+        // futuri e non può coincidere con l'estratto conto. Sui piani FLAT lo split non esiste.
+        BigDecimal debitoResiduo = rate.stream().filter(r -> "PENDING".equals(r.stato))
+                .map(r -> r.quotaCapitale != null ? r.quotaCapitale : r.importo)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
 
         return new RecurringExpensePlanSummaryDTO(
                 plan.id, plan.descrizione,
@@ -809,7 +814,7 @@ public class RecurringExpenseService {
                 (int) rate.stream().filter(r -> "PAID".equals(r.stato)).count(),
                 (int) rate.stream().filter(r -> "SKIPPED".equals(r.stato)).count(),
                 (int) rate.stream().filter(r -> "CANCELLED".equals(r.stato)).count(),
-                pagato, residuo
+                pagato, residuo, debitoResiduo
         );
     }
 
@@ -819,6 +824,11 @@ public class RecurringExpenseService {
                 .map(r -> r.importo).reduce(BigDecimal.ZERO, BigDecimal::add);
         BigDecimal residuo = rate.stream().filter(r -> "PENDING".equals(r.stato))
                 .map(r -> r.importo).reduce(BigDecimal.ZERO, BigDecimal::add);
+        // Il debito verso la banca è la sola quota capitale: `residuo` include gli interessi
+        // futuri e non può coincidere con l'estratto conto. Sui piani FLAT lo split non esiste.
+        BigDecimal debitoResiduo = rate.stream().filter(r -> "PENDING".equals(r.stato))
+                .map(r -> r.quotaCapitale != null ? r.quotaCapitale : r.importo)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
         BigDecimal totale  = rate.stream().filter(r -> !"SKIPPED".equals(r.stato) && !"CANCELLED".equals(r.stato))
                 .map(r -> r.importo).reduce(BigDecimal.ZERO, BigDecimal::add);
 
@@ -838,7 +848,7 @@ public class RecurringExpenseService {
                 plan.contoCoge, lookupContoCogeDescrizione(plan.contoCoge),
                 plan.importoRata, plan.variazionePct, plan.giornoDelMese,
                 plan.frequenza, plan.numeroRate, plan.dataPrimaRata, plan.stato,
-                plan.note, plan.riferimentoEstrattoConto, pagato, residuo, totale,
+                plan.note, plan.riferimentoEstrattoConto, pagato, residuo, debitoResiduo, totale,
                 totaleInteressi, totaleCapitale,
                 plan.tipoPiano, plan.tassoInteresseAnnuo, plan.importoDebitoIniziale,
                 plan.contoCogeInteressiId, cogeInteressiDesc,

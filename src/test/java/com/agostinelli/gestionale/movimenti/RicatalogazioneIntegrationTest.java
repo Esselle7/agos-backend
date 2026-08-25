@@ -179,8 +179,12 @@ class RicatalogazioneIntegrationTest {
                 "nessuna riga con proposta da firma keyword nelle fixture di agosdb_test");
 
         long confermatiPrima = somma("usi_confermati");
+        // Confermare una proposta significa accettarla TUTTA, ramo compreso: dal 24/08/2026 il voto
+        // guarda anche la BU (R18b), quindi tenere qui una BU fissa avrebbe reso il test dipendente
+        // da quale riga capita per prima — verde da solo, rosso nella suite.
+        short buProposta = conProposta.buSuggerita() != null ? conProposta.buSuggerita() : (short) 5;
         QuarkusTransaction.requiringNew().run(() -> triage.classificaTransitorio(conProposta.id(),
-                new ClassificaTransitorioRequest(conProposta.cogeSuggeritoId(), (short) 5, null, false, null)));
+                new ClassificaTransitorioRequest(conProposta.cogeSuggeritoId(), buProposta, null, false, null)));
         assertEquals(confermatiPrima + 1, somma("usi_confermati"),
                 "confermare la proposta vota la firma a favore");
         assertEquals(0, somma("usi_corretti"));
@@ -189,6 +193,79 @@ class RicatalogazioneIntegrationTest {
         assertNull(notaDi(conProposta.id()) == null ? null
                         : (notaDi(conProposta.id()).contains("PROPOSTA[") ? "ancora presente" : null),
                 "la proposta esaurita va tolta dalla nota");
+    }
+
+    /**
+     * R18 con N = 1 — la retrocessione di una firma PROMOSSA (24/08/2026).
+     *
+     * <p>Una firma promossa scrive sul conto definitivo, quindi la riga <b>non</b> porta il
+     * marcatore {@code PROPOSTA[…]}. Fino al 24/08 {@code votaFirma} usciva proprio lì
+     * ({@code if (proposta == null) return}): la firma non poteva mai incassare un
+     * {@code usi_corretti}, cioè «sbaglia una volta, sbaglia per sempre». Con N = ∞ nessuna firma
+     * era promossa e il difetto non si vedeva; abbassando N diventa il rischio principale.
+     *
+     * <p>Il test simula la riga già scritta in automatico: la cataloga (così esce dal transitorio e
+     * la nota perde il marcatore), azzera i voti, poi la <b>corregge</b> su un altro conto.
+     */
+    @Test
+    void correggereUnaRigaSenzaMarcatoreRetrocedeLaFirmaPromossa() throws Exception {
+        importa();
+        TransitorioDTO conProposta = triage.listTransitori(null, 0, 2000).content().stream()
+                .filter(r -> r.cogeSuggeritoId() != null)
+                .filter(this::vieneDaUnaFirmaKeyword)
+                .findFirst().orElse(null);
+        Assumptions.assumeTrue(conProposta != null, "nessuna riga con proposta da firma keyword");
+
+        // 1ª passata: la riga finisce sul conto della firma e la nota perde il marcatore.
+        //    È esattamente lo stato in cui nasce una riga scritta da una firma promossa.
+        Integer cogeFirma = conProposta.cogeSuggeritoId();
+        QuarkusTransaction.requiringNew().run(() -> triage.classificaTransitorio(conProposta.id(),
+                new ClassificaTransitorioRequest(cogeFirma, (short) 5, null, false, null)));
+        assertFalse(notaDi(conProposta.id()) != null && notaDi(conProposta.id()).contains("PROPOSTA["),
+                "premessa del test: la riga non porta più il marcatore");
+
+        QuarkusTransaction.requiringNew().run(() -> em.createNativeQuery(
+                "UPDATE keyword_firma SET usi_confermati = 0, usi_corretti = 0").executeUpdate());
+
+        // 2ª passata: il titolare si accorge che è sbagliata e la sposta.
+        Integer altro = cogeId("40.05.002");
+        Assumptions.assumeTrue(!altro.equals(cogeFirma), "serve un conto diverso");
+        QuarkusTransaction.requiringNew().run(() -> triage.classificaTransitorio(conProposta.id(),
+                new ClassificaTransitorioRequest(altro, (short) 5, null, false, null)));
+
+        assertEquals(1, somma("usi_corretti"),
+                "una firma promossa che sbaglia DEVE incassare il voto contrario: senza, N = 1 "
+                + "significa sbagliare per sempre");
+        assertEquals(0, somma("usi_confermati"));
+    }
+
+    /**
+     * Il ramo conta quanto il conto (24/08/2026). Fino a quella data {@code votaFirma} confrontava
+     * il solo CoGe: correggere la BU passava per conferma, e la firma restava a
+     * {@code usi_corretti = 0} — cioè promuovibile — pur sbagliando il ramo.
+     *
+     * <p>Misurato su prod (dump 24/08): 2 righe reali in questo stato, NOEMI 739,00 € (BU 5 → 1) e
+     * NICELLI 281,82 € (BU 2 → 1), entrambe su firme che con N = 1 si sarebbero promosse.
+     */
+    @Test
+    void correggereLaSolaBuVotaControLaFirma() throws Exception {
+        importa();
+        TransitorioDTO conProposta = triage.listTransitori(null, 0, 2000).content().stream()
+                .filter(r -> r.cogeSuggeritoId() != null)
+                .filter(r -> r.buSuggerita() != null)
+                .filter(this::vieneDaUnaFirmaKeyword)
+                .findFirst().orElse(null);
+        Assumptions.assumeTrue(conProposta != null,
+                "nessuna riga con proposta da firma keyword che porti anche il ramo");
+
+        // Stesso conto proposto, ramo DIVERSO da quello suggerito.
+        short altraBu = (short) (conProposta.buSuggerita() == 1 ? 5 : 1);
+        QuarkusTransaction.requiringNew().run(() -> triage.classificaTransitorio(conProposta.id(),
+                new ClassificaTransitorioRequest(conProposta.cogeSuggeritoId(), altraBu, null, false, null)));
+
+        assertEquals(1, somma("usi_corretti"),
+                "il conto era giusto ma il ramo no: è una correzione, non una conferma");
+        assertEquals(0, somma("usi_confermati"));
     }
 
     @Test

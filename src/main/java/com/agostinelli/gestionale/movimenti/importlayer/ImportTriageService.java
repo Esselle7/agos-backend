@@ -452,7 +452,7 @@ public class ImportTriageService {
                 : keywordLearning.firmeScelte(m.descrizione, ent, req.firme());
 
         // R17 — il voto sulla firma, PRIMA di riscrivere la nota (che è dove vive la proposta).
-        votaFirma(m, (String) target.get(0));
+        votaFirma(m, (String) target.get(0), req.businessUnitId());
 
         m.contoCoge = req.cogeId();
         m.businessUnitId = req.businessUnitId();
@@ -484,17 +484,44 @@ public class ImportTriageService {
      * la proposta veniva da un alias fornitore, o la firma è stata cancellata — non si vota:
      * meglio nessun voto che il voto sulla firma sbagliata.
      */
-    private void votaFirma(Movimento m, String cogeScelto) {
+    private void votaFirma(Movimento m, String cogeScelto, Short buScelta) {
         Proposta proposta = Proposta.leggi(m.note);
-        if (proposta == null) return;   // la riga non portava una proposta: niente da votare
+        // Cosa la firma aveva sostenuto per questa riga. Due casi, non uno:
+        //  · la riga porta il marcatore → la firma aveva PROPOSTO (non applicato): il suo target è lì;
+        //  · la riga NON lo porta e non è sul transitorio → la firma era PROMOSSA e ha SCRITTO da
+        //    sola, quindi il suo target è ciò che si legge adesso sul movimento.
+        // Il secondo caso fino al 24/08/2026 usciva subito (`if (proposta == null) return`): una
+        // firma promossa non riceveva mai un voto contrario e non si retrocedeva MAI. Con N = ∞ era
+        // invisibile; con N = 1 sarebbe «sbaglia una volta, sbaglia per sempre».
+        String cogeSostenuto;
+        Short buSostenuta;
+        if (proposta != null) {
+            cogeSostenuto = proposta.cogeCodice();
+            buSostenuta = proposta.bu();
+        } else {
+            List<?> corrente = em.createNativeQuery(
+                    "SELECT codice FROM piano_dei_conti_coge WHERE id = :id")
+                    .setParameter("id", m.contoCoge).getResultList();
+            // Sul transitorio nessuna firma ha sostenuto niente (era IGNOTA): votare qui
+            // attribuirebbe la riga a una firma imparata DOPO l'import, che non l'ha decisa.
+            if (corrente.isEmpty()) return;
+            cogeSostenuto = (String) corrente.get(0);
+            if (CogeTransitorio.transitorio(cogeSostenuto)) return;
+            buSostenuta = m.businessUnitId;
+        }
         String sorgente = m.contoBancarioId == null ? Sorgente.CA
                 : (m.contoBancarioId == 1 ? Sorgente.BPM : (m.contoBancarioId == 2 ? Sorgente.CA : Sorgente.BILLY));
         var match = keywordEngine.valuta(m.descrizione, m.tipo, sorgente)
                 .filter(k -> !k.conflitto() && k.firmaId() != null)
-                .filter(k -> proposta.cogeCodice().equals(k.cogeCodice()));
+                .filter(k -> cogeSostenuto.equals(k.cogeCodice()));
         if (match.isEmpty()) return;
 
-        boolean confermata = proposta.cogeCodice().equals(cogeScelto);
+        // Il ramo conta quanto il conto. Fino al 24/08/2026 si confrontava il solo CoGe, quindi una
+        // BU corretta a mano passava per conferma: misurato su prod (dump 24/08), 2 righe reali —
+        // NOEMI 739,00 € (BU 5 → 1) e NICELLI 281,82 € (BU 2 → 1) — tenevano `usi_corretti = 0` su
+        // firme che sul ramo avevano sbagliato, e con N = 1 si sarebbero promosse.
+        boolean confermata = cogeSostenuto.equals(cogeScelto)
+                && (buSostenuta == null || buSostenuta.equals(buScelta));
         em.createNativeQuery("UPDATE keyword_firma SET "
                 + (confermata ? "usi_confermati = usi_confermati + 1" : "usi_corretti = usi_corretti + 1")
                 + ", updated_at = now() WHERE id = :id")

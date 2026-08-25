@@ -56,9 +56,18 @@ class ConfidenzaLuglioIntegrationTest {
     // ⚠️ non misurato: restano 2 righe di scarto sulla classe CERTA rispetto alla scomposizione di
     // §1 (43 spese banca qui contro 45 in prod). Per chiuderla servirebbe rigiocare sul dato di
     // produzione, cosa che questo test non fa e non deve fare.
+    // AGGIORNATI il 24/08/2026 dalla bonifica del dizionario keyword (V42→V45, vedi
+    // docs/analisi/keyword-cleanup-esecuzione-2026-08-24.md). Prima erano 64/51/39.
+    // Lo spostamento è 3 righe da IGNOTA a PROPOSTA, ed è l'effetto VOLUTO delle 24 firme nuove
+    // di V44: righe che prima nessuna firma sapeva leggere ora arrivano all'operatore con una
+    // proposta invece che vuote. Misurato riga per riga sul corpus reale.
+    //
+    // ⚠️ La costante che protegge davvero è T_CERTA, ed è rimasta 64: nessuna riga entra in
+    // contabilità automatica che prima non ci entrasse. Se un giorno T_CERTA si muove senza che
+    // qualcuno abbia cambiato l'elenco chiuso di R3, è un difetto — non un numero da riallineare.
     static final int T_CERTA = 64;
-    static final int T_PROPOSTA = 51;
-    static final int T_IGNOTA = 39;
+    static final int T_PROPOSTA = 54;
+    static final int T_IGNOTA = 36;
 
     @Inject MovimentoMappingEngineImpl engine;
     @Inject MovimentoNormalizerImpl normalizer;

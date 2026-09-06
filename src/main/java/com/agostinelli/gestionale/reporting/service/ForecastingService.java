@@ -1,6 +1,7 @@
 package com.agostinelli.gestionale.reporting.service;
 
 import com.agostinelli.gestionale.infrastructure.exception.ApiException;
+import com.agostinelli.gestionale.reporting.Perimetro;
 import com.agostinelli.gestionale.reporting.dto.*;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -11,6 +12,7 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.eclipse.microprofile.faulttolerance.Timeout;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.time.temporal.IsoFields;
@@ -48,6 +50,23 @@ public class ForecastingService {
     @ConfigProperty(name = "forecast.baseline.finestra-settimane", defaultValue = "8")
     int finestraSettimane;
 
+    /** Oltre questi giorni senza cassa a libro il previsionale dichiara che sta prevedendo su dati
+     *  fermi (P6). Default 14: due settimane senza estratto conto sono già un buco che cambia la
+     *  lettura di ogni numero della pagina. */
+    @ConfigProperty(name = "forecast.freschezza.giorni-max", defaultValue = "14")
+    int freschezzaGiorniMax;
+
+    /** Mesi INTERI di dati richiesti perché la stima costi si accenda (P7, gate fail-closed).
+     *  Default 3, deciso dall'utente il 06/09/2026: con go-live al 01/07 significa non prima di
+     *  ottobre 2026. Una media su due mesi, di cui uno è luglio dove il 29,6% dei costi sta ancora
+     *  sul transitorio «da classificare», è il rumore di due campioni, non una stima. */
+    @ConfigProperty(name = "forecast.costi.min-mesi", defaultValue = "3")
+    int minMesiCosti;
+
+    /** Ampiezza della finestra su cui si media, in mesi interi. */
+    @ConfigProperty(name = "forecast.costi.finestra-mesi", defaultValue = "3")
+    int finestraMesiCosti;
+
     @Transactional
     @Timeout(value = 15, unit = ChronoUnit.SECONDS)
     public ForecastingRispostaDTO computeForecasting(String horizon) {
@@ -59,7 +78,7 @@ public class ForecastingService {
             ForecastingAsIsDTO asIs = buildAsIs(oggi);
             ForecastingEconomicoDTO economico = new ForecastingEconomicoDTO(
                     BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO,
-                    BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, List.of());
+                    BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, List.of(), BigDecimal.ZERO, null);
             ForecastingFinanziarioDTO finanziario = new ForecastingFinanziarioDTO(
                     asIs.saldoLiquidita(), BigDecimal.ZERO, BigDecimal.ZERO,
                     asIs.saldoLiquidita(), List.of());
@@ -72,10 +91,14 @@ public class ForecastingService {
         // entrambe le viste (dettaglio economico + timeline finanziaria).
         StimaRicaviCash stima = projectStimaRicaviCash(start, fine, oggi);
 
+        // asIs PRIMA della stima costi: il gate di P7 legge datiIncompleti (freschezza del dato).
         ForecastingAsIsDTO asIs = buildAsIs(oggi);
-        ForecastingEconomicoDTO economico = buildEconomico(start, fine, stima.righe());
-        ForecastingFinanziarioDTO finanziario =
-                buildFinanziario(start, fine, asIs.saldoLiquidita(), horizon, stima.giornaliera());
+        StimaCosti stimaCosti = projectStimaCosti(start, fine, oggi, asIs.datiIncompleti());
+
+        ForecastingEconomicoDTO economico =
+                buildEconomico(start, fine, stima.righe(), stimaCosti);
+        ForecastingFinanziarioDTO finanziario = buildFinanziario(
+                start, fine, asIs.saldoLiquidita(), horizon, stima.giornaliera(), stimaCosti.perData());
 
         return new ForecastingRispostaDTO(asIs, economico, finanziario);
     }
@@ -117,25 +140,107 @@ public class ForecastingService {
                 .setParameter("toYM", toYM)
                 .getSingleResult();
 
-        // Crediti e debiti aperti: movimenti non ancora liquidati (data_finanziaria IS NULL)
+        // P5 (docs/specs/previsionale-correzioni.md): lo YTD si ferma a OGGI, non a fine mese.
+        // La MV ha grana mensile, quindi il mese corrente entra intero — comprese le caparre con
+        // data_competenza futura di eventi non ancora celebrati (misura 06/09/2026: 3.420,00 € di
+        // ricavo non maturato dentro un numero etichettato «YTD», B14 della baseline). Dopo P2 gli
+        // stessi euro stanno anche nel previsionale: senza questa sottrazione sarebbero contati due
+        // volte a video.
+        //
+        // Confine: YTD = [1 gen, oggi] · previsione = (oggi, fine]. Nessuna sovrapposizione, nessun buco.
+        //
+        // La coda si sottrae con LO STESSO JOIN e LA STESSA semantica CASE di V39 — altrimenti si
+        // sottrarrebbe una cosa diversa da quella che si è sommata. Il JOIN su business_units c'è
+        // perché la MV lo ha: una riga con BU non in anagrafica la MV non la conta, e nemmeno questa.
+        Object[] coda = (Object[]) em.createNativeQuery(
+                "SELECT " +
+                " COALESCE(SUM(CASE WHEN m.tipo='ENTRATA' AND pc.tipo='RICAVO' " +
+                "      THEN COALESCE(m.importo_imponibile, m.importo_lordo) " +
+                "      WHEN m.tipo='USCITA' AND pc.tipo='RICAVO' " +
+                "      THEN -COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0), " +
+                " COALESCE(SUM(CASE WHEN m.tipo='USCITA' AND pc.tipo='COSTO' AND NOT pc.is_capex " +
+                "      THEN COALESCE(m.importo_imponibile, m.importo_lordo) " +
+                "      WHEN m.tipo='ENTRATA' AND pc.tipo='COSTO' AND NOT pc.is_capex " +
+                "       AND COALESCE(m.importo_imponibile, m.importo_lordo) < 0 " +
+                "      THEN COALESCE(m.importo_imponibile, m.importo_lordo) ELSE 0 END),0) " +
+                "FROM movimenti m " +
+                "JOIN business_units bu ON bu.id = m.business_unit_id " +
+                "JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
+                "WHERE m.stato <> 'ANNULLATO' AND m.data_competenza > :oggi AND m.data_competenza <= :fineMese")
+                .setParameter("oggi", oggi)
+                .setParameter("fineMese", oggi.withDayOfMonth(oggi.lengthOfMonth()))
+                .getSingleResult();
+
+        BigDecimal ricaviYtd = toBD(ytd[0]).subtract(toBD(coda[0]));
+        BigDecimal costiYtd  = toBD(ytd[1]).subtract(toBD(coda[1]));
+        // L'ebitda_proxy della MV è ricavi − costi: la coda si toglie con la stessa differenza,
+        // così l'invariante ebitdaYtd = ricaviYtd − costiYtd resta vera per costruzione.
+        BigDecimal ebitdaYtd = toBD(ytd[2]).subtract(toBD(coda[0]).subtract(toBD(coda[1])));
+
+        // Crediti e debiti aperti: movimenti non ancora liquidati (data_finanziaria IS NULL).
+        // La terza colonna è il credito da eventi già celebrati (P4): stessa base, più
+        // evento_id IS NOT NULL — è la stessa condizione di ReportingService.computeQualita, senza
+        // filtro di periodo perché riguarda eventi passati e non dipende dall'orizzonte.
+        // Calcolarlo QUI e non con una query a parte rende il sottoinsieme strutturale: non può
+        // superare creditiAperti perché è la stessa SUM con un CASE più stretto.
         Object[] daLiq = (Object[]) em.createNativeQuery(
                 "SELECT " +
                 "COALESCE(SUM(CASE WHEN tipo='ENTRATA' THEN importo_lordo ELSE 0 END),0) AS crediti, " +
-                "COALESCE(SUM(CASE WHEN tipo='USCITA'  THEN importo_lordo ELSE 0 END),0) AS debiti " +
+                "COALESCE(SUM(CASE WHEN tipo='USCITA'  THEN importo_lordo ELSE 0 END),0) AS debiti, " +
+                "COALESCE(SUM(CASE WHEN tipo='ENTRATA' AND evento_id IS NOT NULL " +
+                "         THEN importo_lordo ELSE 0 END),0) AS credito_eventi " +
                 "FROM movimenti " +
                 "WHERE stato != 'ANNULLATO' AND data_finanziaria IS NULL")
                 .getSingleResult();
 
+        // P6: su che dato stiamo prevedendo. Il previsionale affermava «saldo fra 90 giorni:
+        // 20.964,18 €» con la stessa faccia sia che il dato fosse di ieri sia che fosse fermo da
+        // sette settimane — ed è l'informazione che rende interpretabili tutte le altre.
+        // Stesso pattern di ReportingService.computeQualita: un boolean + una nota che dice il numero.
+        LocalDate ultimaDataCassa = toLocalDate(em.createNativeQuery(
+                "SELECT MAX(data_finanziaria) FROM movimenti WHERE stato != 'ANNULLATO'")
+                .getSingleResult());
+        boolean datiIncompleti = ultimaDataCassa == null
+                || ultimaDataCassa.isBefore(oggi.minusDays(freschezzaGiorniMax));
+
         return new ForecastingAsIsDTO(
                 saldo,
-                toBD(ytd[0]), toBD(ytd[1]), toBD(ytd[2]),
-                toBD(daLiq[0]), toBD(daLiq[1]));
+                ricaviYtd, costiYtd, ebitdaYtd,
+                toBD(daLiq[0]), toBD(daLiq[1]), toBD(daLiq[2]),
+                ultimaDataCassa, datiIncompleti,
+                datiIncompleti ? notaFreschezza(ultimaDataCassa, oggi) : null);
+    }
+
+    private static final String[] MESI = {"gennaio", "febbraio", "marzo", "aprile", "maggio",
+            "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"};
+
+    /** Dice la data e i mesi scoperti. Nessun giudizio, solo i numeri: chi legge decide. */
+    private String notaFreschezza(LocalDate ultima, LocalDate oggi) {
+        if (ultima == null) {
+            return "Nessun movimento con data di incasso a libro: la previsione parte dal saldo "
+                 + "iniziale, senza storico di cassa.";
+        }
+        long giorni = ChronoUnit.DAYS.between(ultima, oggi);
+        StringBuilder sb = new StringBuilder("Ultimo movimento di cassa a libro: ")
+                .append(ultima.format(java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy")))
+                .append(" (").append(giorni).append(giorni == 1 ? " giorno fa)." : " giorni fa).");
+
+        List<String> scoperti = new ArrayList<>();
+        for (YearMonth ym = YearMonth.from(ultima).plusMonths(1);
+             !ym.isAfter(YearMonth.from(oggi)); ym = ym.plusMonths(1)) {
+            scoperti.add(MESI[ym.getMonthValue() - 1] + " " + ym.getYear());
+        }
+        if (!scoperti.isEmpty()) {
+            sb.append(" Nessun incasso importato per: ").append(String.join(", ", scoperti)).append('.');
+        }
+        return sb.toString();
     }
 
     // ── ECONOMICO ─────────────────────────────────────────────────────────────
 
     private ForecastingEconomicoDTO buildEconomico(LocalDate start, LocalDate end,
-                                                   List<ForecastingDettaglioDTO> righeStimate) {
+                                                   List<ForecastingDettaglioDTO> righeStimate,
+                                                   StimaCosti stimaCosti) {
         List<ForecastingDettaglioDTO> dettaglio = new ArrayList<>();
 
         // 1a. Movimenti con data economica futura (impatto P&L previsto)
@@ -165,6 +270,10 @@ public class ForecastingService {
         //    flag affidabilita=STIMATO, ma esclusi dai subtotali P&L "certi" sotto.
         dettaglio.addAll(righeStimate);
 
+        // 7. Costi ricorrenti STIMATI (P7). Come i ricavi stimati: nel dettaglio con flag
+        //    affidabilita=STIMATO, fuori dai subtotali certi.
+        dettaglio.addAll(stimaCosti.righe());
+
         dettaglio.sort(Comparator.comparing(ForecastingDettaglioDTO::data));
 
         // Aggregati P&L "certi": escludono FINANZIARIA-only (cassa, P&L già storico) e le voci STIMATE
@@ -179,6 +288,10 @@ public class ForecastingService {
         // movimenti finanziari-only e ammortamenti — questi ultimi stanno tra EBITDA ed EBIT)
         BigDecimal costiOperativi = dettaglio.stream()
                 .filter(d -> !"FINANZIARIA".equals(d.vista()))
+                // P7: costiPrevisti resta il CERTO, esattamente come ricaviPrevisti. Il combinato
+                // lo compone la UI dai flag. Senza questo filtro le righe stimate entrerebbero nei
+                // subtotali certi e l'EBITDA previsto mescolerebbe misura e congettura.
+                .filter(d -> !"STIMATO".equals(d.affidabilita()))
                 .filter(d -> !"RATA_RICORRENTE_CAPITALE".equals(d.categoria())
                           && !"RATA_RICORRENTE_INTERESSI".equals(d.categoria())
                           && !"AMMORTAMENTO".equals(d.categoria()))
@@ -195,8 +308,12 @@ public class ForecastingService {
                 .map(ForecastingDettaglioDTO::importoUscita)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
         BigDecimal ebit = ebitda.subtract(ammortamenti);
+        // P3: gli oneri finanziari stanno SOTTO l'EBIT. Prima erano mostrati a video come riga di
+        // sottrazione ma non venivano sottratti da nessun totale: aritmetica falsa sullo schermo.
+        BigDecimal ebt = ebit.subtract(oneriFinanziari);
 
-        return new ForecastingEconomicoDTO(ricavi, costiOperativi, ebitda, ammortamenti, oneriFinanziari, ebit, dettaglio);
+        return new ForecastingEconomicoDTO(ricavi, costiOperativi, ebitda, ammortamenti,
+                oneriFinanziari, ebit, dettaglio, ebt, stimaCosti.nota());
     }
 
     /**
@@ -253,7 +370,8 @@ public class ForecastingService {
 
     private ForecastingFinanziarioDTO buildFinanziario(LocalDate start, LocalDate end,
                                                         BigDecimal saldoPartenza, String horizon,
-                                                        Map<LocalDate, BigDecimal> stimaGiornaliera) {
+                                                        Map<LocalDate, BigDecimal> stimaGiornaliera,
+                                                        Map<LocalDate, BigDecimal> stimaCostiPerData) {
         List<ForecastingDettaglioDTO> items = new ArrayList<>();
 
         // 1. Movimenti DA_LIQUIDARE con data liquidità nel periodo
@@ -277,8 +395,9 @@ public class ForecastingService {
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
         boolean granularitaSettimanale = isSettimanale(horizon);
-        List<ForecastingTimelineDTO> timeline =
-                buildTimeline(items, start, end, saldoPartenza, granularitaSettimanale, stimaGiornaliera);
+        List<ForecastingTimelineDTO> timeline = buildTimeline(
+                items, start, end, saldoPartenza, granularitaSettimanale,
+                stimaGiornaliera, stimaCostiPerData);
 
         return new ForecastingFinanziarioDTO(
                 saldoPartenza, incassi, uscite,
@@ -290,18 +409,55 @@ public class ForecastingService {
 
     @SuppressWarnings("unchecked")
     private List<ForecastingDettaglioDTO> buildMovimentiEconomici(LocalDate start, LocalDate end) {
-        // Le ENTRATE con evento_id sono escluse perché il residuo entrate dell'evento le rappresenta.
-        // Le USCITE con evento_id (costi diretti: F&B, personale extra, ...) NON sono catturate dal residuo
-        // e devono essere mostrate per non sottostimare i costi previsti.
+        // P2 (docs/specs/previsionale-correzioni.md): le ENTRATE con evento_id NON sono più escluse.
+        // Erano escluse «perché il residuo dell'evento le rappresenta», ma la motivazione era
+        // invertita: il residuo vale preventivato − incassato, cioè il COMPLEMENTO di queste righe.
+        // Escluderle e mostrare solo il residuo teneva fuori dal ricavo previsto l'acconto già
+        // incassato — la cui data_competenza è la data dell'evento, quindi futura — mentre
+        // mv_conto_economico_mensile lo conta in quel mese (raggruppa su data_competenza).
+        // Misura 06/09/2026: 4.420,00 € su orizzonte 90 (B2/B3 della baseline).
+        //
+        // Nessun doppio conteggio in cassa: queste righe nascono vista=ECONOMICA, che
+        // buildTimeline scarta; gli acconti hanno data_finanziaria valorizzata, quindi non sono
+        // nemmeno raccolti da buildMovimentiDaLiquidare — dove la clausola gemella RESTA, ed è lì
+        // che tiene le righe COMPETENZA fuori dalla proiezione di cassa.
+        //
+        // Le USCITE con evento_id (costi diretti: F&B, personale extra, ...) non sono catturate dal
+        // residuo e devono essere mostrate per non sottostimare i costi previsti.
+        //
+        // JOIN su piano_dei_conti_coge (collaudo 06/09/2026). La spec lo teneva «fuori scopo,
+        // latente, 0 occorrenze» lasciando la trappola R2.5 — e la trappola è diventata ROSSA:
+        // `Filtro date range` e `Filtro buId 2`, due ENTRATA con competenza futura su conti
+        // ATTIVITA, venivano contate come ricavo previsto. Il controesempio è un test rosso, che
+        // il CLAUDE.md ammette come misura.
+        //
+        // La semantica replicata è quella di mv_conto_economico_mensile (V39), non una nuova: il
+        // previsionale deve promettere il conto economico che quel mese produrrà davvero
+        // (obiettivo 1 della spec). Quindi ENTRATA conta come ricavo solo su conto RICAVO non
+        // capex, USCITA come costo solo su conto COSTO non capex, e le righe di tipo discorde
+        // valgono zero — esattamente come nel CASE della MV.
+        //
+        // Impatto misurato su agosdb (copia di produzione) al 06/09/2026, finestra (oggi, +180]:
+        // 0 entrate e 0 uscite escluse, 0,00 € mossi, 0 righe senza conto_coge_id. Chiude il buco
+        // senza spostare un centesimo della baseline.
+        //
+        // Limite DICHIARATO, non svista: un'uscita su conto ONERE_FINANZIARIO o IMPOSTA esce dal
+        // dettaglio invece di scendere sotto l'EBIT, e un movimento senza conto_coge_id esce del
+        // tutto (come esce dalla MV, che ha lo stesso inner join). Occorrenze nella finestra al
+        // 06/09/2026: 0 e 0. Gli oneri finanziari previsti oggi arrivano dai piani ricorrenti, non
+        // dai movimenti; portarceli anche da qui è un passo diverso, da aprire con la sua misura.
         List<Object[]> rows = em.createNativeQuery(
-                "SELECT data_competenza, tipo, " +
-                "COALESCE(importo_imponibile, importo_lordo) AS importo, " +
-                "COALESCE(descrizione, 'Movimento') AS desc " +
-                "FROM movimenti " +
-                "WHERE stato != 'ANNULLATO' " +
-                "AND data_competenza BETWEEN :start AND :end " +
-                "AND NOT (evento_id IS NOT NULL AND tipo = 'ENTRATA') " +
-                "ORDER BY data_competenza ASC")
+                "SELECT m.data_competenza, m.tipo, " +
+                "COALESCE(m.importo_imponibile, m.importo_lordo) AS importo, " +
+                "COALESCE(m.descrizione, 'Movimento') AS desc " +
+                "FROM movimenti m " +
+                "JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
+                "WHERE m.stato != 'ANNULLATO' " +
+                "AND m.data_competenza BETWEEN :start AND :end " +
+                "AND NOT pc.is_capex " +
+                "AND ((m.tipo = 'ENTRATA' AND pc.tipo = 'RICAVO') " +
+                "  OR (m.tipo = 'USCITA'  AND pc.tipo = 'COSTO')) " +
+                "ORDER BY m.data_competenza ASC")
                 .setParameter("start", start)
                 .setParameter("end", end)
                 .getResultList();
@@ -540,6 +696,144 @@ public class ForecastingService {
         return new StimaRicaviCash(righe, giornaliera);
     }
 
+    // ── P7: stima dei costi ricorrenti ────────────────────────────────────────
+
+    private record StimaCosti(List<ForecastingDettaglioDTO> righe,
+                              Map<LocalDate, BigDecimal> perData,
+                              String nota) {
+        static StimaCosti spenta(String nota) { return new StimaCosti(List.of(), Map.of(), nota); }
+    }
+
+    /**
+     * Costi ricorrenti stimati: media MENSILE per conto sugli ultimi {@code finestra-mesi} mesi
+     * interi, proiettata come una riga per conto per ogni mese futuro dell'orizzonte.
+     *
+     * <p><b>Perché mensile e non per giorno-della-settimana</b> (come la stima ricavi): i ricavi
+     * cash sono giornalieri, i costi no — sono fatture e canoni, mensili e lumpy. Applicare ai
+     * costi la media per {@code dow} dei ricavi copierebbe la forma sbagliata.
+     *
+     * <p><b>Quando matura:</b> ultimo giorno del mese, la stessa convenzione già usata dagli
+     * ammortamenti — mese intero, nessun pro-rata sui giorni. Conseguenza voluta: il mese in corso
+     * entra tutto o niente a seconda che la sua fine cada nell'orizzonte, invece di essere spalmato
+     * su una frazione di mese che nessun canone rispetta.
+     *
+     * <p><b>Gate di sufficienza dati, fail-closed.</b> Non è un ripiego, è parte della feature: con
+     * un solo mese importato una media è la copia di quel mese. Servono tutte e tre le condizioni, e
+     * quando non ci sono la stima non esce e la nota dice perché.
+     *
+     * <p><b>Data usata: {@code data_competenza}</b> — è un costo di competenza, non un pagamento.
+     * Diverso da come {@code ForecastBaselineService} costruisce la baseline ricavi (usa
+     * {@code data_movimento}): difetto noto e misurato, non replicato qui. Vedi «Fuori scopo» nella
+     * spec.
+     */
+    @SuppressWarnings("unchecked")
+    private StimaCosti projectStimaCosti(LocalDate start, LocalDate end, LocalDate oggi,
+                                         boolean datiIncompleti) {
+        // Finestra: gli ultimi `finestraMesiCosti` mesi INTERI, mai sotto il go-live (R7.7).
+        YearMonth ultimoIntero = YearMonth.from(oggi).minusMonths(1);
+        YearMonth primo        = ultimoIntero.minusMonths(finestraMesiCosti - 1L);
+        YearMonth goLiveYm     = YearMonth.from(Perimetro.GO_LIVE);
+        if (primo.isBefore(goLiveYm)) primo = goLiveYm;
+        // Gate 1 — quanti mesi interi hanno almeno un costo proiettabile. Si valuta anche quando la
+        // finestra è degenere (0 mesi disponibili sopra il go-live), così la nota dice sempre il numero.
+        int mesiConDati = 0;
+        LocalDate finestraStart = primo.atDay(1);
+        LocalDate finestraEnd   = ultimoIntero.atEndOfMonth();
+        int mesiFinestra = (int) ChronoUnit.MONTHS.between(primo, ultimoIntero) + 1;
+        if (!primo.isAfter(ultimoIntero)) {
+            mesiConDati = ((Number) em.createNativeQuery(
+                    "SELECT COUNT(DISTINCT date_trunc('month', m.data_competenza)) " +
+                    "FROM movimenti m JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
+                    "WHERE " + FILTRO_COSTI_PROIETTABILI +
+                    " AND m.data_competenza BETWEEN :from AND :to")
+                    .setParameter("from", finestraStart)
+                    .setParameter("to", finestraEnd)
+                    .getSingleResult()).intValue();
+        }
+
+        // Il gate è fail-closed e dice TUTTE le ragioni per cui non passa, non solo la prima:
+        // «i dati non sono aggiornati» l'utente lo legge già nel banner di P6 — la ragione che gli
+        // serve qui è quanti mesi mancano.
+        List<String> motivi = new ArrayList<>();
+        if (mesiConDati < minMesiCosti) {
+            motivi.add("servono " + minMesiCosti + (minMesiCosti == 1 ? " mese intero" : " mesi interi")
+                     + " di dati, ce " + (mesiConDati == 1 ? "n'è 1" : "ne sono " + mesiConDati));
+        }
+        // Gate 3 — su dati fermi non si stima: si stimerebbe sul buco, non sull'andamento.
+        if (datiIncompleti) motivi.add("i dati di cassa non sono aggiornati");
+        if (!motivi.isEmpty()) {
+            return StimaCosti.spenta("Stima costi non disponibile: " + String.join("; ", motivi) + ".");
+        }
+
+        // Gate 2 — soglia PER CONTO, simmetrica a `min-giorni` sui ricavi: un conto visto una volta
+        // sola non ha una media, ha un episodio.
+        List<Object[]> rows = em.createNativeQuery(
+                "SELECT m.conto_coge_id, pc.descrizione, " +
+                "       SUM(COALESCE(m.importo_imponibile, m.importo_lordo)) AS totale " +
+                "FROM movimenti m JOIN piano_dei_conti_coge pc ON pc.id = m.conto_coge_id " +
+                "WHERE " + FILTRO_COSTI_PROIETTABILI +
+                " AND m.data_competenza BETWEEN :from AND :to " +
+                "GROUP BY m.conto_coge_id, pc.descrizione " +
+                "HAVING COUNT(DISTINCT date_trunc('month', m.data_competenza)) >= :minMesi " +
+                "   AND SUM(COALESCE(m.importo_imponibile, m.importo_lordo)) > 0 " +
+                "ORDER BY m.conto_coge_id")
+                .setParameter("from", finestraStart)
+                .setParameter("to", finestraEnd)
+                .setParameter("minMesi", minMesiCosti)
+                .getResultList();
+        if (rows.isEmpty()) {
+            return StimaCosti.spenta("Stima costi non disponibile: nessun conto di costo ha almeno "
+                    + minMesiCosti + " mesi con occorrenza nella finestra.");
+        }
+
+        // Mesi futuri la cui FINE cade nell'orizzonte: stessa convenzione degli ammortamenti.
+        List<LocalDate> mesiProiettati = new ArrayList<>();
+        for (YearMonth ym = YearMonth.from(start); !ym.isAfter(YearMonth.from(end)); ym = ym.plusMonths(1)) {
+            LocalDate fineMese = ym.atEndOfMonth();
+            if (!fineMese.isBefore(start) && !fineMese.isAfter(end)) mesiProiettati.add(fineMese);
+        }
+        if (mesiProiettati.isEmpty()) return new StimaCosti(List.of(), Map.of(), null);
+
+        List<ForecastingDettaglioDTO> righe = new ArrayList<>();
+        Map<LocalDate, BigDecimal>    perData = new LinkedHashMap<>();
+        for (Object[] r : rows) {
+            BigDecimal media = toBD(r[2]).divide(BigDecimal.valueOf(mesiFinestra), 2, RoundingMode.HALF_UP);
+            if (media.signum() <= 0) continue;
+            String desc = "Stima " + r[1] + " — media mensile ultimi " + mesiFinestra + " mesi";
+            for (LocalDate fineMese : mesiProiettati) {
+                righe.add(new ForecastingDettaglioDTO(
+                        fineMese, "MOVIMENTO", desc, BigDecimal.ZERO, media, "ENTRAMBE", "STIMATO"));
+                perData.merge(fineMese, media, BigDecimal::add);
+            }
+        }
+        return new StimaCosti(righe, perData, null);
+    }
+
+    /**
+     * Cosa può entrare nella media dei costi. Ogni esclusione evita un doppio conteggio o una bugia:
+     * <ul>
+     *   <li>{@code pc.tipo <> 'COSTO'} o {@code is_capex} — convenzione V38/V39: un investimento non
+     *       è un costo operativo;</li>
+     *   <li>conti transitori ({@link ReportingService#TRANSITORI}, la stessa costante che il P&amp;L
+     *       usa per misurarli) — proiettare «da classificare» come costo perpetuo è inventare;</li>
+     *   <li>conti agganciati a un piano ricorrente ATTIVO — sono già nel CERTO come rate, stimarli
+     *       li conterebbe due volte. È il doppio conteggio più probabile di tutta la feature;</li>
+     *   <li>{@code evento_id} — i costi diretti di un evento seguono l'evento, non una media;</li>
+     *   <li>{@code stato = 'ANNULLATO'} — ovvio, ma va scritto.</li>
+     * </ul>
+     */
+    private static final String FILTRO_COSTI_PROIETTABILI =
+            " m.stato <> 'ANNULLATO' AND m.tipo = 'USCITA' " +
+            " AND pc.tipo = 'COSTO' AND NOT pc.is_capex " +
+            " AND NOT " + ReportingService.TRANSITORI +
+            " AND m.evento_id IS NULL " +
+            " AND m.conto_coge_id NOT IN (" +
+            "     SELECT conto_coge_id FROM recurring_expense_plan " +
+            "      WHERE stato = 'ATTIVO' AND conto_coge_id IS NOT NULL " +
+            "      UNION " +
+            "     SELECT conto_coge_interessi_id FROM recurring_expense_plan " +
+            "      WHERE stato = 'ATTIVO' AND conto_coge_interessi_id IS NOT NULL) ";
+
     // ── Timeline aggregata ────────────────────────────────────────────────────
 
     private List<ForecastingTimelineDTO> buildTimeline(
@@ -547,12 +841,14 @@ public class ForecastingService {
             LocalDate start, LocalDate end,
             BigDecimal saldoPartenza,
             boolean settimanale,
-            Map<LocalDate, BigDecimal> stimaGiornaliera) {
+            Map<LocalDate, BigDecimal> stimaGiornaliera,
+            Map<LocalDate, BigDecimal> stimaCostiPerData) {
 
         // Aggrega items per bucket
         Map<String, BigDecimal[]> bucketMap = new LinkedHashMap<>();
         Map<String, LocalDate[]>  bucketBounds = new LinkedHashMap<>();
         Map<String, BigDecimal>   stimaBucket = new LinkedHashMap<>();
+        Map<String, BigDecimal>   stimaCostiBucket = new LinkedHashMap<>();
 
         // Popola tutti i bucket nell'intervallo per garantire continuità
         if (settimanale) {
@@ -615,6 +911,15 @@ public class ForecastingService {
             stimaBucket.merge(key, s.getValue(), BigDecimal::add);
         }
 
+        // Costi stimati (P7): stesso trattamento, colonna separata. Non toccano il saldo progressivo.
+        for (Map.Entry<LocalDate, BigDecimal> c : stimaCostiPerData.entrySet()) {
+            LocalDate d = c.getKey();
+            if (d.isBefore(start) || d.isAfter(end)) continue;
+            String key = settimanale ? bucketKeyWeek(d) : bucketKeyMonth(d);
+            if (!bucketMap.containsKey(key)) continue;
+            stimaCostiBucket.merge(key, c.getValue(), BigDecimal::add);
+        }
+
         // Costruisce la lista ordinata con saldo progressivo (sul solo certo)
         List<ForecastingTimelineDTO> result = new ArrayList<>();
         BigDecimal saldo = saldoPartenza;
@@ -626,7 +931,9 @@ public class ForecastingService {
             saldo = saldo.add(entr).subtract(usc);
             LocalDate[] bounds = bucketBounds.get(key);
             BigDecimal stimata = stimaBucket.getOrDefault(key, BigDecimal.ZERO);
-            result.add(new ForecastingTimelineDTO(key, bounds[0], bounds[1], entr, usc, ebitda, saldo, stimata));
+            BigDecimal stimateUsc = stimaCostiBucket.getOrDefault(key, BigDecimal.ZERO);
+            result.add(new ForecastingTimelineDTO(
+                    key, bounds[0], bounds[1], entr, usc, ebitda, saldo, stimata, stimateUsc));
         }
         return result;
     }

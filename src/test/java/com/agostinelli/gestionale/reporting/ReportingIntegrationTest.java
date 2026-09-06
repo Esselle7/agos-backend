@@ -20,8 +20,15 @@ import static org.junit.jupiter.api.Assertions.*;
  * Integration test per il modulo Reporting & Dashboard.
  * Copre DashboardResource, ReportingResource, ReportJobService.
  *
- * Prerequisito: agosdb_test con dati V9 (movimenti reali 2026).
  * Le MV vengono refreshate una sola volta prima della suite.
+ *
+ * ⚠️ NON c'è nessun «prerequisito di dati». L'intestazione diceva «agosdb_test con dati V9
+ * (movimenti reali 2026)»: è falso e lo è per qualunque migration — nessun file di
+ * {@code db/migration} inserisce movimenti, e il profilo di test carica solo quella cartella
+ * (niente {@code db/seed}). Appena migrato, {@code agosdb_test} è vuoto di movimenti.
+ * Un test che ha bisogno di righe se le semina e se le ripulisce (vedi
+ * {@code seedIncassoMaggio}); scommettere sui dati lasciati da altre classi rende l'esito
+ * dipendente da chi gira insieme — misurato il 06/09/2026 su cashFlowStoricoMONTH_200_lista.
  */
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -1009,21 +1016,99 @@ class ReportingIntegrationTest {
     // REPORTING CASH FLOW STORICO
     // ═══════════════════════════════════════════════════════════
 
+    /**
+     * Il test si porta il proprio movimento invece di aspettarsi che ci sia.
+     *
+     * <p>Il commento precedente diceva «V27 inserisce movimenti a partire da maggio 2026»: non è
+     * più vero e non lo è per nessuna migration — {@code grep -rli "insert into movimenti"
+     * src/main/resources/db/migration/} non trova nulla, e il profilo di test carica SOLO
+     * {@code db/migration} (niente {@code db/seed}). Appena migrato, {@code agosdb_test} non ha
+     * un solo movimento: l'asserzione {@code hasSize(greaterThan(0))} passava soltanto quando
+     * un'altra classe della stessa JVM lasciava per caso una riga liquidata a maggio 2026.
+     *
+     * <p>MISURATO il 06/09/2026: <b>rosso</b> nel set di 10 classi del previsionale
+     * ({@code Expected: a collection with size > 0 · Actual: <[]>}) e <b>verde</b> nella suite
+     * completa. Un test il cui esito dipende da chi gira insieme a lui non dice niente su nessuno
+     * dei due esiti.
+     *
+     * <p>Con la fixture in casa l'asserzione può anche stringere: non «c'è almeno un periodo», ma
+     * «i soldi che ho messo li vedo».
+     */
     @Test
     @Order(90)
     @TestSecurity(user = TEST_USER, roles = {"ADMIN"})
     void cashFlowStoricoMONTH_200_lista() {
-        // Periodo aggiornato a maggio 2026: V26 ha cancellato i seed V9; V27 inserisce
-        // movimenti a partire da maggio 2026.
-        given()
-            .queryParam("from", "2026-05-01")
-            .queryParam("to", "2026-05-31")
-            .queryParam("granularity", "MONTH")
-            .when().get("/api/reporting/cashflow/storico")
-            .then()
-                .statusCode(200)
+        seedIncassoMaggio("1234.56");
+        try {
+            refreshCashFlowMv();
+
+            List<Map<String, Object>> periodi = given()
+                .queryParam("from", "2026-05-01")
+                .queryParam("to", "2026-05-31")
+                .queryParam("granularity", "MONTH")
+                .when().get("/api/reporting/cashflow/storico")
+                .then().statusCode(200)
                 .body("$", instanceOf(java.util.List.class))
-                .body("$", hasSize(greaterThan(0)));
+                .extract().jsonPath().getList("$");
+
+            assertEquals(1, periodi.size(),
+                "maggio 2026 è un mese solo: la granularità MONTH deve restituire un periodo");
+            assertTrue(toFloat(periodi.get(0).get("entrate")) >= 1234.56f - 0.01f,
+                "le entrate di maggio devono contenere l'incasso seminato dal test (1.234,56)");
+        } finally {
+            ripulisciFixtureCashFlow();
+            refreshCashFlowMv();
+        }
+    }
+
+    // ── fixture di cash flow (vedi cashFlowStoricoMONTH_200_lista) ────────────
+
+    /** Il marcatore della fixture: è anche la chiave della pulizia. */
+    private static final String CF_FIXTURE = "ZZ fixture cash flow maggio";
+
+    /**
+     * Un incasso liquidato a maggio 2026, creato con lo stesso {@code creaMovimento} già usato
+     * dagli altri test della classe. {@code data_finanziaria} è ciò su cui
+     * {@code mv_cash_flow_statement} raggruppa, e la MV JOIN-a sia {@code conti_bancari} sia
+     * {@code piano_dei_conti_coge}: senza conto bancario e conto CoGe la riga non esisterebbe
+     * per l'endpoint. Il conto CoGe è RICAVO non capex perché la MV somma in
+     * {@code entrate_operative} solo i tipi diversi da PASSIVITA/ONERE_FINANZIARIO/ATTIVITA.
+     */
+    private void seedIncassoMaggio(String importo) {
+        int cogeRicavo = ((Number) em.createNativeQuery(
+                "SELECT id FROM piano_dei_conti_coge WHERE tipo = 'RICAVO' AND NOT is_capex " +
+                "AND is_active ORDER BY id LIMIT 1").getSingleResult()).intValue();
+        int metodo = ((Number) em.createNativeQuery(
+                "SELECT id FROM metodi_pagamento WHERE codice = 'BONIFICO'").getSingleResult()).intValue();
+        creaMovimento("ENTRATA", importo, 1, cogeRicavo, metodo, "2026-05-15", CF_FIXTURE);
+    }
+
+    /**
+     * A differenza delle altre fixture «ZZ » di questa classe, questa si ripulisce: la classe
+     * condivide {@code agosdb_test} con {@code TermometroLuglioIntegrationTest}, che somma TUTTI i
+     * movimenti di un conto per confrontarli con gli oracoli di saldo. Una riga lasciata a terra
+     * glieli sposta.
+     */
+    private void ripulisciFixtureCashFlow() {
+        try {
+            tx.begin();
+            em.createNativeQuery("DELETE FROM movimenti WHERE descrizione = :d")
+                .setParameter("d", CF_FIXTURE).executeUpdate();
+            tx.commit();
+        } catch (Exception e) {
+            throw new IllegalStateException("pulizia fixture cash flow fallita", e);
+        }
+    }
+
+    /** La MV è materializzata: senza REFRESH la riga appena creata non esiste per l'endpoint. */
+    private void refreshCashFlowMv() {
+        try {
+            tx.begin();
+            em.createNativeQuery("REFRESH MATERIALIZED VIEW mv_cash_flow_statement").executeUpdate();
+            tx.commit();
+        } catch (Exception e) {
+            throw new IllegalStateException("refresh mv_cash_flow_statement fallito", e);
+        }
     }
 
     @Test
@@ -1061,38 +1146,49 @@ class ReportingIntegrationTest {
     void cashFlowStoricoMONTH_saldoCumulativoInvariant() {
         // INVARIANTE: saldoCumulato[i] == saldoCumulato[i-1] + saldoPeriodo[i]
         //             saldoPeriodo[i] == entrate[i] - uscite[i]
-        // Periodo aggiornato a maggio-luglio 2026: V26 ha cancellato i seed V9
-        // di gen-mar; V27 inserisce movimenti a partire da maggio 2026.
-        List<Map<String, Object>> periodi = given()
-            .queryParam("from", "2026-05-01")
-            .queryParam("to", "2026-07-31")
-            .queryParam("granularity", "MONTH")
-            .when().get("/api/reporting/cashflow/storico")
-            .then().statusCode(200)
-            .extract().jsonPath().getList("$");
+        //
+        // Gli invarianti sopra reggono su qualunque dato, anche su zero righe — ma su zero righe
+        // non verificano niente. Stessa fixture (e stessa ragione) di cashFlowStoricoMONTH_200_lista:
+        // nessuna migration inserisce movimenti, quindi «almeno un periodo» era una scommessa su
+        // quali altre classi girassero prima.
+        seedIncassoMaggio("1234.56");
+        try {
+            refreshCashFlowMv();
 
-        assertTrue(periodi.size() >= 1,
-            "Con dati V27 mag-lug 2026, atteso almeno 1 periodo mensile (la MV CF " +
-            "raggruppa per data_finanziaria — i movimenti DA_LIQUIDARE non compaiono)");
+            List<Map<String, Object>> periodi = given()
+                .queryParam("from", "2026-05-01")
+                .queryParam("to", "2026-07-31")
+                .queryParam("granularity", "MONTH")
+                .when().get("/api/reporting/cashflow/storico")
+                .then().statusCode(200)
+                .extract().jsonPath().getList("$");
 
-        // Controlla saldoPeriodo = entrate - uscite per ogni riga
-        for (Map<String, Object> p : periodi) {
-            float entr  = toFloat(p.get("entrate"));
-            float usc   = toFloat(p.get("uscite"));
-            float saldo = toFloat(p.get("saldoPeriodo"));
-            assertEquals(entr - usc, saldo, 0.02f,
-                "saldoPeriodo deve essere entrate - uscite");
-        }
+            assertTrue(periodi.size() >= 1,
+                "la fixture di maggio 2026 deve produrre almeno un periodo mensile (la MV CF " +
+                "raggruppa per data_finanziaria — i movimenti DA_LIQUIDARE non compaiono)");
 
-        // Controlla la progressione cumulativa
-        float prevCumulato = 0f;
-        for (int i = 0; i < periodi.size(); i++) {
-            float saldoPeriodo = toFloat(periodi.get(i).get("saldoPeriodo"));
-            float saldoCumulato = toFloat(periodi.get(i).get("saldoCumulato"));
-            float expected = prevCumulato + saldoPeriodo;
-            assertEquals(expected, saldoCumulato, 0.02f,
-                "Periodo " + i + ": saldoCumulato deve essere saldoCumulato_prev + saldoPeriodo");
-            prevCumulato = saldoCumulato;
+            // Controlla saldoPeriodo = entrate - uscite per ogni riga
+            for (Map<String, Object> p : periodi) {
+                float entr  = toFloat(p.get("entrate"));
+                float usc   = toFloat(p.get("uscite"));
+                float saldo = toFloat(p.get("saldoPeriodo"));
+                assertEquals(entr - usc, saldo, 0.02f,
+                    "saldoPeriodo deve essere entrate - uscite");
+            }
+
+            // Controlla la progressione cumulativa
+            float prevCumulato = 0f;
+            for (int i = 0; i < periodi.size(); i++) {
+                float saldoPeriodo = toFloat(periodi.get(i).get("saldoPeriodo"));
+                float saldoCumulato = toFloat(periodi.get(i).get("saldoCumulato"));
+                float expected = prevCumulato + saldoPeriodo;
+                assertEquals(expected, saldoCumulato, 0.02f,
+                    "Periodo " + i + ": saldoCumulato deve essere saldoCumulato_prev + saldoPeriodo");
+                prevCumulato = saldoCumulato;
+            }
+        } finally {
+            ripulisciFixtureCashFlow();
+            refreshCashFlowMv();
         }
     }
 

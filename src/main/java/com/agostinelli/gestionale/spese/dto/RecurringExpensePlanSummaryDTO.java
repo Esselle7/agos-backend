@@ -26,5 +26,8 @@ public record RecurringExpensePlanSummaryDTO(
     int         rateSkipped,
     int         rateCancelled,
     BigDecimal  totalePagato,
-    BigDecimal  totaleResiduo
+    /** Quanto resta da SBORSARE: capitale + interessi delle rate PENDING. */
+    BigDecimal  totaleResiduo,
+    /** Quanto si deve ancora alla banca: solo la quota capitale delle rate PENDING. */
+    BigDecimal  debitoResiduo
 ) {}

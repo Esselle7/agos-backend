@@ -69,7 +69,7 @@ public class EventiService {
     static final String TIPO_COMPETENZA = "COMPETENZA";
 
     /** Data di apertura del gestionale: prima non esiste un conto economico (reset go-live). */
-    private static final LocalDate GO_LIVE = LocalDate.of(2026, 7, 1);
+    private static final LocalDate GO_LIVE = com.agostinelli.gestionale.reporting.Perimetro.GO_LIVE;
 
     /**
      * Timezone di riferimento per le validazioni di date che derivano da
@@ -1269,7 +1269,9 @@ public class EventiService {
         }
 
         Movimento m = esistente.orElseGet(() -> creaRigaDiCompetenza(e));
-        m.importo = residuo;
+        m.importo         = residuo;
+        m.contoBancarioId = null;   // I2 riaffermata sulle righe già esistenti, non solo alla creazione
+        m.dataFinanziaria = null;   // I2
     }
 
     /**

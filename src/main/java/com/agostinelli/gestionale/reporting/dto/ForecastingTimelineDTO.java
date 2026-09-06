@@ -16,4 +16,7 @@ public record ForecastingTimelineDTO(
         BigDecimal uscitePreviste,
         BigDecimal ebitdaPeriodo,
         BigDecimal saldoLiquiditaFine,
-        BigDecimal entrateStimate) {}
+        BigDecimal entrateStimate,
+        /** Costi ricorrenti STIMATI del bucket (P7). Simmetrico a entrateStimate: additivo, e come
+         *  quello NON entra in {@code saldoLiquiditaFine}, che resta sul solo certo. */
+        BigDecimal usciteStimate) {}

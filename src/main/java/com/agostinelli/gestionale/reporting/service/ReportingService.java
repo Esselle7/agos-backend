@@ -309,14 +309,14 @@ public class ReportingService {
     // ── Fase 6: attendibilita' del numero (additiva, non cambia nessun totale) ─
 
     /** Il gestionale riparte da qui: prima non ci sono i costi, quindi il P&amp;L non e' confrontabile. */
-    private static final LocalDate GO_LIVE = LocalDate.of(2026, 7, 1);
+    private static final LocalDate GO_LIVE = com.agostinelli.gestionale.reporting.Perimetro.GO_LIVE;
 
     /**
      * Conti transitori: quelli su cui una riga viene parcheggiata quando l'attribuzione non e'
      * certa. Non li tocco (decisione D: li cataloga il cliente), li MISURO — cosi' si vede quanto
      * del numero esposto e' ancora da attribuire.
      */
-    private static final String TRANSITORI =
+    static final String TRANSITORI =
             "(pc.codice LIKE '%99.999' OR pc.descrizione ILIKE '%da classificare%' " +
             " OR pc.descrizione ILIKE '%temporane%' OR pc.descrizione ILIKE '%transitori%')";
 

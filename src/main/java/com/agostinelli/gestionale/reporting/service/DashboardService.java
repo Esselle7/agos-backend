@@ -254,17 +254,44 @@ public class DashboardService {
     public ScadenzeImminentiDTO getScadenzeImminenti(LocalDate from, LocalDate to) {
         LocalDate oggi = LocalDate.now();
 
-        // ── Query 1: tutti gli eventi CONFERMATI nel periodo ─────────────
+        // ── Query 1: eventi CONFERMATI nel periodo + ogni evento GIA' CELEBRATO ancora scoperto ──
+        // Il secondo ramo non e' un doppione del primo: da quando il credito degli eventi e' uscito
+        // dagli «incassi da ricevere» (Query 4, evento_id IS NULL) questa e' l'UNICA colonna che lo
+        // mostra — e quella li' non era filtrata per periodo. Senza il ramo, scegliendo un periodo
+        // che non copre la data dell'evento il credito spariva dalla pagina invece di essere contato
+        // una volta sola. CONTROESEMPIO MISURATO il 06/09/2026 su copia di produzione: con
+        // period=MTD (che e' anche il @DefaultValue dell'endpoint) sparivano 21.016,00 € su 18
+        // eventi celebrati a luglio/agosto. Decisione dell'utente del 06/09/2026: il credito di un
+        // evento celebrato si mostra SEMPRE, come facevano gli incassi da ricevere.
+        //
+        // Il backlog resta invece legato al periodo: un evento FUTURO fuori finestra non e' credito,
+        // e' lavoro non ancora svolto. Percio' il ramo e' `data_evento <= oggi AND residuo > 0`.
+        //
+        // Il residuo si legge dai MOVIMENTI, non da e.importo_incassato: quella colonna va stale.
+        // Non c'e' nessun trigger che la riallinei (rimosso in V20), quindi dopo un annullamento
+        // continua a dichiarare incassi che non ci sono piu' e lo Scadenzario chiede al cliente
+        // meno di quanto deve. CONTROESEMPIO MISURATO il 21/08/2026 su copia di produzione,
+        // evento «Elena molteni»: colonna 3.550,00 contro 2.550,00 di movimenti vivi.
+        // Stessa definizione di EventiService#incassatoDaiMovimenti — l'incasso e' cio' che ha una
+        // data finanziaria, cosi' la riga di competenza (che non e' denaro entrato) resta fuori.
         @SuppressWarnings("unchecked")
         List<Object[]> eventiRows = em.createNativeQuery(
-                "SELECT e.id, e.nome, e.data_evento, " +
-                "(e.importo_totale_preventivato - e.importo_incassato) AS importo_residuo " +
-                "FROM eventi e " +
-                "WHERE e.stato = 'CONFERMATO' " +
-                "AND e.data_evento BETWEEN :from AND :to " +
-                "ORDER BY e.data_evento ASC")
+                "SELECT id, nome, data_evento, importo_residuo FROM ( " +
+                "  SELECT e.id, e.nome, e.data_evento, " +
+                "  (e.importo_totale_preventivato - COALESCE(( " +
+                "     SELECT SUM(mi.importo_lordo) FROM movimenti mi " +
+                "     WHERE mi.evento_id = e.id AND mi.tipo = 'ENTRATA' " +
+                "       AND mi.stato <> 'ANNULLATO' AND mi.data_finanziaria IS NOT NULL), 0) " +
+                "  ) AS importo_residuo " +
+                "  FROM eventi e " +
+                "  WHERE e.stato = 'CONFERMATO' " +
+                ") ev " +
+                "WHERE ev.data_evento BETWEEN :from AND :to " +
+                "   OR (ev.data_evento <= :oggi AND ev.importo_residuo > 0) " +
+                "ORDER BY ev.data_evento ASC")
                 .setParameter("from", from)
                 .setParameter("to", to)
+                .setParameter("oggi", oggi)
                 .getResultList();
 
         List<ScadenzaDTO> eventi = eventiRows.stream().map(r -> {
@@ -352,6 +379,14 @@ public class DashboardService {
         // Simmetrica alla Query 3 ma su tipo='ENTRATA': incassi economicamente registrati
         // (data_movimento <= oggi) non ancora arrivati sul conto (data_finanziaria IS NULL),
         // con una scadenza attesa. Usata dallo Scadenzario come "Incassi da ricevere".
+        //
+        // evento_id IS NULL — il credito di un evento vive nella Query 1, non qui. La riga di
+        // competenza (EventiService#creaRigaDiCompetenza) ha ESATTAMENTE questa forma e vale
+        // esattamente il residuo dell'evento: senza il filtro lo stesso euro compariva in due
+        // colonne, e nel calendario nella stessa cella (data_liquidita = data_evento). Il filtro
+        // sta su evento_id e non su tipo_evento_movimento='COMPETENZA' perche' anche un incasso
+        // evento registrato a mano come differito sarebbe gia' dentro quel residuo.
+        // La riga resta a DB: serve al conto economico (docs/specs/competenza-ricavo-evento.md).
         @SuppressWarnings("unchecked")
         List<Object[]> entrateRows = em.createNativeQuery(
                 "SELECT m.id, m.descrizione, m.importo_lordo, " +
@@ -364,6 +399,7 @@ public class DashboardService {
                 "LEFT JOIN fornitori f  ON f.id = m.fornitore_id " +
                 "WHERE m.tipo = 'ENTRATA' " +
                 "  AND m.stato = 'DA_LIQUIDARE' " +
+                "  AND m.evento_id IS NULL " +
                 "  AND m.data_movimento <= CURRENT_DATE " +
                 "  AND m.data_finanziaria IS NULL " +
                 "  AND m.data_liquidita IS NOT NULL " +

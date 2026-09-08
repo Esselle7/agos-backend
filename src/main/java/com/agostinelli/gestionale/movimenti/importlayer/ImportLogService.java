@@ -17,6 +17,7 @@ import jakarta.ws.rs.core.Response;
 
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -40,12 +41,21 @@ public class ImportLogService {
     // ── Storico import ────────────────────────────────────────────────────────
     public PagedResponse<ImportLogDTO> findHistory(String fonte, int page, int size) {
         @SuppressWarnings("unchecked")
+        // Il periodo di riferimento del file si AGGREGA dai movimenti che citano l'import: e' gia'
+        // dato, e una colonna in import_log divergerebbe appena una riga ambigua viene classificata
+        // dopo il caricamento. Costo: import_log ha 2 righe in produzione (08/09/2026) e la LATERAL
+        // usa idx_movimenti_fonte_import — il gate §9.0 non chiede altro a questi volumi.
         List<Object[]> rows = em.createNativeQuery(
-                        "SELECT id, fonte, filename, data_import, righe_totali, righe_importate, " +
-                        "righe_errore, righe_duplicate, righe_ambigue, righe_ambigue_classificate, " +
-                        "stato, imported_by FROM import_log " +
-                        "WHERE (CAST(:fonte AS VARCHAR) IS NULL OR fonte = :fonte) " +
-                        "ORDER BY data_import DESC LIMIT :size OFFSET :offset")
+                        "SELECT il.id, il.fonte, il.filename, il.data_import, il.righe_totali, " +
+                        "il.righe_importate, il.righe_errore, il.righe_duplicate, il.righe_ambigue, " +
+                        "il.righe_ambigue_classificate, il.stato, il.imported_by, p.dal, p.al " +
+                        "FROM import_log il " +
+                        "LEFT JOIN LATERAL (SELECT min(m.data_movimento) AS dal, " +
+                        "                          max(m.data_movimento) AS al " +
+                        "                   FROM movimenti m " +
+                        "                   WHERE m.fonte_importazione_id = il.id) p ON TRUE " +
+                        "WHERE (CAST(:fonte AS VARCHAR) IS NULL OR il.fonte = :fonte) " +
+                        "ORDER BY il.data_import DESC LIMIT :size OFFSET :offset")
                 .setParameter("fonte", fonte)
                 .setParameter("size", size)
                 .setParameter("offset", (long) page * size)
@@ -56,7 +66,8 @@ public class ImportLogService {
             content.add(new ImportLogDTO(
                     toUuid(r[0]), (String) r[1], (String) r[2], toInstant(r[3]),
                     toInt(r[4]), toInt(r[5]), toInt(r[6]), toInt(r[7]),
-                    toInt(r[8]), toInt(r[9]), (String) r[10], toUuid(r[11])));
+                    toInt(r[8]), toInt(r[9]), (String) r[10], toUuid(r[11]),
+                    toLocalDate(r[12]), toLocalDate(r[13])));
         }
 
         long total = ((Number) em.createNativeQuery(
@@ -68,12 +79,22 @@ public class ImportLogService {
     }
 
     // ── Ambiguità di un import ──────────────────────────────────────────────────
+
+    /**
+     * Le righe che l'import non ha saputo interpretare.
+     *
+     * <p>{@code importLogId} null = tutte, di ogni import. Serve perché il badge «Da rileggere»
+     * conta {@code DA_CLASSIFICARE} su TUTTA la tabella: una pagina che leggesse solo l'ultimo
+     * import mostrerebbe una lista vuota accanto a un contatore diverso da zero — il badge e la
+     * schermata che lo apre devono contare la stessa cosa.
+     */
     public PagedResponse<AmbiguitaDTO> getAmbiguita(UUID importLogId, String stato, int page, int size) {
         @SuppressWarnings("unchecked")
         List<Object[]> rows = em.createNativeQuery(
                         "SELECT id, import_log_id, riga_numero, fonte, raw_data, motivo, stato, " +
                         "movimento_id, classificato_at, note_operatore FROM import_ambiguita " +
-                        "WHERE import_log_id = :logId AND (CAST(:stato AS VARCHAR) IS NULL OR stato = :stato) " +
+                        "WHERE (CAST(:logId AS uuid) IS NULL OR import_log_id = :logId) " +
+                        "  AND (CAST(:stato AS VARCHAR) IS NULL OR stato = :stato) " +
                         "ORDER BY riga_numero LIMIT :size OFFSET :offset")
                 .setParameter("logId", importLogId)
                 .setParameter("stato", stato)
@@ -91,7 +112,8 @@ public class ImportLogService {
 
         long total = ((Number) em.createNativeQuery(
                         "SELECT COUNT(*) FROM import_ambiguita " +
-                        "WHERE import_log_id = :logId AND (CAST(:stato AS VARCHAR) IS NULL OR stato = :stato)")
+                        "WHERE (CAST(:logId AS uuid) IS NULL OR import_log_id = :logId) " +
+                        "  AND (CAST(:stato AS VARCHAR) IS NULL OR stato = :stato)")
                 .setParameter("logId", importLogId)
                 .setParameter("stato", stato)
                 .getSingleResult()).longValue();
@@ -299,6 +321,13 @@ public class ImportLogService {
     private UUID toUuid(Object o) {
         if (o == null) return null;
         return o instanceof UUID u ? u : UUID.fromString(o.toString());
+    }
+
+    private LocalDate toLocalDate(Object o) {
+        if (o == null) return null;
+        if (o instanceof LocalDate d) return d;
+        if (o instanceof java.sql.Date d) return d.toLocalDate();
+        return LocalDate.parse(o.toString());
     }
 
     private Instant toInstant(Object o) {

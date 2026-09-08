@@ -261,6 +261,11 @@ public class MovimentoNormalizerImpl implements MovimentoNormalizer {
             // il metodo no (gemelle delle causali BPM 310/314).
             case "ACCREDITI RIBA/EFFETTI", "EFFETTI RITIRATI/RICHIAMATI" -> "RIBA";
             case "COMMISSIONI/SPESE", "PAGAMENTO UTENZE" -> "RID_SDDMANDAT";
+            // Gemella delle causali BPM 662/660/16*/18D/195/669: la banca addebita direttamente
+            // il conto (canone c/c, competenze, interessi passivi). Fino al 08/09/2026 mancava e
+            // il canone mensile del CA restava CAUSALE_NON_MAPPATA: 13,50 EUR fuori dai saldi,
+            // ogni mese, in una coda che nessuna schermata apriva.
+            case "INTERESSI/COMPETENZE" -> "ADDEBITO_CONTO";
             case "IMPOSTE E TASSE" -> "F24"; // tributi addebitati dal conto
             default -> null; // CAUSALE_NON_MAPPATA
         };

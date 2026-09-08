@@ -240,6 +240,21 @@ public class MovimentiResource {
         return importLogService.findHistory(fonte, page, safeSize);
     }
 
+    /**
+     * Tutte le righe da rileggere, di ogni import — la lista che apre il badge «Da rileggere».
+     * Il badge le conta su tutta la tabella: questa deve leggere lo stesso insieme.
+     */
+    @GET
+    @Path("/import/ambiguita")
+    @RolesAllowed("ADMIN")
+    public PagedResponse<AmbiguitaDTO> getAmbiguitaTutte(
+            @QueryParam("stato") @DefaultValue("DA_CLASSIFICARE") String stato,
+            @QueryParam("page") @DefaultValue("0") int page,
+            @QueryParam("size") @DefaultValue("20") int size) {
+        int safeSize = Math.min(Math.max(size, 1), MAX_SIZE);
+        return importLogService.getAmbiguita(null, stato, page, safeSize);
+    }
+
     @GET
     @Path("/import/{importLogId}/ambiguita")
     @RolesAllowed("ADMIN")

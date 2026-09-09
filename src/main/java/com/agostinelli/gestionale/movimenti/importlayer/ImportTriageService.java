@@ -1153,16 +1153,23 @@ public class ImportTriageService {
                 " ORDER BY data_movimento, id LIMIT :size OFFSET :offset")
                 .setParameter("stato", stato).setParameter("size", size).setParameter("offset", (long) page * size)
                 .getResultList();
-        // Suggerimento CoGe: calcolato in Java dalla descrizione, poi UNA sola query per risolvere
-        // i codici in id (no N+1 sul piano dei conti).
-        List<String> codiciSugg = new ArrayList<>(rows.size());
-        for (Object[] r : rows) codiciSugg.add(suggerisciCogeCodice((String) r[4] /* tipo */, (String) r[6] /* descr */));
-        java.util.Map<String, Integer> idByCodice = cogeIdByCodice(new java.util.HashSet<>(codiciSugg));
-
         // Match strutturato coi piani attivi: UNA query per pagina, poi confronto in memoria.
         // Ricalcolato a ogni lettura e mai persistito (SPEC I3): così le righe già in coda
         // ricevono la proposta appena i piani vengono creati, senza rifare l'import.
         List<RataMatcher.Piano> piani = rows.isEmpty() ? List.of() : matchService.pianiAttivi();
+
+        // Suggerimento CoGe: PRIMA il conto del piano che la riga riconosce, poi — solo se nessun
+        // piano la riconosce — il ripiego lessicale. Poi UNA query per risolvere i codici in id
+        // (no N+1 sul piano dei conti).
+        List<String> codiciSugg = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            String daPiano = cogeDelPianoRiconosciuto(
+                    r[5] == null ? null : ((Number) r[5]).shortValue(),
+                    (BigDecimal) r[3], (String) r[6], piani);
+            codiciSugg.add(daPiano != null ? daPiano
+                    : suggerisciCogeCodice((String) r[4] /* tipo */, (String) r[6] /* descr */));
+        }
+        java.util.Map<String, Integer> idByCodice = cogeIdByCodice(new java.util.HashSet<>(codiciSugg));
 
         List<RicorrenteParcheggiataDTO> content = new ArrayList<>(rows.size());
         for (int i = 0; i < rows.size(); i++) {
@@ -1553,14 +1560,42 @@ public class ImportTriageService {
         return out;
     }
 
-    /** Suggerisce il codice CoGe dalla descrizione (case-insensitive); null = l'utente sceglie. */
+    /**
+     * Il conto del piano che questa riga riconosce, o null se nessuno la riconosce — o se più
+     * piani la riconoscono e non sono d'accordo sul conto.
+     *
+     * <p>È la sorgente GIUSTA del suggerimento: il conto è una proprietà del piano, e il piano si
+     * decide con lo stesso segnale lessicale del matching (SPEC ricorrenti-match-strutturato).
+     * Volutamente indipendente dalla finestra ±7gg: quella sceglie la rata, non il conto — le
+     * righe di agosto su piani che partono a settembre hanno zero rate candidate e un piano
+     * perfettamente noto. Due piani sullo stesso conto (i due Fidicomptur) restano d'accordo e
+     * il suggerimento esce lo stesso.
+     */
+    private String cogeDelPianoRiconosciuto(Short conto, BigDecimal importo, String descrizione,
+                                            List<RataMatcher.Piano> piani) {
+        String codice = null;
+        for (RataMatcher.Piano p : RataMatcher.pianiCompatibili(conto, importo, descrizione, piani)) {
+            if (p.contoCogeCodice() == null) continue;
+            if (codice == null) codice = p.contoCogeCodice();
+            else if (!codice.equals(p.contoCogeCodice())) return null; // in disaccordo: non si indovina
+        }
+        return codice;
+    }
+
+    /**
+     * Ripiego quando nessun piano riconosce la riga: solo parole che identificano UN conto solo.
+     *
+     * <p>Fino al 09/09/2026 c'erano anche {@code MUTUO → 20.01.001}, {@code CONFIDI → 20.01.006}
+     * e {@code LEASING → 20.01.005}. Sono state tolte perché sulle causali vere mentono: esistono
+     * due leasing (Merlo e furgone) e due controparti Confidi (Fidicomptur e Asconfidi), e
+     * «RIF. MUTUO N. 030910000075300» è un addebito Asconfidi che finiva sul mutuo ipotecario.
+     * Su un percorso che crea movimenti, un conto sbagliato precompilato è peggio di nessun
+     * conto: quello sbagliato viene accettato, quello mancante viene scelto.
+     */
     private String suggerisciCogeCodice(String tipo, String descrizione) {
         if ("ENTRATA".equals(tipo)) return COGE_FINANZIAMENTO_ENTRATA;
         if (descrizione == null) return null;
         String d = descrizione.toUpperCase();
-        if (d.contains("MUTUO")) return "20.01.001";
-        if (d.contains("ASCONFIDI") || d.contains("CONFIDI")) return "20.01.006";
-        if (d.contains("LEASING")) return "20.01.005";
         if (d.contains("PROTEZIONE VITA")) return "40.05.002";
         if (d.contains("ASSICURAZ") || d.contains("POLIZZA")) return "40.05.002";
         if (d.contains("BOLLO") || d.contains("CANONE")) return "40.02.002";

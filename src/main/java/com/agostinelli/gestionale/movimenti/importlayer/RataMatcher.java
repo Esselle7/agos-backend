@@ -59,6 +59,8 @@ public final class RataMatcher {
             String descrizione,
             String riferimentoEstrattoConto,
             Short contoBancarioId,
+            /** Conto CoGe su cui il piano contabilizza: è il conto GIUSTO per le sue righe. */
+            String contoCogeCodice,
             BigDecimal importoRata,
             List<Rata> ratePending) {}
 
@@ -93,10 +95,24 @@ public final class RataMatcher {
      */
     public static boolean somigliaARata(Short contoBancarioId, BigDecimal importo, String descrizione,
                                         List<Piano> piani) {
+        return !pianiCompatibili(contoBancarioId, importo, descrizione, piani).isEmpty();
+    }
+
+    /**
+     * I piani che questa riga riconosce, <b>indipendentemente dalla finestra della rata</b>.
+     *
+     * <p>Esiste perché il piano e la rata si decidono con segnali diversi: il piano è lessicale
+     * (riferimento o token del nome), la data sceglie solo QUALE rata. Un addebito di agosto su un
+     * piano che parte a settembre non ha nessuna rata candidata, ma il piano si sa benissimo qual
+     * è — e con lui il conto CoGe su cui la riga va contabilizzata.
+     */
+    public static List<Piano> pianiCompatibili(Short contoBancarioId, BigDecimal importo,
+                                               String descrizione, List<Piano> piani) {
+        List<Piano> out = new ArrayList<>();
         for (Piano p : piani) {
-            if (pianoCompatibile(p, contoBancarioId, importo, descrizione) != null) return true;
+            if (pianoCompatibile(p, contoBancarioId, importo, descrizione) != null) out.add(p);
         }
-        return false;
+        return out;
     }
 
     /** Candidati + proposta a un click per una riga già parcheggiata. */

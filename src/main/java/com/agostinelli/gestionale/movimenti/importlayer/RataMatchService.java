@@ -23,8 +23,9 @@ public class RataMatchService {
 
     private static final String SQL = """
             SELECT p.id, p.descrizione, p.riferimento_estratto_conto, p.conto_bancario_id, p.importo_rata,
-                   i.id, i.numero_rata, i.data_scadenza, i.importo
+                   i.id, i.numero_rata, i.data_scadenza, i.importo, c.codice
             FROM recurring_expense_plan p
+            JOIN piano_dei_conti_coge c ON c.id = p.conto_coge_id
             LEFT JOIN recurring_expense_installment i ON i.piano_id = p.id AND i.stato = 'PENDING'
             WHERE p.stato = 'ATTIVO'
             ORDER BY p.id, i.numero_rata
@@ -61,7 +62,8 @@ public class RataMatchService {
 
     private static RataMatcher.Piano piano(Object[] r, List<RataMatcher.Rata> rate) {
         return new RataMatcher.Piano(uuid(r[0]), (String) r[1], (String) r[2],
-                r[3] == null ? null : ((Number) r[3]).shortValue(), (BigDecimal) r[4], List.copyOf(rate));
+                r[3] == null ? null : ((Number) r[3]).shortValue(), (String) r[9],
+                (BigDecimal) r[4], List.copyOf(rate));
     }
 
     private static UUID uuid(Object o) {

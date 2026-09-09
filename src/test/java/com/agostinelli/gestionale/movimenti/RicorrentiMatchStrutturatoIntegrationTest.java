@@ -56,6 +56,17 @@ class RicorrentiMatchStrutturatoIntegrationTest {
     private static final String DESCR_ENEL =
             "ADDEBITO DIRETTO SDD - SDD CORE: 2C1071113500569T ENEL ENERGIA";
 
+    // Righe reali di agosto 2026 (dump prod 09/09). Ognuna contiene una parola che la rete di
+    // keyword hardcoded interpreta MALE: LEASING → Merlo, CONFIDI → Asconfidi, MUTUO → ipotecario.
+    private static final String DESCR_FURGONE =
+            "SDD A : CREDIT AGRICOLE LEASING ITALIA SRL FT V3 /2026/26214562 SC 01082026 "
+            + "- CTR 01609006/001 10032026 0005 ADDEBITO SDD NUMERO 0399059443";
+    private static final String DESCR_FIDICOMPTUR_8K =
+            "ADDEBITO DIRETTO SDD - SDD B2B : 981811800294901 ASSOCIAZIONE DEI CONFIDI DELLA";
+    private static final String DESCR_ASCONFIDI_40K =
+            "SDD A : ASSOCIAZIONE DEI CONFIDI DELLA SDD03 RIF. MUTUO N. 030910000075300 "
+            + "RATA N. 004 SCAD. 05.08.2026 Q.CAP. E 1.602,20 Q.INT. E 161,12 SPESE E 2,00";
+
     @Inject EntityManager em;
     @Inject ImportTriageService triageService;
     @Inject MovimentoImportService importService;
@@ -369,6 +380,59 @@ class RicorrentiMatchStrutturatoIntegrationTest {
         assertNull(dopo[2], "movimento_id resta NULL");
     }
 
+    // ── R9/R10/R11 — il CoGe suggerito viene dal PIANO, non da una parola ────────
+    // Il piano è una proprietà della riga; la finestra ±7gg decide solo QUALE RATA. Legare il
+    // suggerimento del conto alla finestra (o peggio a una keyword) produceva il conto sbagliato
+    // proprio sulle righe che l'operatore poi contabilizza con «registrala e basta».
+
+    /** R9 — addebito fuori finestra (piani da settembre, rate di agosto): il conto è comunque quello del piano. */
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void r9_fuoriFinestra_ilCogeArrivaDalPianoNonDallaKeyword() {
+        // In produzione il furgone sta su 20.01.007, creato a runtime da /piano-conti e quindi
+        // assente dal seed: qui vale un altro conto del ramo, il punto è che NON sia 20.01.005.
+        creaPianoSuCoge(TAG + " Furgone", "510.00", (short) 2, "CTR 01609006", "20.01.002");
+        UUID riga = seedRiga(DESCR_FURGONE, (short) 2, "518.54", SCADENZA.plusDays(20));
+
+        RicorrenteParcheggiataDTO dto = leggi(riga);
+        assertNull(dto.propostaRataId(), "fuori finestra nessuna rata si aggancia: è corretto");
+        assertEquals("20.01.002", dto.cogeSuggeritoCodice(),
+                "il conto è del piano riconosciuto, non di «LEASING» → Merlo (20.01.005)");
+        assertEquals(cogeId("20.01.002"), dto.cogeSuggeritoId());
+    }
+
+    /** R10 — «CONFIDI» nella causale non deve tirare il conto di Asconfidi: decide il mandato SDD. */
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void r10_mandatoSddBatteLaParolaConfidi() {
+        creaPianoSuCoge(TAG + " Fidicomptur 8k", "118.54", (short) 1, "981811800294901", "20.01.004");
+        UUID riga = seedRiga(DESCR_FIDICOMPTUR_8K, (short) 1, "118.54", SCADENZA.plusDays(20));
+
+        assertEquals("20.01.004", leggi(riga).cogeSuggeritoCodice(),
+                "il mandato 981811800294901 è il Fidicomptur 8k, non Asconfidi 40k");
+    }
+
+    /** R11 — «MUTUO» compare nella causale Asconfidi: la parola mente, il riferimento no. */
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void r11_laParolaMutuoNonTiraIlContoDelMutuoIpotecario() {
+        creaPianoSuCoge(TAG + " Asconfidi 40k", "1756.27", (short) 2, "030910000075300", "20.01.006");
+        UUID riga = seedRiga(DESCR_ASCONFIDI_40K, (short) 2, "1765.32", SCADENZA.plusDays(20));
+
+        assertEquals("20.01.006", leggi(riga).cogeSuggeritoCodice(),
+                "la causale contiene «RIF. MUTUO N.», ma il mutuo ipotecario è un altro conto");
+    }
+
+    /** Controprova: senza nessun piano che la riconosca, meglio nessun conto che uno sbagliato. */
+    @Test
+    @TestSecurity(user = USER, roles = {"ADMIN"})
+    void r12_nessunPianoRiconosciuto_nessunSuggerimentoInventato() {
+        UUID riga = seedRiga(DESCR_FURGONE, (short) 2, "518.54", SCADENZA.plusDays(20));
+
+        assertNull(leggi(riga).cogeSuggeritoCodice(),
+                "«LEASING» da solo non dice QUALE leasing: si lascia scegliere all'operatore");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────
 
     RicorrenteParcheggiataDTO leggi(UUID riga) {
@@ -384,6 +448,19 @@ class RicorrentiMatchStrutturatoIntegrationTest {
                 + ",\"contoCoge\":" + cogeId("20.01.001") + ",\"importoRata\":" + importoRata
                 + ",\"giornoDelMese\":15,\"frequenza\":\"MENSILE\",\"numeroRate\":3,"
                 + "\"dataInizio\":\"" + SCADENZA + "\",\"tipoPiano\":\"FLAT\"" + rif + "}";
+        return UUID.fromString(given().contentType(ContentType.JSON).body(body)
+                .when().post("/api/spese-ricorrenti/piani")
+                .then().log().ifValidationFails().statusCode(201).extract().path("id"));
+    }
+
+    /** Come {@link #creaPiano} ma sul conto CoGe indicato: serve a distinguere i piani fra loro. */
+    UUID creaPianoSuCoge(String descrizione, String importoRata, short conto, String riferimento,
+                         String cogeCodice) {
+        String body = "{\"descrizione\":\"" + descrizione + "\",\"contoBancarioId\":" + conto
+                + ",\"contoCoge\":" + cogeId(cogeCodice) + ",\"importoRata\":" + importoRata
+                + ",\"giornoDelMese\":15,\"frequenza\":\"MENSILE\",\"numeroRate\":3,"
+                + "\"dataInizio\":\"" + SCADENZA + "\",\"tipoPiano\":\"FLAT\","
+                + "\"riferimentoEstrattoConto\":\"" + riferimento + "\"}";
         return UUID.fromString(given().contentType(ContentType.JSON).body(body)
                 .when().post("/api/spese-ricorrenti/piani")
                 .then().log().ifValidationFails().statusCode(201).extract().path("id"));
